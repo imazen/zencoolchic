@@ -1,0 +1,30 @@
+[package]
+name = "zencoolchic"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Cool-chic 5 overfitted neural image codec in safe Rust"
+repository = "https://github.com/imazen/zencoolchic"
+keywords = ["image", "codec", "neural", "compression", "cool-chic"]
+categories = ["multimedia::images", "compression"]
+publish = false
+
+[features]
+default = []
+std = []
+# Differential tests against the upstream Python decoder's dumps
+# (`scripts/oracle/dump_decode.py`). Needs ZENCOOLCHIC_ORACLE_DIR.
+oracle = ["std"]
+
+[dependencies]
+libm = "0.2.16"
+
+[dev-dependencies]
+
+[profile.release]
+debug = 1
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"
