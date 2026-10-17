@@ -129,19 +129,41 @@ impl<'a> RangeDecoder<'a> {
         }
         let q = quantile as u32;
 
-        // Binary search for the largest s with left(s) <= q. left(MIN_SYMBOL) = 0 <= q.
-        let (mut lo, mut hi) = (MIN_SYMBOL, MAX_SYMBOL);
-        while lo < hi {
-            let mid = lo + (hi - lo + 1) / 2;
-            if left_cumulative(mid, mu, b) <= q {
-                lo = mid;
-            } else {
-                hi = mid - 1;
+        // Largest s with left(s) <= q. Start from the inverse CDF of the (non-leaky) Laplace
+        // and walk: the leak shifts cumulatives by at most 127 / 2^24, so the guess is
+        // almost always within one symbol. left(MIN_SYMBOL) = 0 <= q always holds.
+        let p = (q as f64 + 0.5) / (1u64 << PRECISION) as f64;
+        let guess = if p > 0.5 {
+            mu - b * libm::log(2.0 - 2.0 * p)
+        } else {
+            mu + b * libm::log(2.0 * p)
+        };
+        let mut symbol = if guess.is_nan() {
+            0
+        } else {
+            (libm::floor(guess) as i32).clamp(MIN_SYMBOL, MAX_SYMBOL)
+        };
+        let mut left = left_cumulative(symbol, mu, b);
+        let mut right;
+        if left > q {
+            loop {
+                right = left;
+                symbol -= 1;
+                left = left_cumulative(symbol, mu, b);
+                if left <= q {
+                    break;
+                }
+            }
+        } else {
+            loop {
+                right = right_cumulative(symbol, mu, b);
+                if right > q {
+                    break;
+                }
+                symbol += 1;
+                left = right;
             }
         }
-        let symbol = lo;
-        let left = left_cumulative(symbol, mu, b);
-        let right = right_cumulative(symbol, mu, b);
         let probability = right.wrapping_sub(left);
         if probability == 0 {
             return Err(Error::Invalid("zero-probability symbol"));
