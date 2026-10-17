@@ -1,0 +1,19 @@
+name: exp audit
+
+# Exhaustive check that libm::exp gives the same range-coder cumulatives as the platform
+# libm (examples/exp_audit.rs). Manual: ~10^10 evaluations.
+on:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: exp audit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run --release --example exp_audit --features std -- 4
