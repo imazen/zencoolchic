@@ -104,14 +104,12 @@ pub(crate) fn inter_context(
     // IFCE output at the stacked resolution.
     let mut small = vec![0i64; uh * uw * n_out];
     if let Some(arm) = ifce {
-        let mut scratch = Vec::new();
         let shift = 2 * WEIGHT_SHIFT - N_FRAC_BIT_INTER_FT_CTX;
         for p in 0..uh * uw {
             arm.forward(
                 &stacked[p * uc..(p + 1) * uc],
                 shift,
                 &mut small[p * n_out..(p + 1) * n_out],
-                &mut scratch,
             );
         }
     }
@@ -158,7 +156,6 @@ pub(crate) fn decode_grid(
 
     let mut ctx = vec![0i64; n_spatial + n_inter];
     let mut out = [0i64; 2];
-    let mut scratch = Vec::new();
     let shift = 2 * WEIGHT_SHIFT - N_FRAC_BIT_MU_SCALE;
     let mu_min_fp: i64 = -64 << N_FRAC_BIT_MU_SCALE;
     let log_scale_min_fp: i64 = -5 << N_FRAC_BIT_MU_SCALE;
@@ -172,7 +169,7 @@ pub(crate) fn decode_grid(
             let p = (y * w + x) * ic.c;
             ctx[n_spatial..].copy_from_slice(&ic.data[p..p + ic.c]);
         }
-        arm.forward(&ctx, shift, &mut out, &mut scratch);
+        arm.forward(&ctx, shift, &mut out);
         let im = (out[0] - mu_min_fp).clamp(0, N_MU as i64 - 1) as usize;
         let is = (out[1] - log_scale_min_fp).clamp(0, N_SCALE_IDX as i64 - 1) as usize;
         padded[centre] = rc.decode(im, is)? as i64;

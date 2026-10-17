@@ -18,7 +18,7 @@ pub(crate) const N_FRAC_BIT_INTER_FT_CTX: u32 = 8;
 /// Fractional bits of the ARM's (mu, log-scale) output.
 pub(crate) const N_FRAC_BIT_MU_SCALE: u32 = 8;
 
-/// One linear layer, `y = x · w + b` with `w` stored `[in][out]` (already transposed).
+/// One linear layer, `y = W x + b` with `W` stored `[out][in]` (row per output).
 #[derive(Debug, Clone)]
 pub(crate) struct FixedLinear {
     pub(crate) n_in: usize,
@@ -70,6 +70,13 @@ pub(crate) fn to_fixed_point(
     opt: &FixedPointOptions,
 ) -> Result<FixedArm> {
     let n_layers = q.dims.len();
+    if n_layers == 0
+        || q.dims
+            .iter()
+            .any(|&(i, o)| i == 0 || i > MAX_WIDTH || o > MAX_WIDTH)
+    {
+        return Err(Error::Invalid("ARM layer width"));
+    }
     let mut layers = Vec::with_capacity(n_layers);
     for l in 0..n_layers {
         let (n_in, n_out) = q.dims[l];
@@ -90,7 +97,7 @@ pub(crate) fn to_fixed_point(
                 if n_in == n_out && !opt.no_residual_layer && i == o {
                     v = v.wrapping_add(1i64 << ident);
                 }
-                w[i * n_out + o] = v;
+                w[o * n_in + i] = v;
             }
         }
 
@@ -121,7 +128,7 @@ pub(crate) fn to_fixed_point(
                     if i >= n_in - opt.n_inter_ft_ctx {
                         s -= N_FRAC_BIT_INTER_FT_CTX as i32;
                     }
-                    w[i * n_out + o] = shl(sw[o * n_in + i], s)?;
+                    w[o * n_in + i] = shl(sw[o * n_in + i], s)?;
                 }
             }
             let s = 2 * WEIGHT_SHIFT as i32 + q_shift_b;
@@ -147,66 +154,50 @@ impl FixedArm {
         self.stabiliser.n_out
     }
 
-    /// `fixed_point_arm` for one context vector. `scratch` must hold `2 * max width`.
-    pub(crate) fn forward(
-        &self,
-        ctx: &[i64],
-        output_shift: u32,
-        out: &mut [i64],
-        scratch: &mut Vec<i64>,
-    ) {
+    /// `fixed_point_arm` for one context vector: writes `n_out` values to `out`.
+    pub(crate) fn forward(&self, ctx: &[i64], output_shift: u32, out: &mut [i64]) {
         let n_in = self.n_in();
         debug_assert_eq!(ctx.len(), n_in);
-        let width = self
-            .layers
-            .iter()
-            .map(|l| l.n_out.max(l.n_in))
-            .max()
-            .unwrap_or(0);
-        scratch.clear();
-        scratch.resize(2 * width.max(n_in), 0);
-        let (cur, next) = scratch.split_at_mut(width.max(n_in));
-        for (c, &x) in cur.iter_mut().zip(ctx) {
+        let mut buf_a = [0i64; MAX_WIDTH];
+        let mut buf_b = [0i64; MAX_WIDTH];
+        for (c, &x) in buf_a.iter_mut().zip(ctx) {
             *c = x.wrapping_shl(WEIGHT_SHIFT);
         }
+        let x0 = &buf_a[..n_in];
 
-        // Stabiliser from the shifted input.
+        // Stabiliser from the shifted input, then the trunk.
         let st = &self.stabiliser;
-        let n_out = st.n_out;
-        out[..n_out].copy_from_slice(&st.b[..n_out]);
-        for i in 0..n_in {
-            let x = cur[i];
-            let row = &st.w[i * n_out..(i + 1) * n_out];
-            for o in 0..n_out {
-                out[o] = out[o].wrapping_add(x.wrapping_mul(row[o]));
-            }
+        for ((o, row), &b) in out.iter_mut().zip(st.w.chunks_exact(n_in)).zip(&st.b) {
+            *o = dot(row, x0).wrapping_add(b);
         }
 
         let (last, hidden) = self.layers.split_last().expect("ARM has a last layer");
-        let mut cur: &mut [i64] = cur;
-        let mut next: &mut [i64] = next;
+        let (mut cur, mut next) = (&mut buf_a, &mut buf_b);
         for l in hidden {
-            let y = &mut next[..l.n_out];
-            y.copy_from_slice(&l.b);
-            for i in 0..l.n_in {
-                let x = cur[i];
-                let row = &l.w[i * l.n_out..(i + 1) * l.n_out];
-                for o in 0..l.n_out {
-                    y[o] = y[o].wrapping_add(x.wrapping_mul(row[o]));
-                }
-            }
-            for v in y.iter_mut() {
-                *v = (*v).max(0) >> WEIGHT_SHIFT;
+            let x = &cur[..l.n_in];
+            for ((y, row), &b) in next.iter_mut().zip(l.w.chunks_exact(l.n_in)).zip(&l.b) {
+                *y = dot(row, x).wrapping_add(b).max(0) >> WEIGHT_SHIFT;
             }
             core::mem::swap(&mut cur, &mut next);
         }
-
-        for o in 0..last.n_out {
-            let mut acc = last.b[o];
-            for i in 0..last.n_in {
-                acc = acc.wrapping_add(cur[i].wrapping_mul(last.w[i * last.n_out + o]));
-            }
-            out[o] = (acc.wrapping_add(out[o])) >> output_shift;
+        let x = &cur[..last.n_in];
+        for ((o, row), &b) in out
+            .iter_mut()
+            .zip(last.w.chunks_exact(last.n_in))
+            .zip(&last.b)
+        {
+            *o = dot(row, x).wrapping_add(b).wrapping_add(*o) >> output_shift;
         }
     }
+}
+
+/// Widest layer the fixed-point MLPs can have: 40 spatial contexts + 31 IFCE features.
+pub(crate) const MAX_WIDTH: usize = 72;
+
+/// Wrapping i64 dot product (order-independent: integer addition is associative).
+#[inline(always)]
+fn dot(a: &[i64], b: &[i64]) -> i64 {
+    a.iter()
+        .zip(b)
+        .fold(0i64, |acc, (&x, &y)| acc.wrapping_add(x.wrapping_mul(y)))
 }
