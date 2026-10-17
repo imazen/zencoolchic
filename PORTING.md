@@ -8,35 +8,48 @@ v5.0.1), BSD-3-Clause (notice in `upstream-notices/`). Entropy coder: `constrict
 
 | Module | Upstream | Status | Parity evidence |
 |---|---|---|---|
-| Video / frame / Cool-chic headers | `bitstream/header/*.py` | done (I frames) | kodim14 decodes; `tests/oracle.rs` |
+| Video / frame / Cool-chic headers | `bitstream/header/*.py` | done (I frames) | 12 oracle streams; `tests/oracle.rs` |
 | Network parameters (exp-Golomb, per-module q-step) | `bitstream/neuralnet/*.py` | done | `expgolomb::tests::round_trip_all_orders`; kodim14 |
-| Fixed-point ARM / IFCE | `bitstream/component/armint.py` | done | latents bit-exact on kodim14 |
-| Wavefront latent decode | `bitstream/component/latent.py` | done | latents bit-exact on kodim14 |
-| Range decoder + leaky quantized Laplace | constriction 0.4.2 `queue.rs`, `quantize.rs` | done | latents bit-exact on kodim14 |
-| Upsampling (train-mode kron kernels) | `component/core/upsampling.py` | done, scalar | raw output max abs error 3.6e-7 on kodim14 |
+| Fixed-point ARM / IFCE | `bitstream/component/armint.py` | done | latents bit-exact on 12 streams, incl. no-IFCE and no-stabiliser |
+| Wavefront latent decode | `bitstream/component/latent.py` | done (wavefront and width ≤ 9 raster order) | latents bit-exact on 12 streams |
+| Range decoder + leaky quantized Laplace | constriction 0.4.2 `queue.rs`, `quantize.rs` | done | latents bit-exact on 12 streams; exhaustive `exp` audit below |
+| Upsampling (train-mode kron kernels) | `component/core/upsampling.py` | done, scalar | raw output max abs error ≤ 9.3e-7 (9.24e-7) on 12 streams |
 | Synthesis | `component/core/synthesis.py` | done, scalar | as above |
-| Final resize (nearest / bilinear / bicubic) | `F.interpolate` | done; only the identity case is exercised (kodim14 is full-resolution) | not yet tested on a stream that resizes |
-| Common randomness | `component/core/noise.py` | ported, **untested**: no stream with `flag_common_randomness` yet | — |
-| YUV 4:2:0 / 4:4:4 output | `io/format/yuv.py` | ported, **untested**: no YUV stream yet | — |
+| Final resize (bicubic; nearest / bilinear ported) | `F.interpolate` | bicubic tested (`mid_lat1_debug`, latents from 1/2 resolution); nearest and bilinear are only used by the motion decoder and are untested | `mid_lat1_debug` |
+| Common randomness | `component/core/noise.py` | done | `mid_wasserstein_debug` (`--tune wasserstein`): all samples identical |
+| YUV 4:2:0 / 4:4:4 output | `io/format/yuv.py` | done | `yuv420_8b_debug`, `yuv444_10b_debug` (10-bit) |
 | Inter frames (P/B), warper, global motion | `bitstream/decode.py`, `intercoding/` | not ported: `Error::Unsupported` | — |
 
 ### Measured parity (2026-10-17, mac, torch 2.14.1 CPU)
 
-`just oracle` on upstream's `samples/bitstreams/kodim14.cool` (768×512, 10 latent grids incl.
-3 hyperlatent, ARM 14 contexts + 6 IFCE features, synthesis `48-1,3-1,3-3r,3-3r`):
+`just oracle` over upstream's `samples/bitstreams/kodim14.cool` plus 11 streams from
+`scripts/oracle/make_streams.sh` (crops of kodim14 encoded by upstream; `--debug` streams train
+for a few iterations, `_2k` ones for 2000):
 
-- integer latents: 526,272 / 526,272 identical;
-- synthesis output before quantization: max |Δ| 3.6e-7;
-- 8-bit samples: 1,179,643 identical, 5 differ by one step, none by more.
+| stream | size | latents identical | raw max \|Δ\| | samples off by 1 |
+|---|---|---|---|---|
+| kodim14 (upstream sample, hop) | 768×512 RGB | 526,272 / 526,272 | 3.6e-7 | 5 / 1,179,648 |
+| small64_hop_2k / lop_2k / vhop_2k | 64×64 RGB | 5,482 each | ≤ 3.0e-7 | 0 |
+| mid_lat1_debug (latents from 1/2 res, bicubic resize) | 130×97 | 4,409 | 9.2e-7 | 1 / 37,830 |
+| mid_noifce_nohyper | 130×97 | 16,930 | 2.4e-7 | 0 |
+| mid_nostab_debug (ARM 8,1, no stabilisers) | 130×97 | 17,019 | 1.2e-7 | 1 / 37,830 |
+| mid_wasserstein_debug (common randomness) | 130×97 | 17,019 | 2.4e-7 | 0 |
+| odd37x23_debug | 37×23 | 1,172 | 3.0e-8 | 0 |
+| narrow7x40_debug (raster order) | 7×40 | 397 | 1.2e-7 | 0 |
+| yuv420_8b_debug | 48×32 4:2:0 | 2,058 | 6.0e-8 | 0 |
+| yuv444_10b_debug | 40×24 4:4:4 10-bit | 1,293 | 0 | 0 |
+
+No sample differs by more than one step.
 
 ### Bit-exactness risks
 
 - The leaky Laplace CDF calls `exp` in f64. Upstream gets it from the platform libm through
-  Rust std (glibc on Linux wheels, Apple libm on macOS); this port uses the `libm` crate. A
-  1-ulp disagreement that moves `floor(free_weight · F(x))` across an integer would change one
-  cumulative and desynchronise the range coder. Not yet measured: the next step is an
-  exhaustive comparison over every (mu, scale, symbol) the model can produce
-  (32768 × 2561 × 128 evaluations) of `libm::exp` vs glibc and Apple libm.
+  Rust std (glibc in Linux wheels, Apple libm on macOS); this port uses the `libm` crate.
+  `examples/exp_audit.rs` evaluates every (mu, scale, symbol boundary) the model can produce
+  (10,741,612,544 cases): `libm::exp` differs from the platform `exp` in about 8% of them
+  (Apple libm 859,272,296; glibc 2.43 858,811,983), and in **none** does the leaky cumulative
+  `floor(free_weight · F(x))` change (`benchmarks/exp_audit_2026-10-17.log`). Streams encoded on
+  Linux (glibc) or macOS therefore decode identically here; Windows' CRT `exp` is not audited.
 - The Laplace scale table cannot be recomputed bit-exactly (23 of 2561 entries differ from
   `f32(exp(f64))`), so it is embedded from upstream's `mu_scale.npy`
   (`scripts/gen_scale_table.py`).

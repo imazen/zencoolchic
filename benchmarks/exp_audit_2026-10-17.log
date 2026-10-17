@@ -1,0 +1,6 @@
+# exp_audit, commit a00d411, 2026-10-17
+# cmd: cargo run --release --example exp_audit --features std -- <threads>
+mac (Apple M4 Pro, macOS libm):
+macos aarch64: evaluations 10741612544; exp bit differences 859272296; leaky-cumulative differences 0; 12.3 s
+dev (Ryzen 9 9950X3D, Ubuntu GLIBC 2.43-2ubuntu2.4):
+linux x86_64: evaluations 10741612544; exp bit differences 858811983; leaky-cumulative differences 0; 24.6 s
