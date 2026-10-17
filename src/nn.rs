@@ -44,11 +44,6 @@ impl Planes {
     }
 }
 
-#[inline]
-fn fmadd(a: f32, b: f32, c: f32) -> f32 {
-    libm::fmaf(a, b, c)
-}
-
 /// `_Parameterization_Symmetric_1d`: full symmetric kernel from its first half.
 pub(crate) fn symmetric_kernel(half: &[f32], k: usize) -> Vec<f32> {
     let mut out = half.to_vec();
@@ -70,47 +65,67 @@ fn kron(w: &[f32]) -> Vec<f32> {
     out
 }
 
+/// Copy of a plane with `p` replicated (or zero) border pixels on every side.
+fn pad_plane(src: &[f32], h: usize, w: usize, p: usize, replicate: bool) -> Vec<f32> {
+    let pw = w + 2 * p;
+    let mut out = vec![0.0f32; (h + 2 * p) * pw];
+    for py in 0..h + 2 * p {
+        let sy = if replicate {
+            py.saturating_sub(p).min(h - 1)
+        } else if py < p || py >= h + p {
+            continue;
+        } else {
+            py - p
+        };
+        let srow = &src[sy * w..(sy + 1) * w];
+        let drow = &mut out[py * pw..(py + 1) * pw];
+        drow[p..p + w].copy_from_slice(srow);
+        if replicate {
+            drow[..p].fill(srow[0]);
+            drow[p + w..].fill(srow[w - 1]);
+        }
+    }
+    out
+}
+
 /// `UpsamplingSeparableSymmetricConvTranspose2d.forward` (training path) on one plane:
 /// replicate-pad by `k/2`, stride-2 transposed convolution with the 2-D kernel, crop.
 /// Output is `2h × 2w`.
+///
+/// Computed per output phase: output `f = 2m + parity` (in uncropped coordinates) gathers
+/// `xp[m - a][n - b] · K[py + 2a][px + 2b]`, a contiguous correlation per row. Taps are
+/// accumulated with input rows and columns ascending.
 pub(crate) fn conv_transpose_up2(src: &[f32], h: usize, w: usize, kernel: &[f32]) -> Vec<f32> {
     let k = kernel.len();
     let k2 = kron(kernel);
+    let half = k / 2;
     let p0 = k / 2;
     let crop = 2 * p0 - 1 + k / 2;
-    let (ph, pw) = (h + 2 * p0, w + 2 * p0);
-    let at = |y: usize, x: usize| -> f32 {
-        let sy = y.saturating_sub(p0).min(h - 1);
-        let sx = x.saturating_sub(p0).min(w - 1);
-        src[sy * w + sx]
-    };
+    let pw = w + 2 * p0;
+    let xp = pad_plane(src, h, w, p0, true);
     let (oh, ow) = (2 * h, 2 * w);
+    let m0 = crop >> 1;
+    let nm = ((ow - 1 + crop) >> 1) - m0 + 1;
     let mut out = vec![0.0f32; oh * ow];
-    // Gather form: full-output pixel (fy, fx) = Σ xp[iy][ix] · K[fy - 2iy][fx - 2ix].
+    let mut tmp = [vec![0.0f32; nm], vec![0.0f32; nm]];
     for oy in 0..oh {
-        let fy = oy + crop;
-        for ox in 0..ow {
-            let fx = ox + crop;
-            let mut acc = 0.0f32;
-            // iy ranges over input rows with 0 <= fy - 2iy < k.
-            let iy_hi = (fy / 2).min(ph - 1);
-            let iy_lo = (fy + 1).saturating_sub(k).div_ceil(2);
-            let ix_hi = (fx / 2).min(pw - 1);
-            let ix_lo = (fx + 1).saturating_sub(k).div_ceil(2);
-            for iy in iy_lo..=iy_hi {
-                let ky = fy - 2 * iy;
-                if ky >= k {
-                    continue;
-                }
-                for ix in ix_lo..=ix_hi {
-                    let kx = fx - 2 * ix;
-                    if kx >= k {
-                        continue;
-                    }
-                    acc = fmadd(at(iy, ix), k2[ky * k + kx], acc);
+        let f = oy + crop;
+        let (my, py) = (f >> 1, f & 1);
+        for (px, t) in tmp.iter_mut().enumerate() {
+            t.fill(0.0);
+            for a in (0..half).rev() {
+                let row = &xp[(my - a) * pw..(my - a + 1) * pw];
+                let ky = py + 2 * a;
+                for b in (0..half).rev() {
+                    let kx = px + 2 * b;
+                    crate::simd::axpy(t, k2[ky * k + kx], &row[m0 - b..m0 - b + nm]);
                 }
             }
-            out[oy * ow + ox] = acc;
+        }
+        let orow = &mut out[oy * ow..(oy + 1) * ow];
+        for (ox, o) in orow.iter_mut().enumerate() {
+            let f = ox + crop;
+            *o = tmp[f & 1][(f >> 1) - m0];
         }
     }
     out
@@ -121,25 +136,20 @@ pub(crate) fn conv_transpose_up2(src: &[f32], h: usize, w: usize, kernel: &[f32]
 pub(crate) fn sym_conv_residual(src: &[f32], h: usize, w: usize, kernel: &[f32]) -> Vec<f32> {
     let k = kernel.len();
     let k2 = kron(kernel);
-    let p = (k / 2) as isize;
+    let p = k / 2;
+    let pw = w + 2 * p;
+    let xp = pad_plane(src, h, w, p, false);
     let mut out = vec![0.0f32; h * w];
     for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0.0f32;
-            for ky in 0..k {
-                let sy = y as isize + ky as isize - p;
-                if sy < 0 || sy >= h as isize {
-                    continue;
-                }
-                for kx in 0..k {
-                    let sx = x as isize + kx as isize - p;
-                    if sx < 0 || sx >= w as isize {
-                        continue;
-                    }
-                    acc = fmadd(src[sy as usize * w + sx as usize], k2[ky * k + kx], acc);
-                }
+        let orow = &mut out[y * w..(y + 1) * w];
+        for ky in 0..k {
+            let row = &xp[(y + ky) * pw..(y + ky + 1) * pw];
+            for kx in 0..k {
+                crate::simd::axpy(orow, k2[ky * k + kx], &row[kx..kx + w]);
             }
-            out[y * w + x] = acc + src[y * w + x];
+        }
+        for (o, s) in orow.iter_mut().zip(&src[y * w..(y + 1) * w]) {
+            *o += *s;
         }
     }
     out
@@ -197,40 +207,39 @@ impl Conv {
     pub(crate) fn forward(&self, x: &Planes) -> Planes {
         debug_assert_eq!(x.c, self.c_in);
         let (h, w, k) = (x.h, x.w, self.k);
-        let p = (k / 2) as isize;
+        let p = k / 2;
+        let pw = w + 2 * p;
+        // Replicate-padded inputs, once per layer (1×1 convs read the planes directly).
+        let padded: Vec<Vec<f32>> = if k == 1 {
+            Vec::new()
+        } else {
+            (0..self.c_in)
+                .map(|i| pad_plane(x.plane(i), h, w, p, true))
+                .collect()
+        };
         let mut out = Planes::zeros(self.c_out, h, w);
         for o in 0..self.c_out {
             let dst = &mut out.data[o * h * w..(o + 1) * h * w];
             dst.fill(self.bias[o]);
             for i in 0..self.c_in {
-                let src = x.plane(i);
-                for ky in 0..k {
-                    for kx in 0..k {
-                        let wv = self.weight[((o * self.c_in + i) * k + ky) * k + kx];
-                        for y in 0..h {
-                            let sy =
-                                (y as isize + ky as isize - p).clamp(0, h as isize - 1) as usize;
-                            let srow = &src[sy * w..(sy + 1) * w];
-                            let drow = &mut dst[y * w..(y + 1) * w];
-                            if k == 1 {
-                                for xx in 0..w {
-                                    drow[xx] = fmadd(srow[xx], wv, drow[xx]);
-                                }
-                            } else {
-                                for xx in 0..w {
-                                    let sx = (xx as isize + kx as isize - p)
-                                        .clamp(0, w as isize - 1)
-                                        as usize;
-                                    drow[xx] = fmadd(srow[sx], wv, drow[xx]);
-                                }
-                            }
+                let wk = &self.weight[(o * self.c_in + i) * k * k..(o * self.c_in + i + 1) * k * k];
+                if k == 1 {
+                    crate::simd::axpy(dst, wk[0], x.plane(i));
+                    continue;
+                }
+                let src = &padded[i];
+                for y in 0..h {
+                    let drow = &mut dst[y * w..(y + 1) * w];
+                    for ky in 0..k {
+                        let row = &src[(y + ky) * pw..(y + ky + 1) * pw];
+                        for kx in 0..k {
+                            crate::simd::axpy(drow, wk[ky * k + kx], &row[kx..kx + w]);
                         }
                     }
                 }
             }
             if self.residual {
-                let src = x.plane(o);
-                for (d, s) in dst.iter_mut().zip(src) {
+                for (d, s) in dst.iter_mut().zip(x.plane(o)) {
                     *d += *s;
                 }
             }

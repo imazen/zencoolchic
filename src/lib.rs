@@ -21,6 +21,7 @@ mod latent;
 mod nn;
 mod rangecoder;
 mod scale_table;
+mod simd;
 
 pub use decode::{DecodeDetails, Limits, Picture, decode, decode_with_details};
 pub use error::{Error, Result};

@@ -18,7 +18,9 @@ std = []
 oracle = ["std"]
 
 [dependencies]
+archmage = { version = "0.9.30", features = ["macros"] }
 libm = "0.2.16"
+magetypes = "0.9.30"
 
 [dev-dependencies]
 
