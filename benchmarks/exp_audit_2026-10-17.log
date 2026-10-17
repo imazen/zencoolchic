@@ -4,3 +4,7 @@ mac (Apple M4 Pro, macOS libm):
 macos aarch64: evaluations 10741612544; exp bit differences 859272296; leaky-cumulative differences 0; 12.3 s
 dev (Ryzen 9 9950X3D, Ubuntu GLIBC 2.43-2ubuntu2.4):
 linux x86_64: evaluations 10741612544; exp bit differences 858811983; leaky-cumulative differences 0; 24.6 s
+GitHub Actions run 39076789012 (commit 8e9a870), 4 threads:
+windows x86_64: evaluations 10741612544; exp bit differences 836094391; leaky-cumulative differences 0; 59.7 s
+linux aarch64: evaluations 10741612544; exp bit differences 858811983; leaky-cumulative differences 0; 52.1 s
+windows aarch64: evaluations 10741612544; exp bit differences 859089903; leaky-cumulative differences 0; 53.7 s

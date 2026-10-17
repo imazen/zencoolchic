@@ -47,9 +47,11 @@ No sample differs by more than one step.
   Rust std (glibc in Linux wheels, Apple libm on macOS); this port uses the `libm` crate.
   `examples/exp_audit.rs` evaluates every (mu, scale, symbol boundary) the model can produce
   (10,741,612,544 cases): `libm::exp` differs from the platform `exp` in about 8% of them
-  (Apple libm 859,272,296; glibc 2.43 858,811,983), and in **none** does the leaky cumulative
-  `floor(free_weight · F(x))` change (`benchmarks/exp_audit_2026-10-17.log`). Streams encoded on
-  Linux (glibc) or macOS therefore decode identically here; Windows' CRT `exp` is not audited.
+  (Apple libm 859,272,296; glibc 2.43 x86_64 and aarch64 858,811,983; Windows x64 836,094,391;
+  Windows arm64 859,089,903), and in **none** does the leaky cumulative
+  `floor(free_weight · F(x))` change (`benchmarks/exp_audit_2026-10-17.log`; the
+  `exp audit` workflow reruns it). Streams encoded on any of these platforms decode
+  identically here.
 - The Laplace scale table cannot be recomputed bit-exactly (23 of 2561 entries differ from
   `f32(exp(f64))`), so it is embedded from upstream's `mu_scale.npy`
   (`scripts/gen_scale_table.py`).
