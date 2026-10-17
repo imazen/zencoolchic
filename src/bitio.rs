@@ -57,7 +57,7 @@ pub(crate) struct BitWriter {
 #[cfg(feature = "encoder")]
 impl BitWriter {
     pub(crate) fn bit(&mut self, b: bool) {
-        if self.n_bits % 8 == 0 {
+        if self.n_bits.is_multiple_of(8) {
             self.bytes.push(0);
         }
         if b {

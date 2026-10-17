@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 // The encoder lands in pieces; until its public entry point exists the writer is only
 // reached from tests. Remove with the first public encode API.
-#![cfg_attr(all(feature = "encoder", not(test)), allow(dead_code))]
+#![cfg_attr(feature = "encoder", allow(dead_code))]
 
 extern crate alloc;
 #[cfg(feature = "std")]
