@@ -6,6 +6,9 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
+// The encoder lands in pieces; until its public entry point exists the writer is only
+// reached from tests. Remove with the first public encode API.
+#![cfg_attr(all(feature = "encoder", not(test)), allow(dead_code))]
 
 extern crate alloc;
 #[cfg(feature = "std")]
@@ -22,6 +25,8 @@ mod nn;
 mod rangecoder;
 mod scale_table;
 mod simd;
+#[cfg(feature = "encoder")]
+mod write;
 
 pub use decode::{DecodeDetails, Limits, Picture, decode, decode_with_details};
 pub use error::{Error, Result};

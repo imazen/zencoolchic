@@ -9,6 +9,8 @@
 use alloc::vec::Vec;
 
 use crate::bitio::BitReader;
+#[cfg(feature = "encoder")]
+use crate::bitio::BitWriter;
 use crate::error::{Error, Result};
 
 /// Decodes `orders.len()` values; `orders[i]` is the exp-Golomb order of value `i`.
@@ -40,11 +42,44 @@ pub(crate) fn decode(data: &[u8], n_padding_bits: u32, orders: &[u32]) -> Result
     Ok(out)
 }
 
+#[cfg(feature = "encoder")]
+/// Encodes signed values with per-value orders (upstream `encode_exp_golomb`). Returns the
+/// bytes and the number of zero padding bits *prefixed* to fill whole bytes.
+pub(crate) fn encode(data: &[i64], orders: &[u32]) -> (Vec<u8>, u32) {
+    debug_assert_eq!(data.len(), orders.len());
+    // Unsigned code: x <= 0 -> -2x, x > 0 -> 2x - 1; then order-k exp-Golomb of it.
+    let mut total = 0usize;
+    let codes: Vec<(u64, u32, u32)> = data
+        .iter()
+        .zip(orders)
+        .map(|(&x, &k)| {
+            let u = if x <= 0 {
+                (-2 * x) as u64
+            } else {
+                (2 * x - 1) as u64
+            };
+            let v = u + (1u64 << k); // the (x' + 1) of upstream, x' = u + 2^k - 1
+            let len = 64 - v.leading_zeros(); // bits of v
+            let zeros = len - 1 - k; // leading zeros kept after dropping k of them
+            total += (zeros + len) as usize;
+            (v, len, zeros)
+        })
+        .collect();
+    let pad = ((8 - total % 8) % 8) as u32;
+    let mut w = BitWriter::default();
+    w.bits(0, pad);
+    for (v, len, zeros) in codes {
+        w.bits(0, zeros);
+        w.bits(v, len);
+    }
+    (w.into_bytes(), pad)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Port of upstream `encode_exp_golomb`, used only to round-trip the decoder.
+    /// Literal port of upstream `encode_exp_golomb` (bit strings), the reference for both.
     fn encode(data: &[i64], orders: &[u32]) -> (Vec<u8>, u32) {
         let mut bits: Vec<u8> = Vec::new();
         for (&x, &k) in data.iter().zip(orders) {
@@ -81,5 +116,7 @@ mod tests {
         }
         let (bytes, pad) = encode(&data, &orders);
         assert_eq!(decode(&bytes, pad, &orders).unwrap(), data);
+        #[cfg(feature = "encoder")]
+        assert_eq!(super::encode(&data, &orders), (bytes, pad));
     }
 }

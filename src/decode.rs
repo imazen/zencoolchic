@@ -72,7 +72,7 @@ pub struct DecodeDetails {
 }
 
 /// Derived architecture (upstream `CoolChicEncoderParameter.__post_init__`).
-struct Arch {
+pub(crate) struct Arch {
     size_per_latent: Vec<(usize, usize)>,
     is_hyperlatent: Vec<bool>,
     input_features_ifce: Vec<usize>,
@@ -87,7 +87,7 @@ fn ceil_div_pow2(x: u32, i: u32) -> usize {
     (x as u64).div_ceil(1u64 << i) as usize
 }
 
-fn arch(h: &CoolChicHeader) -> Result<Arch> {
+pub(crate) fn arch(h: &CoolChicHeader) -> Result<Arch> {
     let [lr0, lr1] = h.latent_resolution;
     if lr0 > lr1 {
         return Err(Error::Invalid("latent_resolution"));
@@ -295,7 +295,7 @@ fn exp_golomb_order(h: &CoolChicHeader, module: usize, bias: bool) -> u32 {
     m[bias as usize]
 }
 
-struct Networks {
+pub(crate) struct Networks {
     arm: FixedArm,
     /// One fixed-point IFCE per grid (None where the grid has no IFCE).
     ifce: Vec<Option<FixedArm>>,
@@ -303,9 +303,9 @@ struct Networks {
     synthesis: Synthesis,
 }
 
-fn build_networks(h: &CoolChicHeader, a: &Arch, nn_bytes: &[u8]) -> Result<Networks> {
-    let s = shapes(h, a)?;
-    let p = plan(&s);
+/// Exp-Golomb order of every network parameter, in stream order.
+pub(crate) fn param_orders(h: &CoolChicHeader, a: &Arch) -> Result<Vec<u32>> {
+    let p = plan(&shapes(h, a)?);
     let total: usize = p.tensors.iter().map(|t| t.2).sum();
     if total > 1 << 24 {
         return Err(Error::LimitExceeded("network parameter count"));
@@ -314,7 +314,19 @@ fn build_networks(h: &CoolChicHeader, a: &Arch, nn_bytes: &[u8]) -> Result<Netwo
     for &(m, b, n) in &p.tensors {
         orders.extend(core::iter::repeat_n(exp_golomb_order(h, m, b), n));
     }
+    Ok(orders)
+}
+
+/// Parses the network parameters; returns the networks and the raw quantized integers.
+pub(crate) fn build_networks(
+    h: &CoolChicHeader,
+    a: &Arch,
+    nn_bytes: &[u8],
+) -> Result<(Networks, Vec<i64>)> {
+    let s = shapes(h, a)?;
+    let orders = param_orders(h, a)?;
     let values = expgolomb::decode(nn_bytes, h.nn_n_bit_pad, &orders)?;
+    let raw = values.clone();
     let mut it = values.into_iter();
     let mut take = |n: usize| -> Vec<i64> { it.by_ref().take(n).collect() };
 
@@ -442,16 +454,44 @@ fn build_networks(h: &CoolChicHeader, a: &Arch, nn_bytes: &[u8]) -> Result<Netwo
             )
         })
         .collect();
-    Ok(Networks {
-        arm,
-        ifce,
-        upsampling,
-        synthesis: Synthesis {
-            layers,
-            stabiliser,
-            output_transform,
+    Ok((
+        Networks {
+            arm,
+            ifce,
+            upsampling,
+            synthesis: Synthesis {
+                layers,
+                stabiliser,
+                output_transform,
+            },
         },
-    })
+        raw,
+    ))
+}
+
+/// Produces each grid in coding order: decodes it, or encodes a known one.
+pub(crate) trait GridCoder {
+    fn grid(
+        &mut self,
+        idx: usize,
+        arm: &FixedArm,
+        window: &[usize],
+        inter: Option<&latent::InterContext>,
+        hw: (usize, usize),
+    ) -> Result<Grid>;
+}
+
+impl GridCoder for RangeDecoder<'_> {
+    fn grid(
+        &mut self,
+        _: usize,
+        arm: &FixedArm,
+        window: &[usize],
+        inter: Option<&latent::InterContext>,
+        (h, w): (usize, usize),
+    ) -> Result<Grid> {
+        latent::code_grid(self, arm, window, inter, h, w)
+    }
 }
 
 fn decode_latents(
@@ -460,8 +500,19 @@ fn decode_latents(
     nets: &Networks,
     latent_bytes: &[u8],
 ) -> Result<Vec<Grid>> {
-    let window = latent::context_window_indices(h.spatial_context_arm as usize)?;
     let mut rc = RangeDecoder::new(latent_bytes)?;
+    code_latents(h, a, nets, &mut rc)
+}
+
+/// Walks the grids coarsest first, computing each grid's IFCE context from the grids
+/// already coded.
+pub(crate) fn code_latents(
+    h: &CoolChicHeader,
+    a: &Arch,
+    nets: &Networks,
+    rc: &mut impl GridCoder,
+) -> Result<Vec<Grid>> {
+    let window = latent::context_window_indices(h.spatial_context_arm as usize)?;
     let n = a.size_per_latent.len();
     let mut grids: Vec<Option<Grid>> = (0..n).map(|_| None).collect();
     for idx in (0..n).rev() {
@@ -480,14 +531,7 @@ fn decode_latents(
         } else {
             None
         };
-        grids[idx] = Some(latent::decode_grid(
-            &mut rc,
-            &nets.arm,
-            &window,
-            inter.as_ref(),
-            gh,
-            gw,
-        )?);
+        grids[idx] = Some(rc.grid(idx, &nets.arm, &window, inter.as_ref(), (gh, gw))?);
     }
     Ok(grids.into_iter().map(|g| g.unwrap()).collect())
 }
@@ -547,7 +591,7 @@ fn decode_coolchic<'a>(data: &'a [u8], limits: &Limits) -> Result<CoolChicOut<'a
     }
     let (nn_bytes, rest) = rest.split_at(nn_len);
     let (lat_bytes, rest) = rest.split_at(lat_len);
-    let nets = build_networks(&h, &a, nn_bytes)?;
+    let (nets, _) = build_networks(&h, &a, nn_bytes)?;
     let grids = decode_latents(&h, &a, &nets, lat_bytes)?;
     let out = synthesize(&h, &a, &nets, &grids);
     Ok((out, grids, a.is_hyperlatent, rest))

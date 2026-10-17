@@ -183,6 +183,97 @@ impl<'a> RangeDecoder<'a> {
     }
 }
 
+#[cfg(feature = "encoder")]
+/// `constriction::stream::queue::DefaultRangeEncoder` (u32 words, u64 state, 24-bit
+/// probabilities). Output words are little-endian bytes, as upstream writes them.
+pub(crate) struct RangeEncoder {
+    words: alloc::vec::Vec<u32>,
+    lower: u64,
+    range: u64,
+    /// Pending carry: `(count, first word)` of words whose final value depends on a carry
+    /// that may still propagate (constriction's `EncoderSituation::Inverted`).
+    inverted: Option<(usize, u32)>,
+}
+
+#[cfg(feature = "encoder")]
+impl RangeEncoder {
+    pub(crate) fn new() -> Self {
+        Self {
+            words: alloc::vec::Vec::new(),
+            lower: 0,
+            range: u64::MAX,
+            inverted: None,
+        }
+    }
+
+    fn flush_inverted(&mut self, carry: bool) {
+        if let Some((n, first)) = self.inverted.take() {
+            let (first, rest) = if carry {
+                (first.wrapping_add(1), 0)
+            } else {
+                (first, u32::MAX)
+            };
+            self.words.push(first);
+            for _ in 1..n {
+                self.words.push(rest);
+            }
+        }
+    }
+
+    /// Encodes `symbol` under the quantized Laplace with table indices `(idx_mu, idx_scale)`.
+    pub(crate) fn encode(&mut self, symbol: i32, idx_mu: usize, idx_scale: usize) -> Result<()> {
+        if !(MIN_SYMBOL..=MAX_SYMBOL).contains(&symbol) {
+            return Err(Error::Invalid("latent value outside [-64, 63]"));
+        }
+        let mu = mu_of(idx_mu) as f64;
+        let b = scale_of(idx_scale) as f64;
+        let left = left_cumulative(symbol, mu, b);
+        let probability = right_cumulative(symbol, mu, b).wrapping_sub(left);
+
+        let scale = self.range >> PRECISION;
+        self.range = scale * probability as u64;
+        if self.range == 0 {
+            return Err(Error::Invalid("zero-probability symbol"));
+        }
+        let new_lower = self.lower.wrapping_add(scale * left as u64);
+        if self.inverted.is_some() && new_lower.wrapping_add(self.range) > new_lower {
+            self.flush_inverted(new_lower < self.lower);
+        }
+        self.lower = new_lower;
+
+        if self.range < 1u64 << 32 {
+            self.range <<= 32;
+            let lower_word = (self.lower >> 32) as u32;
+            self.lower <<= 32;
+            if let Some((n, _)) = &mut self.inverted {
+                *n += 1;
+            } else if self.lower.wrapping_add(self.range) > self.lower {
+                self.words.push(lower_word);
+            } else {
+                self.inverted = Some((1, lower_word));
+            }
+        }
+        Ok(())
+    }
+
+    /// `seal` + byte serialization.
+    pub(crate) fn finish(mut self) -> alloc::vec::Vec<u8> {
+        if self.range != u64::MAX {
+            let point = self.lower.wrapping_add((1u64 << 32) - 1);
+            if self.inverted.is_some() {
+                self.flush_inverted(point < self.lower);
+            }
+            let point_word = (point >> 32) as u32;
+            self.words.push(point_word);
+            let upper_word = (self.lower.wrapping_add(self.range) >> 32) as u32;
+            if upper_word == point_word {
+                self.words.push(0);
+            }
+        }
+        self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +299,39 @@ mod tests {
                 prev = r;
             }
             assert_eq!(prev, 1 << PRECISION);
+        }
+    }
+
+    #[cfg(feature = "encoder")]
+    #[test]
+    fn encoder_round_trips_through_decoder() {
+        // Deterministic mix of models and symbols, including extreme tails.
+        let mut seed = 0x1234_5678u64;
+        let mut rnd = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut items = alloc::vec::Vec::new();
+        for _ in 0..20000 {
+            let im = rnd(N_MU as u64) as usize;
+            let is = rnd(N_SCALE_IDX as u64) as usize;
+            let s = if rnd(10) == 0 {
+                rnd(128) as i32 - 64
+            } else {
+                (mu_of(im) as i32).clamp(-64, 63) + rnd(3) as i32 - 1
+            };
+            items.push((s.clamp(-64, 63), im, is));
+        }
+        let mut enc = RangeEncoder::new();
+        for &(s, im, is) in &items {
+            enc.encode(s, im, is).unwrap();
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        for &(s, im, is) in &items {
+            assert_eq!(dec.decode(im, is).unwrap(), s);
         }
     }
 }

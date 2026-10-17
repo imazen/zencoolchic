@@ -45,3 +45,49 @@ impl<'a> BitReader<'a> {
         Ok(())
     }
 }
+
+#[cfg(feature = "encoder")]
+/// MSB-first bit writer; [`BitWriter::into_bytes`] pads the last byte with zeros.
+#[derive(Default)]
+pub(crate) struct BitWriter {
+    bytes: alloc::vec::Vec<u8>,
+    n_bits: usize,
+}
+
+#[cfg(feature = "encoder")]
+impl BitWriter {
+    pub(crate) fn bit(&mut self, b: bool) {
+        if self.n_bits % 8 == 0 {
+            self.bytes.push(0);
+        }
+        if b {
+            *self.bytes.last_mut().unwrap() |= 0x80 >> (self.n_bits % 8);
+        }
+        self.n_bits += 1;
+    }
+
+    /// Writes the low `n` bits of `v`, most significant first.
+    pub(crate) fn bits(&mut self, v: u64, n: u32) {
+        for i in (0..n).rev() {
+            self.bit((v >> i) & 1 == 1);
+        }
+    }
+
+    /// Sign bit (1 = negative) then `n - 1` magnitude bits.
+    pub(crate) fn signed(&mut self, v: i64, n: u32) {
+        self.bit(v < 0);
+        self.bits(v.unsigned_abs(), n - 1);
+    }
+
+    pub(crate) fn len_bits(&self) -> usize {
+        self.n_bits
+    }
+
+    pub(crate) fn clone_bytes(&self) -> alloc::vec::Vec<u8> {
+        self.bytes.clone()
+    }
+
+    pub(crate) fn into_bytes(self) -> alloc::vec::Vec<u8> {
+        self.bytes
+    }
+}

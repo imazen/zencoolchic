@@ -12,6 +12,8 @@ use alloc::vec::Vec;
 
 use crate::arm::{FixedArm, N_FRAC_BIT_INTER_FT_CTX, N_FRAC_BIT_MU_SCALE, WEIGHT_SHIFT};
 use crate::error::{Error, Result};
+#[cfg(feature = "encoder")]
+use crate::rangecoder::RangeEncoder;
 use crate::rangecoder::{N_MU, N_SCALE_IDX, RangeDecoder};
 
 pub(crate) const MASK_SIZE: usize = 9;
@@ -128,9 +130,41 @@ pub(crate) fn inter_context(
     InterContext { c: n_out, data }
 }
 
-/// Decodes one `h × w` grid.
-pub(crate) fn decode_grid(
-    rc: &mut RangeDecoder<'_>,
+/// Where the symbols of a grid come from (decoding) or go to (encoding).
+pub(crate) trait SymbolCoder {
+    /// Codes the value at `(y, x)` under model `(idx_mu, idx_scale)` and returns it.
+    fn code(&mut self, y: usize, x: usize, idx_mu: usize, idx_scale: usize) -> Result<i32>;
+}
+
+impl SymbolCoder for RangeDecoder<'_> {
+    #[inline]
+    fn code(&mut self, _: usize, _: usize, idx_mu: usize, idx_scale: usize) -> Result<i32> {
+        self.decode(idx_mu, idx_scale)
+    }
+}
+
+#[cfg(feature = "encoder")]
+/// Encodes a known grid (`w`-wide, row-major) into a range encoder.
+pub(crate) struct GridEncoder<'a> {
+    pub(crate) rc: &'a mut RangeEncoder,
+    pub(crate) values: &'a [i64],
+    pub(crate) w: usize,
+}
+
+#[cfg(feature = "encoder")]
+impl SymbolCoder for GridEncoder<'_> {
+    #[inline]
+    fn code(&mut self, y: usize, x: usize, idx_mu: usize, idx_scale: usize) -> Result<i32> {
+        let v = self.values[y * self.w + x];
+        let v = i32::try_from(v).map_err(|_| Error::Invalid("latent value outside [-64, 63]"))?;
+        self.rc.encode(v, idx_mu, idx_scale)?;
+        Ok(v)
+    }
+}
+
+/// Decodes (or, with a [`GridEncoder`], encodes) one `h × w` grid in upstream's symbol order.
+pub(crate) fn code_grid(
+    rc: &mut impl SymbolCoder,
     arm: &FixedArm,
     window: &[usize],
     inter: Option<&InterContext>,
@@ -172,7 +206,7 @@ pub(crate) fn decode_grid(
         arm.forward(&ctx, shift, &mut out);
         let im = (out[0] - mu_min_fp).clamp(0, N_MU as i64 - 1) as usize;
         let is = (out[1] - log_scale_min_fp).clamp(0, N_SCALE_IDX as i64 - 1) as usize;
-        padded[centre] = rc.decode(im, is)? as i64;
+        padded[centre] = rc.code(y, x, im, is)? as i64;
         Ok(())
     };
 

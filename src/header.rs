@@ -7,6 +7,8 @@
 use alloc::vec::Vec;
 
 use crate::bitio::BitReader;
+#[cfg(feature = "encoder")]
+use crate::bitio::BitWriter;
 use crate::error::{Error, Result};
 
 /// Video header: the coding structure (which frames are intra / P / B).
@@ -191,7 +193,7 @@ impl FrameHeader {
 
 /// Smallest log2 quantization step per (module, weight|bias); the header stores an index
 /// on top of it (upstream `POSSIBLE_Q_STEP`).
-const Q_SHIFT_MIN: PerModule<i32> = PerModule {
+pub(crate) const Q_SHIFT_MIN: PerModule<i32> = PerModule {
     arm: [-8, -16],
     ifce: [-8, -16],
     upsampling: [-12, 0],
@@ -326,5 +328,120 @@ impl CoolChicHeader {
             },
             rest,
         ))
+    }
+}
+
+#[cfg(feature = "encoder")]
+/// Bits of `n_bytes_header` itself, written at the end of every fixed part.
+const N_BYTES_HEADER_BITS: usize = 16;
+
+#[cfg(feature = "encoder")]
+/// Finishes a header: `fixed` is written, then `n_bytes_header`, then `var`; the total
+/// size (rounded up to bytes) is what `n_bytes_header` holds.
+fn assemble(fixed: BitWriter, var: BitWriter) -> Vec<u8> {
+    let total = fixed.len_bits() + N_BYTES_HEADER_BITS + var.len_bits();
+    let n_bytes = total.div_ceil(8);
+    let mut w = BitWriter::default();
+    copy_bits(&mut w, &fixed);
+    w.bits(n_bytes as u64, 16);
+    copy_bits(&mut w, &var);
+    w.into_bytes()
+}
+
+#[cfg(feature = "encoder")]
+fn copy_bits(dst: &mut BitWriter, src: &BitWriter) {
+    let n = src.len_bits();
+    let bytes = src.clone_bytes();
+    for i in 0..n {
+        dst.bit((bytes[i / 8] >> (7 - i % 8)) & 1 == 1);
+    }
+}
+
+#[cfg(feature = "encoder")]
+impl VideoHeader {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut f = BitWriter::default();
+        f.bits(self.n_frames as u64, 12);
+        f.bits(self.intra_pos.len() as u64, 12);
+        f.bits(self.p_pos.len() as u64, 12);
+        let mut v = BitWriter::default();
+        for &p in self.intra_pos.iter().chain(&self.p_pos) {
+            v.bits(p as u64, 12);
+        }
+        assemble(f, v)
+    }
+}
+
+#[cfg(feature = "encoder")]
+impl FrameHeader {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut f = BitWriter::default();
+        f.bits(self.display_index as u64, 12);
+        f.bits(self.frame_type as u64, 2);
+        f.bits(self.frame_data_type as u64, 2);
+        f.bits((self.bitdepth - 8) as u64, 4);
+        let mut v = BitWriter::default();
+        for &r in &self.index_references {
+            v.bits(r as u64, 12);
+        }
+        for &g in &self.global_flow {
+            v.signed(g as i64, 14);
+        }
+        if let Some(s) = self.warp_filter_size {
+            v.bits(s as u64, 4);
+        }
+        assemble(f, v)
+    }
+}
+
+#[cfg(feature = "encoder")]
+impl CoolChicHeader {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut f = BitWriter::default();
+        f.bits(self.linear_stabiliser_synth as u64, 1);
+        f.bits(self.layers_synthesis.len() as u64, 3);
+        f.bits(self.ups_k_size as u64, 4);
+        f.bits(self.ups_preconcat_k_size as u64, 4);
+        f.bits(self.output_feature_ifce as u64, 5);
+        f.bits(self.spatial_context_arm as u64, 6);
+        f.bits(self.linear_stabiliser_arm as u64, 1);
+        f.bits(self.n_hidden_layers_arm as u64, 3);
+        for &s in &self.img_size {
+            f.bits(s as u64, 14);
+        }
+        for &r in &self.latent_resolution {
+            f.bits(r as u64, 4);
+        }
+        f.bits(self.n_latent_grids as u64, 5);
+        f.bits(self.hyperlatent_resolution.is_some() as u64, 1);
+        f.bits(self.flag_common_randomness as u64, 1);
+        f.bits(self.final_upsampling as u64, 2);
+        let flat = |p: &PerModule<i32>| [p.arm, p.ifce, p.upsampling, p.synthesis].concat();
+        for (s, m) in flat(&self.nn_q_shift).into_iter().zip(flat(&Q_SHIFT_MIN)) {
+            f.bits((s - m) as u64, 5);
+        }
+        let e = &self.nn_expgol_cnt;
+        for c in [e.arm, e.ifce, e.upsampling, e.synthesis].concat() {
+            f.bits(c as u64, 4);
+        }
+        f.bits(self.nn_n_bytes as u64, 14);
+        f.bits(self.nn_n_bit_pad as u64, 3);
+        f.bits(self.n_bytes_latent as u64, 28);
+        let mut v = BitWriter::default();
+        for r in self
+            .ifce_resolution
+            .iter()
+            .chain(&self.hyperlatent_resolution)
+        {
+            v.bits(r[0] as u64, 4);
+            v.bits(r[1] as u64, 4);
+        }
+        for l in &self.layers_synthesis {
+            v.bits(l.out_ft as u64, 7);
+            v.bits(l.k_size as u64, 4);
+            v.bits(l.residual as u64, 1);
+            v.bits(l.relu as u64, 1);
+        }
+        assemble(f, v)
     }
 }

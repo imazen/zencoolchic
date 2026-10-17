@@ -13,9 +13,11 @@ publish = false
 [features]
 default = []
 std = []
+# Bitstream writer (and, later, the encoder).
+encoder = ["std"]
 # Differential tests against the upstream Python decoder's dumps
 # (`scripts/oracle/dump_decode.py`). Needs ZENCOOLCHIC_ORACLE_DIR.
-oracle = ["std"]
+oracle = ["std", "encoder"]
 
 [dependencies]
 archmage = { version = "0.9.30", features = ["macros"] }
