@@ -43,11 +43,10 @@ No sample differs by more than one step.
 
 ### Speed (2026-10-17, mac M4 Pro, single thread)
 
-kodim14 (768×512): **176 ms** (`cargo run --release --example decode --features std --
-kodim14.cool --repeat 5`, best of 5; commit 2159b69). Upstream's decoder reports
+kodim14 (768×512): **178 ms** (`cargo run --release --example decode --features std --
+kodim14.cool --repeat 5`, best of 5; commit 9ee5fa7). Upstream's decoder reports
 `Decoding frame 0 time = 0.46 seconds` for the same stream on the same machine (torch 2.14.1
-CPU, its own timer, model construction included). Of the 176 ms, about 145 are latent
-decoding (fixed-point ARM ~70%, range coder ~20%); the float networks are the rest.
+CPU, its own timer, model construction included).
 
 ### Bit-exactness risks
 
