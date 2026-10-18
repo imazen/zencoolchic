@@ -331,43 +331,52 @@ fn eigh_descending(m: &[f32], d: usize) -> Vec<f32> {
     out
 }
 
-/// Q factor of a square matrix (modified Gram–Schmidt with re-orthogonalization, f64).
-/// Column signs follow Householder QR's convention (`R` diagonal non-positive is LAPACK's
-/// usual output, but SOAP is invariant to column signs).
+/// Q factor of a square matrix by Householder reflections (f64), as LAPACK's `geqrf` +
+/// `orgqr` behind `torch.linalg.qr`: orthonormal to rounding however rank-deficient the input
+/// (SOAP's Kronecker factors usually are). Column signs may differ from LAPACK's; SOAP is
+/// invariant to them.
 fn qr_q(a: &[f64], d: usize) -> Vec<f64> {
-    let mut q = vec![0.0f64; d * d];
+    let mut r = a.to_vec();
+    // Householder vectors, one per column.
+    let mut vs: Vec<Vec<f64>> = Vec::with_capacity(d);
     for c in 0..d {
-        let mut col: Vec<f64> = (0..d).map(|i| a[i * d + c]).collect();
-        for _ in 0..2 {
-            for p in 0..c {
-                let dot: f64 = (0..d).map(|i| q[i * d + p] * col[i]).sum();
-                for i in 0..d {
-                    col[i] -= dot * q[i * d + p];
+        let norm = libm::sqrt((c..d).map(|i| r[i * d + c] * r[i * d + c]).sum::<f64>());
+        let mut v = vec![0.0f64; d];
+        if norm > 0.0 {
+            let alpha = if r[c * d + c] > 0.0 { -norm } else { norm };
+            for i in c..d {
+                v[i] = r[i * d + c];
+            }
+            v[c] -= alpha;
+            let vn = libm::sqrt(v.iter().map(|x| x * x).sum::<f64>());
+            if vn > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= vn;
                 }
+                // R = (I - 2 v vᵀ) R
+                for j in 0..d {
+                    let dotv: f64 = (c..d).map(|i| v[i] * r[i * d + j]).sum();
+                    for i in c..d {
+                        r[i * d + j] -= 2.0 * v[i] * dotv;
+                    }
+                }
+            } else {
+                v.fill(0.0);
             }
         }
-        let norm = libm::sqrt(col.iter().map(|v| v * v).sum::<f64>());
-        if norm > 1e-300 {
-            for i in 0..d {
-                q[i * d + c] = col[i] / norm;
-            }
-        } else {
-            // Rank-deficient input: complete the basis with a unit vector orthogonal to the
-            // previous columns.
-            for e in 0..d {
-                let mut cand: Vec<f64> = (0..d).map(|i| if i == e { 1.0 } else { 0.0 }).collect();
-                for p in 0..c {
-                    let dot: f64 = (0..d).map(|i| q[i * d + p] * cand[i]).sum();
-                    for i in 0..d {
-                        cand[i] -= dot * q[i * d + p];
-                    }
-                }
-                let n = libm::sqrt(cand.iter().map(|v| v * v).sum::<f64>());
-                if n > 1e-6 {
-                    for i in 0..d {
-                        q[i * d + c] = cand[i] / n;
-                    }
-                    break;
+        vs.push(v);
+    }
+    // Q = H_0 H_1 … H_{d-1} applied to the identity.
+    let mut q = vec![0.0f64; d * d];
+    for i in 0..d {
+        q[i * d + i] = 1.0;
+    }
+    for v in vs.iter().rev() {
+        for j in 0..d {
+            let dotv: f64 = (0..d).map(|i| v[i] * q[i * d + j]).sum();
+            if dotv != 0.0 {
+                for i in 0..d {
+                    q[i * d + j] -= 2.0 * v[i] * dotv;
                 }
             }
         }
@@ -411,6 +420,32 @@ mod tests {
                 } else {
                     assert!(s.abs() < 1e-5, "off-diagonal {s}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn qr_is_orthonormal_on_rank_deficient_input() {
+        // Power iteration of a rank-3 48×48 Gram matrix (SOAP's synthesis 3×48 weight).
+        let d = 48;
+        let mut seed = 11u32;
+        let mut r = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f64 / (1 << 24) as f64 - 0.5
+        };
+        let b: Vec<f64> = (0..3 * d).map(|_| r()).collect();
+        let mut m = vec![0.0f64; d * d];
+        for i in 0..d {
+            for j in 0..d {
+                m[i * d + j] = (0..3).map(|k| b[k * d + i] * b[k * d + j]).sum();
+            }
+        }
+        let q = qr_q(&m, d);
+        for a in 0..d {
+            for c in 0..d {
+                let s: f64 = (0..d).map(|i| q[i * d + a] * q[i * d + c]).sum();
+                let want = if a == c { 1.0 } else { 0.0 };
+                assert!((s - want).abs() < 1e-12, "qᵀq[{a}][{c}] = {s}");
             }
         }
     }
