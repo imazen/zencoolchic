@@ -35,3 +35,25 @@ speed claim. Gradient/SOAP tensors and `.cool` inputs are outside this compariso
 
 These transformed files are storage experiments. Current `just oracle-all` reads
 the original dump layout; using PNG/IMI fixtures would require a restoration step.
+
+## Zstd and test-time loading
+
+```sh
+just fixture-zstd /absolute/path/to/fixture-root /absolute/path/to/new-output-directory
+```
+
+This mode requires the `zenzstd` sibling checkout and a `zstd` executable as an
+independent measurement/decode oracle. It reads all 68 entries in the portable
+bundle's `manifest.json`, compares ordinary zstd with reversible byte-plane
+packing, and records per-file and category totals. Every frame is decompressed
+with the pure-Rust decoder under its exact expected output-size cap; all original
+bytes must agree. Our encoder's frames are additionally decoded with C zstd.
+The source fixtures remain intact. The large per-file table stays in the output
+directory; category totals and method are in
+[the zstd study](../../benchmarks/fixture_zstd_2026-10-18.md).
+
+The measurement helper's `zenzstd::stream::decode_all_with_max` call demonstrates
+bounded in-memory recovery. A future regression loader can use the same API as a
+test dependency, with checked-in `.zst` files, expected lengths and SHA-256s. It
+would require no executable, Python, network or extraction at test runtime.
+That regression-loading path is proposed; it is not installed by this study.

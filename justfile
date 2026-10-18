@@ -98,3 +98,11 @@ fixture-compression-fmt:
 
 fixture-compression-summary input output log csv python="python3":
     '{{python}}' tools/fixture-compression/summarize.py '{{input}}' '{{output}}' '{{log}}' '{{csv}}'
+
+# Includes C zstd as an independent measurement/decode oracle.
+fixture-zstd input output:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "$HOME/tmp"
+    cd "$HOME/tmp"
+    cargo run --release --manifest-path '{{justfile_directory()}}/tools/fixture-compression/Cargo.toml' --bin zstd_fixtures -- '{{input}}' '{{output}}'

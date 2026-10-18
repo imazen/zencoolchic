@@ -431,6 +431,7 @@ dependencies = [
  "rgb",
  "serde_json",
  "zenpng",
+ "zenzstd",
 ]
 
 [[package]]
@@ -504,6 +505,10 @@ dependencies = [
  "zenpixels",
  "zenpixels-convert",
 ]
+
+[[package]]
+name = "zenzstd"
+version = "0.1.0"
 
 [[package]]
 name = "zmij"
