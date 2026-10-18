@@ -4,10 +4,9 @@ A safe-Rust port of [Cool-chic](https://github.com/Orange-OpenSource/Cool-Chic) 
 overfitted neural image codec: each image carries its own tiny decoder (latent grids, an
 auto-regressive entropy model, upsampling and a small synthesis CNN, about 2000 MAC per pixel).
 
-**Status: decoder for still images; no encoder yet.** On upstream's sample stream the integer
-latents match the reference decoder exactly and 5 of 1,179,648 output samples differ by one
-step. Inter frames, and an encoder, are not ported. [`PORTING.md`](PORTING.md) has the
-module-by-module status and what each claim rests on.
+**Status: still-image decoder and experimental encoder.** The decoder's integer latents
+match upstream on 12 oracle streams; floating-point reconstruction differs by at most one
+output step. Inter frames are not ported. See [`PORTING.md`](PORTING.md) for evidence.
 
 ```rust
 let data = std::fs::read("kodim14.cool")?;
@@ -16,6 +15,26 @@ let rgb = picture.to_rgb8(); // Some(interleaved RGB) for 8-bit RGB streams
 ```
 
 `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`.
+
+## Encoder
+
+Enable `encoder` to train a decoder for each RGB8 image, quantize its networks, run optional
+RDOQ, and write a `.cool` stream. For a binary P6 RGB8 PPM:
+
+```sh
+cargo run --release --example encode --features encoder -- input.ppm output.cool 10000 0.001 1
+```
+
+The last arguments are iteration budget (minimum 2000), lambda, and architecture
+(`0` vhop, `1` hop, `2` mop, `3` lop). On CID22 image 1279330 (512×512, lambda 0.001,
+10,000 iterations, hop, one seed each), this port produced **10,692 bytes / 37.988 dB in
+507 s**, versus upstream's **10,769 bytes / 38.157 dB in 1,065 s** on the same M4 Pro.
+These are one-image observations, not a quality or speed calibration
+([recorded benchmark](benchmarks/encode_cid22_1279330_2026-10-17.tsv)).
+
+Encoding YUV/10-bit input, common randomness / Wasserstein tuning, latents starting below
+full resolution, and video are not supported. [Encoder details](docs/ENCODER.md) covers
+settings, determinism, the training pipeline, and parity evidence.
 
 ## License
 

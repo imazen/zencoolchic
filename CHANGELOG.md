@@ -15,6 +15,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Encoder usage and pipeline documentation in `docs/ENCODER.md`.
+
 - Cool-chic 5 image decoder: headers, exp-Golomb network parameters, fixed-point ARM and
   IFCE, constriction-compatible range decoder, upsampling, synthesis, RGB / YUV 4:2:0 /
   YUV 4:4:4 output at 8–16 bits.
