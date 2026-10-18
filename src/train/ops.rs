@@ -12,6 +12,7 @@ use super::arm_batch::{
 use super::{
     ConvLayer, Linear, LossTerms, Mlp, Params, Quantizer, Shape, StepCfg, WINDOW, full_kernel,
 };
+use crate::simd::{axpy, dot};
 
 const PAD: usize = (WINDOW - 1) / 2;
 
@@ -128,6 +129,7 @@ pub(super) fn mlp_forward(m: &Mlp, x: &[f32], acts: &mut Vec<Vec<f32>>) {
 
 /// Backward for [`mlp_forward`]: accumulates weight gradients into `g` (f64) and writes the
 /// input gradient to `dx`.
+#[inline(never)]
 fn mlp_backward(m: &Mlp, acts: &[Vec<f32>], dout: &[f32], g: &mut MlpGrad, dx: &mut [f32]) {
     let x = &acts[0];
     dx.fill(0.0);
@@ -260,6 +262,7 @@ fn pad(src: &[f32], h: usize, w: usize, p: usize, replicate: bool) -> Vec<f32> {
 }
 
 /// Backward of [`pad`]: folds a padded gradient back onto the plane.
+#[inline(never)]
 fn unpad(dp: &[f32], h: usize, w: usize, p: usize, replicate: bool, dst: &mut [f32]) {
     let pw = w + 2 * p;
     for py in 0..h + 2 * p {
@@ -276,6 +279,10 @@ fn unpad(dp: &[f32], h: usize, w: usize, p: usize, replicate: bool, dst: &mut [f
 
 /// Train-mode transposed conv (`UpsamplingSeparableSymmetricConvTranspose2d`), cropped to
 /// `(th, tw)` (≤ 2h × 2w).
+///
+/// Per output phase: uncropped output `f = 2m + parity` gathers `xp[m - a][n - b] ·
+/// K[py + 2a][px + 2b]`, a contiguous correlation per row.
+#[inline(never)]
 pub(super) fn conv_t_forward(
     x: &[f32],
     h: usize,
@@ -285,32 +292,40 @@ pub(super) fn conv_t_forward(
     th: usize,
     tw: usize,
 ) -> Vec<f32> {
+    let half = k / 2;
     let p0 = k / 2;
     let c = 2 * p0 - 1 + k / 2;
-    let (ph, pw) = (h + 2 * p0, w + 2 * p0);
+    let pw = w + 2 * p0;
     let xp = pad(x, h, w, p0, true);
+    let m0 = c >> 1;
+    let nm = ((tw - 1 + c) >> 1) - m0 + 1;
     let mut out = vec![0.0f32; th * tw];
-    for i in 0..ph {
-        for j in 0..pw {
-            let v = xp[i * pw + j];
-            for ky in 0..k {
-                let fy = 2 * i + ky;
-                if fy < c || fy - c >= th {
-                    continue;
-                }
-                for kx in 0..k {
-                    let fx = 2 * j + kx;
-                    if fx < c || fx - c >= tw {
-                        continue;
-                    }
-                    out[(fy - c) * tw + fx - c] += v * k2[ky * k + kx];
+    let mut tmp = [vec![0.0f32; nm], vec![0.0f32; nm]];
+    for oy in 0..th {
+        let f = oy + c;
+        let (my, py) = (f >> 1, f & 1);
+        for (px, t) in tmp.iter_mut().enumerate() {
+            t.fill(0.0);
+            for a in 0..half {
+                let row = &xp[(my - a) * pw..(my - a + 1) * pw];
+                for b in 0..half {
+                    axpy(
+                        t,
+                        k2[(py + 2 * a) * k + px + 2 * b],
+                        &row[m0 - b..m0 - b + nm],
+                    );
                 }
             }
+        }
+        for (ox, o) in out[oy * tw..(oy + 1) * tw].iter_mut().enumerate() {
+            let f = ox + c;
+            *o = tmp[f & 1][(f >> 1) - m0];
         }
     }
     out
 }
 
+#[inline(never)]
 fn conv_t_backward(
     x: &[f32],
     h: usize,
@@ -323,57 +338,66 @@ fn conv_t_backward(
     dx: &mut [f32],
     dk2: &mut [f32],
 ) {
+    let half = k / 2;
     let p0 = k / 2;
     let c = 2 * p0 - 1 + k / 2;
     let (ph, pw) = (h + 2 * p0, w + 2 * p0);
     let xp = pad(x, h, w, p0, true);
     let mut dxp = vec![0.0f32; ph * pw];
-    for i in 0..ph {
-        for j in 0..pw {
-            let v = xp[i * pw + j];
-            let mut acc = 0.0f32;
-            for ky in 0..k {
-                let fy = 2 * i + ky;
-                if fy < c || fy - c >= th {
-                    continue;
-                }
-                for kx in 0..k {
-                    let fx = 2 * j + kx;
-                    if fx < c || fx - c >= tw {
-                        continue;
-                    }
-                    let d = dout[(fy - c) * tw + fx - c];
-                    acc += d * k2[ky * k + kx];
-                    dk2[ky * k + kx] += d * v;
+    let m0 = c >> 1;
+    let nm = ((tw - 1 + c) >> 1) - m0 + 1;
+    let mut dt = [vec![0.0f32; nm], vec![0.0f32; nm]];
+    let mut dk = vec![0.0f64; k * k];
+    for oy in 0..th {
+        let f = oy + c;
+        let (my, py) = (f >> 1, f & 1);
+        dt[0].fill(0.0);
+        dt[1].fill(0.0);
+        for (ox, &d) in dout[oy * tw..(oy + 1) * tw].iter().enumerate() {
+            let f = ox + c;
+            dt[f & 1][(f >> 1) - m0] = d;
+        }
+        for (px, t) in dt.iter().enumerate() {
+            for a in 0..half {
+                let r0 = (my - a) * pw;
+                for b in 0..half {
+                    let ki = (py + 2 * a) * k + px + 2 * b;
+                    dk[ki] += dot(t, &xp[r0 + m0 - b..r0 + m0 - b + nm]) as f64;
+                    axpy(&mut dxp[r0 + m0 - b..r0 + m0 - b + nm], k2[ki], t);
                 }
             }
-            dxp[i * pw + j] = acc;
         }
+    }
+    for (a, b) in dk2.iter_mut().zip(&dk) {
+        *a += *b as f32;
     }
     unpad(&dxp, h, w, p0, true, dx);
 }
 
 /// Train-mode `UpsamplingSeparableSymmetricConv2d`: zero-padded conv with `kron(w, w)`, plus
 /// the input.
+#[inline(never)]
 pub(super) fn sym_conv_forward(x: &[f32], h: usize, w: usize, k2: &[f32], k: usize) -> Vec<f32> {
     let p = k / 2;
     let pw = w + 2 * p;
     let xp = pad(x, h, w, p, false);
-    let mut out = x.to_vec();
+    let mut out = vec![0.0f32; h * w];
     for y in 0..h {
-        for xx in 0..w {
-            let mut acc = 0.0f32;
-            for ky in 0..k {
-                for kx in 0..k {
-                    acc += xp[(y + ky) * pw + xx + kx] * k2[ky * k + kx];
-                }
+        let orow = &mut out[y * w..(y + 1) * w];
+        for ky in 0..k {
+            let row = &xp[(y + ky) * pw..(y + ky + 1) * pw];
+            for kx in 0..k {
+                axpy(orow, k2[ky * k + kx], &row[kx..kx + w]);
             }
-            out[y * w + xx] += acc;
+        }
+        for (o, s) in orow.iter_mut().zip(&x[y * w..(y + 1) * w]) {
+            *o += *s;
         }
     }
     out
 }
 
+#[inline(never)]
 fn sym_conv_backward(
     x: &[f32],
     h: usize,
@@ -388,17 +412,19 @@ fn sym_conv_backward(
     let pw = w + 2 * p;
     let xp = pad(x, h, w, p, false);
     let mut dxp = vec![0.0f32; xp.len()];
+    let mut dk = vec![0.0f64; k * k];
     for y in 0..h {
-        for xx in 0..w {
-            let d = dout[y * w + xx];
-            for ky in 0..k {
-                for kx in 0..k {
-                    let idx = (y + ky) * pw + xx + kx;
-                    dxp[idx] += d * k2[ky * k + kx];
-                    dk2[ky * k + kx] += d * xp[idx];
-                }
+        let drow = &dout[y * w..(y + 1) * w];
+        for ky in 0..k {
+            let r0 = (y + ky) * pw;
+            for kx in 0..k {
+                dk[ky * k + kx] += dot(drow, &xp[r0 + kx..r0 + kx + w]) as f64;
+                axpy(&mut dxp[r0 + kx..r0 + kx + w], k2[ky * k + kx], drow);
             }
         }
+    }
+    for (a, b) in dk2.iter_mut().zip(&dk) {
+        *a += *b as f32;
     }
     unpad(&dxp, h, w, p, false, dx);
     for (a, b) in dx.iter_mut().zip(dout) {
@@ -411,22 +437,29 @@ pub(super) fn conv_forward(l: &ConvLayer, x: &[f32], h: usize, w: usize) -> Vec<
     let (k, p) = (l.k, l.k / 2);
     let pw = w + 2 * p;
     let n = h * w;
-    let xp: Vec<Vec<f32>> = (0..l.c_in)
-        .map(|i| pad(&x[i * n..(i + 1) * n], h, w, p, true))
-        .collect();
+    let xp: Vec<Vec<f32>> = if k == 1 {
+        Vec::new()
+    } else {
+        (0..l.c_in)
+            .map(|i| pad(&x[i * n..(i + 1) * n], h, w, p, true))
+            .collect()
+    };
     let mut out = vec![0.0f32; l.c_out * n];
     for o in 0..l.c_out {
         let dst = &mut out[o * n..(o + 1) * n];
         dst.fill(l.b[o]);
         for i in 0..l.c_in {
-            for ky in 0..k {
-                for kx in 0..k {
-                    let wv = l.w[((o * l.c_in + i) * k + ky) * k + kx];
-                    for y in 0..h {
-                        let row = &xp[i][(y + ky) * pw + kx..(y + ky) * pw + kx + w];
-                        for (d, s) in dst[y * w..(y + 1) * w].iter_mut().zip(row) {
-                            *d += *s * wv;
-                        }
+            let wk = &l.w[(o * l.c_in + i) * k * k..(o * l.c_in + i + 1) * k * k];
+            if k == 1 {
+                axpy(dst, wk[0], &x[i * n..(i + 1) * n]);
+                continue;
+            }
+            for y in 0..h {
+                let drow = &mut dst[y * w..(y + 1) * w];
+                for ky in 0..k {
+                    let row = &xp[i][(y + ky) * pw..(y + ky + 1) * pw];
+                    for kx in 0..k {
+                        axpy(drow, wk[ky * k + kx], &row[kx..kx + w]);
                     }
                 }
             }
@@ -453,7 +486,18 @@ fn conv_backward(
     let pw = w + 2 * p;
     let n = h * w;
     for i in 0..l.c_in {
-        let xp = pad(&x[i * n..(i + 1) * n], h, w, p, true);
+        let xi = &x[i * n..(i + 1) * n];
+        if k == 1 {
+            let dxi = &mut dx[i * n..(i + 1) * n];
+            for o in 0..l.c_out {
+                let d = &dout[o * n..(o + 1) * n];
+                let widx = o * l.c_in + i;
+                g.w[widx] += dot(d, xi);
+                axpy(dxi, l.w[widx], d);
+            }
+            continue;
+        }
+        let xp = pad(xi, h, w, p, true);
         let mut dxp = vec![0.0f32; xp.len()];
         for o in 0..l.c_out {
             let d = &dout[o * n..(o + 1) * n];
@@ -464,11 +508,9 @@ fn conv_backward(
                     let mut gw = 0.0f64;
                     for y in 0..h {
                         let base = (y + ky) * pw + kx;
-                        for xx in 0..w {
-                            let dv = d[y * w + xx];
-                            gw += (dv * xp[base + xx]) as f64;
-                            dxp[base + xx] += dv * wv;
-                        }
+                        let drow = &d[y * w..(y + 1) * w];
+                        gw += dot(drow, &xp[base..base + w]) as f64;
+                        axpy(&mut dxp[base..base + w], wv, drow);
                     }
                     g.w[widx] += gw as f32;
                 }
