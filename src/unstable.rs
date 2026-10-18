@@ -18,6 +18,8 @@ pub struct TrainOptions {
     /// 0 = vhop, 1 = hop, 2 = mop, 3 = lop.
     pub arch: u8,
     pub seed: u64,
+    /// Run RDOQ on the quantized networks (upstream always does).
+    pub rdoq: bool,
 }
 
 impl Default for TrainOptions {
@@ -28,6 +30,7 @@ impl Default for TrainOptions {
             n_itr: 10_000,
             arch: 1,
             seed: 0,
+            rdoq: true,
         }
     }
 }
@@ -75,7 +78,11 @@ pub fn encode_rgb8(
         loss: l.loss,
     };
     let has_ifce = p.ifce.iter().any(|m| m.is_some());
-    let (pq, q) = crate::train::quantize::quantize_model(&pb, &p, has_ifce);
+    let (mut pq, q) = crate::train::quantize::quantize_model(&pb, &p, has_ifce);
+    if opt.rdoq {
+        let mut rng = trainer::Rng::new(opt.seed ^ 0x5244_4f51);
+        crate::train::rdoq::rdoq(&pb, &mut pq, &q, &mut rng, log);
+    }
     let mut scratch = pq.zeros_like();
     let lq = trainer::evaluate(&pb, &pq, &mut scratch);
     let nn_bits = crate::train::quantize::network_rate(&pq, &q) as f64;

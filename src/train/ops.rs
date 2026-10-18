@@ -58,7 +58,7 @@ fn cdf_and_grads(v: f32, mu: f32, b: f32) -> (f32, f32, f32) {
 /// Rate in bits of value `x` under the ARM output `(mu, raw log-scale)`, and its gradients
 /// with respect to `x`, `mu`, raw log-scale.
 #[inline]
-fn rate_and_grads(x: f32, mu: f32, raw_ls: f32) -> (f32, f32, f32, f32) {
+pub(super) fn rate_and_grads(x: f32, mu: f32, raw_ls: f32) -> (f32, f32, f32, f32) {
     let ls = raw_ls - 4.0;
     let lsc = ls.clamp(-5.0, 5.0);
     let b = libm::expf(lsc);
@@ -88,7 +88,7 @@ fn rate_and_grads(x: f32, mu: f32, raw_ls: f32) -> (f32, f32, f32, f32) {
 // MLP (one context vector at a time)
 
 /// Forward through an MLP; `acts[l]` receives layer `l`'s input, `acts[n]` the output.
-fn mlp_forward(m: &Mlp, x: &[f32], acts: &mut Vec<Vec<f32>>) {
+pub(super) fn mlp_forward(m: &Mlp, x: &[f32], acts: &mut Vec<Vec<f32>>) {
     acts.resize(m.layers.len() + 1, Vec::new());
     acts[0].clear();
     acts[0].extend_from_slice(x);
@@ -214,7 +214,7 @@ impl MlpGrad {
 // ---------------------------------------------------------------------------------------
 // Convolutions
 
-fn kron(w: &[f32]) -> Vec<f32> {
+pub(super) fn kron(w: &[f32]) -> Vec<f32> {
     let k = w.len();
     let mut out = vec![0.0; k * k];
     for r in 0..k {
@@ -273,7 +273,7 @@ fn unpad(dp: &[f32], h: usize, w: usize, p: usize, replicate: bool, dst: &mut [f
 
 /// Train-mode transposed conv (`UpsamplingSeparableSymmetricConvTranspose2d`), cropped to
 /// `(th, tw)` (≤ 2h × 2w).
-fn conv_t_forward(
+pub(super) fn conv_t_forward(
     x: &[f32],
     h: usize,
     w: usize,
@@ -352,7 +352,7 @@ fn conv_t_backward(
 
 /// Train-mode `UpsamplingSeparableSymmetricConv2d`: zero-padded conv with `kron(w, w)`, plus
 /// the input.
-fn sym_conv_forward(x: &[f32], h: usize, w: usize, k2: &[f32], k: usize) -> Vec<f32> {
+pub(super) fn sym_conv_forward(x: &[f32], h: usize, w: usize, k2: &[f32], k: usize) -> Vec<f32> {
     let p = k / 2;
     let pw = w + 2 * p;
     let xp = pad(x, h, w, p, false);
@@ -404,7 +404,7 @@ fn sym_conv_backward(
 }
 
 /// Synthesis conv forward (replicate padding, bias, residual; no activation).
-fn conv_forward(l: &ConvLayer, x: &[f32], h: usize, w: usize) -> Vec<f32> {
+pub(super) fn conv_forward(l: &ConvLayer, x: &[f32], h: usize, w: usize) -> Vec<f32> {
     let (k, p) = (l.k, l.k / 2);
     let pw = w + 2 * p;
     let n = h * w;
@@ -489,15 +489,15 @@ fn conv_backward(
 
 /// For grid `idx`, where each channel of its IFCE input comes from: `(grid, flat index map)`
 /// per channel, at the resolution `(uh, uw)` of grid `idx + 1`.
-struct Stack {
-    uh: usize,
-    uw: usize,
+pub(super) struct Stack {
+    pub(super) uh: usize,
+    pub(super) uw: usize,
     /// (source grid, source flat index per stacked pixel); empty = the all-zero channel of
     /// the coarsest grid.
-    channels: Vec<(usize, Vec<u32>)>,
+    pub(super) channels: Vec<(usize, Vec<u32>)>,
 }
 
-fn ifce_stack(shape: &Shape, idx: usize) -> Stack {
+pub(super) fn ifce_stack(shape: &Shape, idx: usize) -> Stack {
     let n = shape.grids.len();
     if idx == n - 1 {
         let (h, w) = shape.grids[idx];

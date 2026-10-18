@@ -1,0 +1,237 @@
+//! Forward-only pieces of the evaluation pass (hardround latents), for RDOQ's partial
+//! scores (upstream `nnquant/rdoq.py`: `score_arm`, `score_ifce`, `score_syn_image`).
+//! `tests::stages_compose_to_the_evaluation_pass` holds them equal to `ops::step`.
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use super::ops::{
+    conv_forward, conv_t_forward, ifce_stack, kron, mlp_forward, rate_and_grads, sym_conv_forward,
+};
+use super::{Mlp, Params, Shape, WINDOW, full_kernel};
+
+const PAD: usize = (WINDOW - 1) / 2;
+
+/// `round(gain · y)` per grid.
+pub(crate) fn quantize_hard(p: &Params, gain: f32) -> Vec<Vec<f32>> {
+    p.latents
+        .iter()
+        .map(|l| l.iter().map(|&y| libm::rintf(y * gain)).collect())
+        .collect()
+}
+
+/// IFCE context of every grid (pixel-major, `n_ifce` values); None without IFCE.
+pub(crate) fn ifce_contexts(
+    shape: &Shape,
+    ifce: &[Option<Mlp>],
+    q: &[Vec<f32>],
+) -> Vec<Option<Vec<f32>>> {
+    let n_ifce = shape.n_ifce_out;
+    if n_ifce == 0 {
+        return (0..shape.grids.len()).map(|_| None).collect();
+    }
+    let mut acts = Vec::new();
+    (0..shape.grids.len())
+        .map(|idx| {
+            let (gh, gw) = shape.grids[idx];
+            let mut ctx = vec![0.0f32; gh * gw * n_ifce];
+            if let Some(m) = &ifce[idx] {
+                let st = ifce_stack(shape, idx);
+                let uc = st.channels.len();
+                let mut input = vec![0.0f32; uc];
+                let mut out = vec![0.0f32; st.uh * st.uw * n_ifce];
+                for px in 0..st.uh * st.uw {
+                    for (c, (j, map)) in st.channels.iter().enumerate() {
+                        input[c] = if *j == usize::MAX {
+                            0.0
+                        } else {
+                            q[*j][map[px] as usize]
+                        };
+                    }
+                    mlp_forward(m, &input, &mut acts);
+                    out[px * n_ifce..(px + 1) * n_ifce].copy_from_slice(&acts[acts.len() - 1]);
+                }
+                for y in 0..gh {
+                    for x in 0..gw {
+                        let s = ((y / 2) * st.uw + x / 2) * n_ifce;
+                        ctx[(y * gw + x) * n_ifce..(y * gw + x + 1) * n_ifce]
+                            .copy_from_slice(&out[s..s + n_ifce]);
+                    }
+                }
+            }
+            Some(ctx)
+        })
+        .collect()
+}
+
+/// Total latent rate in bits under the float ARM.
+pub(crate) fn latent_rate(
+    shape: &Shape,
+    arm: &Mlp,
+    q: &[Vec<f32>],
+    inter: &[Option<Vec<f32>>],
+) -> f64 {
+    let n_sp = shape.window.len();
+    let n_ifce = shape.n_ifce_out;
+    let dim = n_sp + n_ifce;
+    let offsets: Vec<(isize, isize)> = shape
+        .window
+        .iter()
+        .map(|&cell| {
+            (
+                (cell / WINDOW) as isize - PAD as isize,
+                (cell % WINDOW) as isize - PAD as isize,
+            )
+        })
+        .collect();
+    let mut ctx = vec![0.0f32; dim];
+    let mut acts = Vec::new();
+    let mut total = 0.0f64;
+    for (g, qg) in q.iter().enumerate() {
+        let (gh, gw) = shape.grids[g];
+        for y in 0..gh {
+            for x in 0..gw {
+                for (c, &(dy, dx)) in ctx.iter_mut().zip(&offsets) {
+                    let (sy, sx) = (y as isize + dy, x as isize + dx);
+                    *c = if sy >= 0 && sx >= 0 && (sy as usize) < gh && (sx as usize) < gw {
+                        qg[sy as usize * gw + sx as usize]
+                    } else {
+                        0.0
+                    };
+                }
+                if let Some(ic) = &inter[g] {
+                    let o = (y * gw + x) * n_ifce;
+                    ctx[n_sp..].copy_from_slice(&ic[o..o + n_ifce]);
+                }
+                mlp_forward(arm, &ctx, &mut acts);
+                let out = &acts[acts.len() - 1];
+                total += rate_and_grads(qg[y * gw + x], out[0], out[1]).0 as f64;
+            }
+        }
+    }
+    total
+}
+
+/// Upsampling of the non-hyper grids: the synthesis input, `[c][h][w]`.
+pub(crate) fn upsample(shape: &Shape, p: &Params, q: &[Vec<f32>]) -> Vec<f32> {
+    let lat: Vec<usize> = (0..shape.grids.len())
+        .filter(|&g| !shape.is_hyper[g])
+        .collect();
+    let n_ups = p.ups_t.len().max(1);
+    let k2_t: Vec<Vec<f32>> = p
+        .ups_t
+        .iter()
+        .map(|h| kron(&full_kernel(h, shape.ups_k)))
+        .collect();
+    let k2_c: Vec<Vec<f32>> = p
+        .ups_c
+        .iter()
+        .map(|h| kron(&full_kernel(h, shape.ups_pre_k)))
+        .collect();
+    let last = lat[lat.len() - 1];
+    let mut up = q[last].clone();
+    let (mut uc, mut uh, mut uw) = (1usize, shape.grids[last].0, shape.grids[last].1);
+    for (i, &t) in lat[..lat.len() - 1].iter().rev().enumerate() {
+        let (th, tw) = shape.grids[t];
+        let ki = i % n_ups;
+        let mut next = Vec::with_capacity((uc + 1) * th * tw);
+        next.extend(sym_conv_forward(&q[t], th, tw, &k2_c[ki], shape.ups_pre_k));
+        for c in 0..uc {
+            next.extend(conv_t_forward(
+                &up[c * uh * uw..(c + 1) * uh * uw],
+                uh,
+                uw,
+                &k2_t[ki],
+                shape.ups_k,
+                th,
+                tw,
+            ));
+        }
+        up = next;
+        uc += 1;
+        uh = th;
+        uw = tw;
+    }
+    up
+}
+
+/// Synthesis + output transform: the decoded picture before clamping, `[c][h][w]`.
+pub(crate) fn synthesize(shape: &Shape, p: &Params, syn_in: &[f32]) -> Vec<f32> {
+    let (ih, iw) = shape.img;
+    let n = ih * iw;
+    let mut cur = syn_in.to_vec();
+    for l in &p.syn {
+        let mut o = conv_forward(l, &cur, ih, iw);
+        if l.relu {
+            for v in &mut o {
+                *v = v.max(0.0);
+            }
+        }
+        cur = o;
+    }
+    if let Some(st) = &p.syn_stab {
+        let s = conv_forward(st, &syn_in[..st.c_in * n], ih, iw);
+        for (a, b) in cur.iter_mut().zip(&s) {
+            *a += *b;
+        }
+    }
+    conv_forward(&p.out_transform, &cur, ih, iw)
+}
+
+/// MSE of the clamped picture rounded to `bitdepth`.
+pub(crate) fn distortion(raw: &[f32], target: &[f32], bitdepth: u32) -> f64 {
+    let m = ((1u32 << bitdepth) - 1) as f32;
+    raw.iter()
+        .zip(target)
+        .map(|(&r, &t)| {
+            let c = libm::rintf(r.clamp(0.0, 1.0) * m) / m;
+            ((c - t) * (c - t)) as f64
+        })
+        .sum::<f64>()
+        / raw.len() as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::trainer::{Problem, Rng, evaluate, initialize};
+    use super::super::{Shape, config};
+    use super::*;
+
+    #[test]
+    fn stages_compose_to_the_evaluation_pass() {
+        let hdr = config::header(config::Arch::Medium, 37, 53);
+        let a = crate::decode::arch(&hdr).unwrap();
+        let shape = Shape::new(&hdr, &a).unwrap();
+        let mut p = shape.zero_params(&hdr, &a);
+        let mut rng = Rng::new(5);
+        initialize(&mut p, &shape, &mut rng);
+        // Non-trivial latents and weights.
+        p.for_each_mut(|t| {
+            for v in t.iter_mut() {
+                *v += rng.normal() * 0.1;
+            }
+        });
+        let target: Vec<f32> = (0..3 * 37 * 53)
+            .map(|i| ((i * 7919) % 256) as f32 / 255.0)
+            .collect();
+        let pb = Problem {
+            shape: &shape,
+            target: &target,
+            bitdepth: 8,
+            lambda: 1e-3,
+            gain: 16.0,
+        };
+        let mut scratch = p.zeros_like();
+        let want = evaluate(&pb, &p, &mut scratch);
+        let q = quantize_hard(&p, 16.0);
+        let inter = ifce_contexts(&shape, &p.ifce, &q);
+        let rate = latent_rate(&shape, &p.arm, &q, &inter);
+        let mse = distortion(
+            &synthesize(&shape, &p, &upsample(&shape, &p, &q)),
+            &target,
+            8,
+        );
+        assert_eq!(rate, want.rate_bits);
+        assert_eq!(mse, want.mse);
+    }
+}

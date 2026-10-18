@@ -24,8 +24,10 @@ use crate::latent::{MASK_SIZE, context_window_indices};
 use crate::nn::{layer_dims, symmetric_kernel};
 
 pub(crate) mod config;
+pub(crate) mod eval;
 mod ops;
 pub(crate) mod quantize;
+pub(crate) mod rdoq;
 pub(crate) mod soap;
 #[cfg(all(test, feature = "oracle"))]
 mod tests;

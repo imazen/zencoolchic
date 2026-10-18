@@ -17,7 +17,7 @@ pub(crate) enum Module {
 }
 
 impl Module {
-    const SORTED: [Module; 4] = [
+    pub(crate) const SORTED: [Module; 4] = [
         Module::Arm,
         Module::Ifce,
         Module::Synthesis,
@@ -25,7 +25,7 @@ impl Module {
     ];
 
     /// Index into [`PerModule`](crate::header::PerModule) arrays.
-    fn slot(self) -> usize {
+    pub(crate) fn slot(self) -> usize {
         match self {
             Module::Arm => 0,
             Module::Ifce => 1,
@@ -319,4 +319,23 @@ pub(crate) fn apply_to_header(h: &mut CoolChicHeader, q: &NnQuant) {
         upsampling: e[2],
         synthesis: e[3],
     };
+}
+
+/// Every weight (or bias) value of module `m`, flat in upstream `get_param(which)` order.
+/// The upsampling biases are not modelled (always zero, unused by the forward pass).
+pub(crate) fn module_values_mut(p: &mut Params, m: Module, bias: bool) -> Vec<&mut f32> {
+    module_tensors_mut(p, m)
+        .into_iter()
+        .filter(|(_, b)| *b == bias)
+        .flat_map(|(t, _)| t.iter_mut())
+        .collect()
+}
+
+/// Parameter rate estimate of one module under its chosen quantization.
+pub(crate) fn nn_rate_of(p: &Params, q: &NnQuant, m: Module) -> f32 {
+    q.shift[m.slot()].map_or(0.0, |s| module_rate(p, m, s, q.expgol[m.slot()]))
+}
+
+pub(crate) fn step_of(q: &NnQuant, m: Module, bias: bool) -> f32 {
+    libm::exp2f(q.shift[m.slot()].unwrap()[bias as usize] as f32)
 }

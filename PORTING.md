@@ -77,15 +77,22 @@ Reuse plan (user, 2026-10-17: reuse owned code, relicensed): zensim-train-core /
 | SOAP optimizer (Adam mode for latents and 1-D tensors) | `training/soap.py` | done, scalar | vs upstream after 25 steps on fixed gradients (`just soap`): 20×20 weight 2.1e-4 of the parameter movement, 1-D 6.6e-7, latents 1.3e-6. Rank-deficient factors (non-square weights) are not comparable: upstream against itself with a rotated null-space basis differs by 1.6% (`scripts/oracle/soap_null_space_probe.py`); this port differs by 2.2% |
 | Training loop: grad clip 0.1, cosine LR, softround / noise schedules, patience, best-model restore; initializers; intra preset; 5 → 2 → 1 warm-up; lambda-dependent encoder gain | `training/train.py`, `presets.py`, `warmup.py`, `initialize_parameters` | done, scalar; RNG is not torch's | small64 (64×64), 2000 itr, λ 1e-3, hop, one seed each: upstream 33.808 dB / 0.5983 bpp latent / loss 1.0143e-3 in 20.7 s (torch CPU); this port 34.094 dB / 0.5949 bpp / 0.984e-3 in 25.8 s (1 thread, scalar). Not yet compared over several seeds or images |
 | Network quantization search (per module, every weight/bias step; exp-Golomb orders from upstream's bit estimate) | `nnquant/quantizemodel.py` | done, scalar | small64 end to end (below) |
-| RDOQ | `nnquant/rdoq.py` | not started | — |
+| RDOQ (greedy ±1..15-step moves with upstream's local scores) | `nnquant/rdoq.py` | done, scalar; every score is a full pass (no incremental update yet) | small64 below |
 | Trained model → stream integers → bitstream | `bitstream/encode.py` | done | upstream's decoder reads this encoder's stream: small64 decodes to 33.828 dB in both decoders |
 | SIMD / threaded training kernels | — | not started | — |
 
-End to end on small64 (64×64, 2000 itr, λ 1e-3, hop; `examples/encode.rs`, 2026-10-17): this
-port writes 1,909 bytes (3.73 bpp) decoding to 33.828 dB, in this crate's decoder and in
-upstream's `cc_decode.py` alike, 27.5 s. Upstream's encoder on the same image and settings:
-1,767 bytes (3.45 bpp), 33.32 dB, after RDOQ, which this port does not run yet. On a 64×64
-picture the network parameters are most of the stream (2.9 of the 3.7 bpp).
+End to end on small64 (64×64, 2000 itr, λ 1e-3, hop; `examples/encode.rs`, 2026-10-17, one
+seed per side):
+
+| encoder | bytes | bpp | PSNR | D + λR (upstream's loss) | time |
+|---|---|---|---|---|---|
+| upstream (torch CPU) | 1,767 | 3.451 | 33.322 dB | 0.003916 | — |
+| this port, no RDOQ | 1,909 | 3.729 | 33.828 dB | 0.004143 | 27.5 s |
+| this port, RDOQ | 1,858 | 3.629 | 33.979 dB | 0.004029 | 33.6 s |
+
+Both decoders (this crate's and upstream's `cc_decode.py`) decode this port's streams to the
+same PSNR. One seed on a 64×64 picture, where network parameters are ~80% of the stream, does
+not separate the encoders; a multi-seed, multi-image comparison needs the faster trainer.
 
 The gradient check compares against a float64 run of upstream (`dump_grad.py ... f64`): the
 rate term `F(q + ½) − F(q − ½)` cancels badly in float32, so torch's float32 gradients are not
