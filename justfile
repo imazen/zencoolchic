@@ -43,3 +43,12 @@ soap:
 # Every upstream-oracle test (decoder, re-encode, gradients, SOAP).
 oracle-all:
     ZENCOOLCHIC_ORACLE_DIR={{oracle_dir}} ZENCOOLCHIC_GRAD_DIR={{grad_dir}} ZENCOOLCHIC_SOAP_DIR={{soap_dir}} cargo test --release --features oracle
+
+# Gate before pushing: fmt, clippy on every feature set, tests.
+check:
+    cargo fmt --check
+    cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --features std -- -D warnings
+    cargo clippy --all-targets --features encoder -- -D warnings
+    cargo clippy --all-targets --features oracle -- -D warnings
+    cargo test --release --lib --features encoder

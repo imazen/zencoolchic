@@ -43,6 +43,7 @@ fn axpy_impl(token: Token, acc: &mut [f32], w: f32, x: &[f32]) {
 /// `Σ a[i] · b[i]` with a fixed reduction order on every tier: eight lane accumulators
 /// (element `i` goes to lane `i % 8`, fused multiply-add), the tail into lanes `0..`, then
 /// `((l0 + l1) + (l2 + l3)) + ((l4 + l5) + (l6 + l7))`.
+#[cfg_attr(not(feature = "encoder"), allow(dead_code))]
 #[inline]
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -57,6 +58,7 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     dot_fused_scalar(a, b)
 }
 
+#[cfg_attr(not(feature = "encoder"), allow(dead_code))]
 #[inline(always)]
 fn reduce8(l: [f32; 8]) -> f32 {
     ((l[0] + l[1]) + (l[2] + l[3])) + ((l[4] + l[5]) + (l[6] + l[7]))
@@ -68,7 +70,7 @@ fn reduce8(l: [f32; 8]) -> f32 {
 fn dot_impl(token: Token, a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
     let (a, b) = (&a[..n], &b[..n]);
-    let mut acc = f32x8::zero(token);
+    let mut acc = f32x8::zero_t(token);
     let (ac, at) = a.as_chunks::<8>();
     let (bc, bt) = b.as_chunks::<8>();
     for (x, y) in ac.iter().zip(bc) {
@@ -82,6 +84,7 @@ fn dot_impl(token: Token, a: &[f32], b: &[f32]) -> f32 {
     reduce8(l)
 }
 
+#[cfg_attr(not(feature = "encoder"), allow(dead_code))]
 fn dot_fused_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut l = [0.0f32; 8];
     let (ac, at) = a.as_chunks::<8>();
