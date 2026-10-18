@@ -1,9 +1,9 @@
 # zencoolchic — project instructions
 
 Port of Cool-chic 5 (Orange-OpenSource/Cool-Chic, `a6fe38a`) to safe Rust. User request
-2026-10-17: "port cool-chic 5, reusing stuff from zenjpegai"; license MIT OR Apache-2.0 (user
+2026-10-17: "port cool-chic 5, reusing stuff from zenjpegai"; license BSD-3-Clause (user
 choice). Imazen owns all imazen/lilith code outright, AGPL repos included: copy from zenjpegai,
-zensim, zenanalyze/zentrain, zensr, zenmetrics freely, relicensed to MIT OR Apache-2.0, and cite
+zensim, zenanalyze/zentrain, zensr, zenmetrics freely, relicensed to BSD-3-Clause, and cite
 the origin repo + commit in the commit message. Don't rewrite what those repos already have.
 
 Read `PORTING.md` first: the status table and the parity evidence.

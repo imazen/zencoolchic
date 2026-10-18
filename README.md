@@ -19,5 +19,5 @@ let rgb = picture.to_rgb8(); // Some(interleaved RGB) for 8-bit RGB streams
 
 ## License
 
-MIT OR Apache-2.0. Derived from Cool-chic (BSD-3-Clause, © Orange), whose notice is in
+BSD-3-Clause. Derived from Cool-chic (BSD-3-Clause, © Orange), whose notice is in
 [`upstream-notices/`](upstream-notices/).

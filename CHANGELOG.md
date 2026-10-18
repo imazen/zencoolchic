@@ -9,6 +9,10 @@ All notable changes to this project are documented here. The format follows
 
 - None yet (the crate is unpublished).
 
+### Changed
+
+- Relicensed to BSD-3-Clause to match upstream; retained the Orange notice.
+
 ### Added
 
 - Cool-chic 5 image decoder: headers, exp-Golomb network parameters, fixed-point ARM and
