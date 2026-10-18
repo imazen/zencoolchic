@@ -90,6 +90,14 @@ seed per side):
 | this port, no RDOQ | 1,909 | 3.729 | 33.828 dB | 0.004143 | 27.5 s |
 | this port, RDOQ | 1,858 | 3.629 | 33.979 dB | 0.004029 | 33.6 s |
 
+Full size, CID22-512 `validation/1279330.png` (512×512), upstream defaults (λ 1e-3, 10,000
+itr, hop), mac M4 Pro, one seed each (`benchmarks/encode_cid22_1279330_2026-10-17.tsv`):
+
+| encoder | bytes | bpp | PSNR | D + λR | wall time |
+|---|---|---|---|---|---|
+| upstream (torch 2.14.1 CPU) | 10,769 | 0.3286 | 38.157 dB | 0.0004815 | 1,065 s |
+| this port (`39c0f16`) | 10,692 | 0.3263 | 37.988 dB | 0.0004851 | 507 s |
+
 Both decoders (this crate's and upstream's `cc_decode.py`) decode this port's streams to the
 same PSNR. One seed on a 64×64 picture, where network parameters are ~80% of the stream, does
 not separate the encoders; a multi-seed, multi-image comparison needs the faster trainer.

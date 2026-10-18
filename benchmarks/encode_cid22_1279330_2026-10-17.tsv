@@ -1,0 +1,5 @@
+# CID22-512 validation/1279330.png, lambda 1e-3, 10000 itr, hop, defaults; mac M4 Pro, 2026-10-17
+# zencoolchic commit 39c0f16 (examples/encode.rs); upstream Cool-chic a6fe38a cc_encode.py, torch 2.14.1 CPU; one seed each
+encoder	bytes	bpp	psnr_db	loss	wall_s
+upstream	10769	0.3286	38.157	0.0004815	1065
+zencoolchic	10692	0.3263	37.988	0.0004851	507
