@@ -73,13 +73,13 @@ pub struct DecodeDetails {
 
 /// Derived architecture (upstream `CoolChicEncoderParameter.__post_init__`).
 pub(crate) struct Arch {
-    size_per_latent: Vec<(usize, usize)>,
-    is_hyperlatent: Vec<bool>,
-    input_features_ifce: Vec<usize>,
-    flag_ifce: bool,
-    size_per_latent_cr: Vec<(usize, usize)>,
-    input_feature_synthesis: usize,
-    total_context_arm: usize,
+    pub(crate) size_per_latent: Vec<(usize, usize)>,
+    pub(crate) is_hyperlatent: Vec<bool>,
+    pub(crate) input_features_ifce: Vec<usize>,
+    pub(crate) flag_ifce: bool,
+    pub(crate) size_per_latent_cr: Vec<(usize, usize)>,
+    pub(crate) input_feature_synthesis: usize,
+    pub(crate) total_context_arm: usize,
 }
 
 fn ceil_div_pow2(x: u32, i: u32) -> usize {

@@ -65,11 +65,23 @@ CPU, its own timer, model construction included).
 
 ## Encoder
 
-Not started. Plan: hand-written forward + backward passes on archmage (CPU first), upstream
-PyTorch as the per-op gradient oracle; SOAP optimizer, softround + Kumaraswamy noise, STE,
-RDOQ and the network quantization search are new code. Reuse candidates surveyed 2026-10-17:
-zensim `adam_simd.rs`, `zensim-train-core` dense SIMD kernels, `qat_quantize_copy`,
-`zensim-train-gpu` CubeCL kernel templates (all MIT/Apache).
+Reuse plan (user, 2026-10-17: reuse owned code, relicensed): zensim-train-core / zensim-validate
+(dense SIMD forward/backward, SIMD Adam, QAT), zenpicker-train (Adam MLP trainer), zenjpegai
+`nn::fast` (conv forward engine), zentrain (per-image preset picker).
+
+| Piece | Upstream | Status | Evidence |
+|---|---|---|---|
+| Bitstream writer: range encoder, exp-Golomb encoder, headers | `bitstream/encode.py`, constriction encoder | done (`encoder` feature) | all 12 oracle streams re-encode byte for byte (`write::tests`) |
+| Training forward: quantizer (softround ∘ noise ∘ softround, Kumaraswamy), float ARM + IFCE, Laplace rate, train-mode upsampling, synthesis, MSE + λ·rate | `component/core/*.py`, `training/loss.py` | done, scalar, full-resolution latents only | loss within 3e-8 of torch (`just grad`) |
+| Backward of all of the above | torch autograd | done, scalar | vs float64 torch: worst relative gradient error 3.7e-4 (mid130×97 hop), 7.3e-4 (64×64 hop), 5.8e-4 (64×64 small); torch's own float32 pass is off by up to 1.4e-2 on the same tensors |
+| Optimizers (Adam for latents, SOAP for weights), grad clip, cosine LR, schedules | `training/train.py`, `soap.py` | not started | — |
+| Warm-up, presets | `training/warmup.py`, `presets.py` | not started | — |
+| Network quantization search, RDOQ | `nnquant/*.py` | not started | — |
+| SIMD / threaded training kernels | — | not started | — |
+
+The gradient check compares against a float64 run of upstream (`dump_grad.py ... f64`): the
+rate term `F(q + ½) − F(q − ½)` cancels badly in float32, so torch's float32 gradients are not
+a usable reference at 1e-3.
 
 ## Reference environment
 
