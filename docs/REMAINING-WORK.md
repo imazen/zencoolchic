@@ -1,0 +1,123 @@
+# Remaining Cool-chic 5 port work
+
+Target: upstream [Cool-chic v5.0.1 at a6fe38a414dd098b39c41636bd6e423626402f7e](https://github.com/Orange-OpenSource/Cool-Chic/tree/a6fe38a414dd098b39c41636bd6e423626402f7e).
+Audited against Rust and pinned upstream source on 2026-10-18.
+
+**Still missing:** multi-frame/video decoding and encoding; motion compensation
+and global translation; YUV/high-bit-depth encoding; training with common
+randomness/Wasserstein loss or starting latents below full resolution. There are
+also untested decoder variants and incomplete resource/streaming integrations.
+The current implementation is a still-image decoder plus experimental RGB8
+encoder, not a complete port of every upstream workflow.
+
+## Start here
+
+1. [PORTING.md](../PORTING.md) records implemented pieces, exact reference
+   identity, measured tolerances and historical performance observations.
+2. [Encoder guide](ENCODER.md) describes the training/writer pipeline, public
+   zencodec configuration, defaults and deliberate API refusals.
+3. Run `just check`. It includes frozen upstream comparisons and zencodec
+   conformance. `just oracle-all` isolates upstream parity. The checked-in
+   [references](../tests/fixtures/upstream/README.md) need Rust alone at runtime.
+4. [Oracle maintenance](../scripts/oracle/README.md) has exact upstream setup,
+   environment records, source inputs and dump/regeneration commands.
+
+The following paths under `coolchic/` refer to the pinned upstream tree above.
+Their Rust counterparts are linked directly.
+
+## Missing codec and training behavior
+
+| Work | Current boundary and implementation entry points | Upstream reference and acceptance gate |
+|---|---|---|
+| Multiple I frames | [decode_inner](../src/decode.rs) rejects `n_frames != 1`; [Picture](../src/decode.rs) represents one image. Header parsers already read video/frame fields. | `bitstream/decode.py::decode_video`, `component/video.py`, `component/frame.py`. Start with two independently coded I frames, correct byte consumption and display/coding order. A sequence-returning public API needs design review. |
+| P/B frame decoding | Native decode rejects inter frames and flow output. [decode_coolchic](../src/decode.rs) and [header.rs](../src/header.rs) supply entropy/network groundwork; there is no frame-reference store or compositor. | `bitstream/decode.py::decode_frame`, `component/intercoding/globalmotion.py`, `component/intercoding/warp.py`. Decode residue and motion networks separately, preserve per-network exact latents, then match translation, flow sampling, alpha/beta masking, rounding and YUV handling. Test P and B frames with border/fractional motion and reference ordering. |
+| Motion/video encoding | [trainer](../src/train/trainer.rs), [config](../src/train/config.rs) and [unstable entry](../src/unstable.rs) build one intra residue model. | `component/video.py::encode_one_frame` / `guided_motion_pretraining`, `component/frame.py`, `training/presets.py`, `bitstream/encode.py`. Port decode first; then residue/motion objectives, reference management, presets and serialization. Upstream's `component/intercoding/raft.py` uses pretrained torchvision RAFT for encoder initialization. RAFT weights are not needed by a video decoder; a future encoder must record their provenance. |
+| YUV and higher-depth encode input | Native decoding supports RGB/YUV; [RGB8 training entry](../src/unstable.rs) and [trait encode](../src/codec/encode.rs) accept RGB8 sRGB. [Problem/evaluate](../src/train/trainer.rs), [distortion](../src/train/eval.rs), [RDOQ scores](../src/train/rdoq.rs) carry bit-depth-sensitive behavior. | `training/loss.py`, `io/format/yuv.py`, `io/framedata.py`, `component/frame.py`. Add differential loss/gradient cases for 4:2:0, 4:4:4 and higher depth, including chroma geometry and both rounding stages. Preserve all supported sample bits. Public descriptors/configuration require review. |
+| Common-randomness training and Wasserstein objective | Decoder [CommonNoise](../src/nn.rs) exists and has a frozen stream. [Shape::new](../src/train/mod.rs) explicitly refuses common randomness. The training objective is MSE plus rate. | `component/core/noise.py`, `component/core/coolchic.py`, `training/loss.py`, `training/metrics/wasserstein.py`. Add forward/backward graph support and a separate float64 torch gradient oracle; then an upstream-decoded end-to-end stream. Decoder support does not establish encoder support. |
+| Starting latents below full resolution | Native decoder handles the frozen half-resolution/bicubic case. [Shape::new](../src/train/mod.rs) rejects `latent_resolution[0] != 0`; [training step](../src/train/ops.rs) and [evaluation](../src/train/eval.rs) assume the supported full-resolution path. | `component/core/coolchic.py` and its final `F.interpolate`. Implement the necessary resize and its backward path with matching geometry, alignment and borders. Require a float64 gradient comparison and end-to-end reconstruction parity before removing the refusal. |
+| Preset/configuration breadth | Public encode exposes four fixed intra architectures. Internal header/shape code handles more configurations than those presets expose; three gradient cases do not establish all of them. | `cfg/dec/`, `utils/parsecli.py`, `training/presets.py`. Validate alternative IFCE/hyperlatent/architecture choices individually before exposing new knobs. Motion/debug/custom training schedules are not a general Rust preset interface. |
+
+For video, extend [dump_decode.py](../scripts/oracle/dump_decode.py) **before**
+judging a port: it currently captures one still frame and overwrites a shared raw
+output. Capture frame identity, residue/motion identity, integer latents, pre-round
+reconstruction and final planes separately. Add new frozen cases while retaining
+the original still-image set. Do not infer video support from parsed headers.
+
+## Coverage gaps and known limits
+
+- The frozen suite covers 12 still-image decoder/writer cases, three float64
+  gradient cases and fixed-gradient SOAP behavior. It is not exhaustive format
+  conformance. It includes odd RGB dimensions, narrow raster-order decoding,
+  no-IFCE/no-hyperlatent, no stabilisers, common randomness, half-resolution
+  bicubic resize, YUV420 8-bit and YUV444 10-bit.
+- [nearest/bilinear resize](../src/nn.rs) exists but lacks an independent frozen
+  upstream case. Add fixtures for these modes, higher-depth RGB and further YUV
+  boundary combinations. The trait tests' synthetic 16-bit path is not an
+  upstream 16-bit golden reference.
+- [decode::arch](../src/decode.rs) explicitly refuses even synthesis kernels.
+  Establish a valid upstream stream and its shape/padding behavior before
+  deciding how to extend that architecture path.
+- SOAP's [rank-deficient eigenspaces](../src/train/soap.rs) have arbitrary bases.
+  Full-rank/Adam cases retain their asserted trajectory bound; non-square
+  trajectories are diagnostic. Read the tracked [null-space probe](../scripts/oracle/soap_null_space_probe.py)
+  before changing the optimizer or proposing a new comparison contract.
+- RNG initialization differs from torch. Complete training trajectories are
+  not torch-identical. There are step-level and complete tiny-stream thread-count
+  identity tests, but no measured cross-platform full-training identity guarantee.
+- No multi-image/multi-seed rate-distortion calibration exists. The generic quality
+  mapping is explicitly uncalibrated. Historical one-image/one-seed benchmarks do
+  not establish a general quality or speed ranking.
+- No fuzz targets are currently checked in. Malformed-input limits and truncation
+  have unit/trait coverage; a dedicated fuzzing/regression corpus is further work.
+
+## Performance and integration work
+
+SIMD and threaded training are **already implemented**. [simd.rs](../src/simd.rs)
+provides AXPY/dot; [ops.rs](../src/train/ops.rs), [arm_batch.rs](../src/train/arm_batch.rs)
+and [ifce.rs](../src/train/ifce.rs) use those kernels and rayon. Further optimization
+must start from the current implementation and preserve arithmetic order.
+
+RDOQ [score](../src/train/rdoq.rs) already caches per-module invariant latents,
+IFCE contexts and synthesis inputs. Candidates recompute affected stages over the
+full image. Spatial incremental scoring remains to be implemented and checked
+against the current scores, selected moves and final stream; adding the existing
+cache again would not be progress. Quantization search likewise uses shared
+evaluation rather than a separate scalar-only network implementation.
+
+The [shared-NN assessment](zennn-assessment.md) identifies owned kernels to reuse,
+their source revisions, consumers and bit-order/performance risks. No `zennn`
+crate was created. Read it before replacing kernels or creating a new framework.
+
+The trait bridge currently refuses YUV output, finite working-memory budgets,
+sequential encode job policy, row streaming and animation. RGB streams have no
+color metadata carrier; the bridge assumes sRGB. A YUV extension needs explicit
+color interpretation or native planar semantics. Memory estimates/accounting,
+fallible allocation coverage and finer cancellation granularity remain engineering
+work. Current cancellation checks are per grid/stage or training/quantization/RDOQ
+iteration; an entire convolution is not interruptible.
+
+Training uses a CPU backend. Upstream GPU/torch compilation machinery, general
+training checkpoint/resume and PyTorch `.pt` checkpoint import/export are not
+ported interfaces. These are workflow/backend work in addition to the missing
+bitstream features above; they are not dependencies of the current still decoder.
+
+## Validation when extending the port
+
+Preserve exact integer latents and writer bytes. The existing float reconstruction
+bound is 9.3e-7 and final samples differ by at most one step; both are enforced.
+Gradient loss/relative-L2 and full-rank SOAP thresholds are recorded in their tests.
+Do not change a bound to make a new path pass. Extend upstream capture first and
+compare the smallest new behavior independently before wiring it into the codec.
+
+Run `just check`, default/no_std checks and the relevant upstream comparisons.
+CI runs frozen comparisons on Linux x64/ARM64, Windows x64/ARM64, macOS ARM64 and
+i686 through cross; it also checks wasm no_std and the declared Rust MSRV. The
+separate [exp audit workflow](../.github/workflows/exp-audit.yml) is relevant when
+changing Laplace CDF/libm/scale-table behavior; its historical measurements are
+in [PORTING.md](../PORTING.md#bit-exactness-risks).
+
+The checked-in code, fixtures, source inputs and maintenance scripts are sufficient
+for current regression testing and for starting the next port slice. The pinned
+upstream checkout/Python environment can be rebuilt for new comparisons. Benchmark
+datasets and any future pretrained motion model are separate, explicitly sourced
+inputs; neither is required for ordinary regression or conformance tests.

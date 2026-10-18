@@ -1,0 +1,63 @@
+{
+  "source_reference_image": "kodim14.png",
+  "source_reference_image_sha256": "112045b71433dc61e4c9e17944d838896aa6a31a4850a339cdf8f0c668eb6349",
+  "rgb_crop_validation": "All four RGB crop pixel arrays matched the indicated crop of the reference image exactly on 2026-10-18.",
+  "files": [
+    {
+      "path": "small64.png",
+      "bytes": 9115,
+      "sha256": "5b12a3b7e2868465cf5195e30fe49fd6e3b3ba7c2cb09f27b9aa84128a07d8d1",
+      "rgb_crop_xywh": [
+        400,
+        200,
+        64,
+        64
+      ]
+    },
+    {
+      "path": "mid130x97.png",
+      "bytes": 19027,
+      "sha256": "934c0111b86567f82686838384b4344ca48f36e587fa61b43a5b5d80d48780e5",
+      "rgb_crop_xywh": [
+        100,
+        300,
+        130,
+        97
+      ]
+    },
+    {
+      "path": "odd37x23.png",
+      "bytes": 1031,
+      "sha256": "f5d019bd7d54fab91f985232797c2d4010c477604c81e1b73eb221c57772f621",
+      "rgb_crop_xywh": [
+        200,
+        100,
+        37,
+        23
+      ]
+    },
+    {
+      "path": "narrow7x40.png",
+      "bytes": 513,
+      "sha256": "a4780c8b584a7d37d7c1476eef86f4bdfa92b14258faf7adffa2d37c042fa33b",
+      "rgb_crop_xywh": [
+        300,
+        50,
+        7,
+        40
+      ]
+    },
+    {
+      "path": "yuv_48x32_1p_yuv420_8b.yuv",
+      "bytes": 2304,
+      "sha256": "e29ece064c0b2adfde393a26360646bfa5a0738a8860993c3207cbd2f22691cf",
+      "origin": "Frozen YUV input used by the original oracle run; restore these bytes directly."
+    },
+    {
+      "path": "yuv_40x24_1p_yuv444_10b.yuv",
+      "bytes": 5760,
+      "sha256": "93214e6637c3e4f62607f461f08710cb24edfd8840b807c498769d7f1df9bde5",
+      "origin": "Frozen YUV input used by the original oracle run; restore these bytes directly."
+    }
+  ]
+}

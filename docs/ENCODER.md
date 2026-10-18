@@ -47,8 +47,9 @@ This rescales latents internally; it is not a calibrated output quality scale.
    rate estimate covers latents, not the final serialized network overhead.
 4. Search weight/bias quantization steps per module, choosing exp-Golomb orders and including
    estimated network rate in the objective.
-5. Optionally run RDOQ with greedy ±1 through ±15 moves. Each candidate score currently runs
-   a full evaluation; incremental updates are not implemented.
+5. Optionally run RDOQ with greedy ±1 through ±15 moves. Scores reuse invariant data cached
+   per module and recompute affected stages over the full image; spatial incremental
+   updates are not implemented.
 6. Convert to stream integers and write network parameters, integer ARM/IFCE latents, range
    coding, and headers. The reported final PSNR comes from decoding the written stream.
 

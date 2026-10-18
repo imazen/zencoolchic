@@ -16,7 +16,7 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - Portable zstd oracle fixtures with bounded Rust test-time loading, integrity
-  checks, complete case inventory, and decoder reconstruction bounds enforced in CI.
+  checks, complete case inventory, and decoder reconstruction bounds enforced in CI (`e129ed9`).
 
 - Source-based assessment of shared NN primitives in `docs/zennn-assessment.md`.
 

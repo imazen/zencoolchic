@@ -7,6 +7,8 @@ zensim, zenanalyze/zentrain, zensr, zenmetrics freely, relicensed to BSD-3-Claus
 the origin repo + commit in the commit message. Don't rewrite what those repos already have.
 
 Read `PORTING.md` first: the status table and the parity evidence.
+Then read `docs/REMAINING-WORK.md` for missing behavior, source entry points and gates;
+`scripts/oracle/README.md` covers rebuilding or extending the reference environment.
 
 ## Hard rules
 

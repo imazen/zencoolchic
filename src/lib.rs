@@ -6,8 +6,8 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
-// The encoder lands in pieces; until its public entry point exists the writer is only
-// reached from tests. Remove with the first public encode API.
+// Encoder modules include differential re-encoding and experimental training helpers
+// exercised by tests and examples in addition to the public codec entry point.
 #![cfg_attr(feature = "encoder", allow(dead_code))]
 
 extern crate alloc;

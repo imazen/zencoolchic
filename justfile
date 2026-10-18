@@ -19,6 +19,14 @@ clippy:
 grad_dir := env_var_or_default("ZENCOOLCHIC_GRAD_DIR", env_var("HOME") + "/tmp/coolchic-grad64")
 sources := env_var_or_default("ZENCOOLCHIC_SOURCES", env_var("HOME") + "/tmp/coolchic-gen")
 
+# Restore the small, frozen generator inputs into a NEW directory.
+oracle-sources:
+    python3 scripts/oracle/make_sources.py '{{sources}}'
+
+# Maintenance only; normal tests decompress in Rust without this extraction.
+fixture-unpack output:
+    python3 scripts/oracle/unpack_fixtures.py tests/fixtures/upstream '{{output}}'
+
 # float64 gradient dumps from upstream (ground truth for the backward pass).
 grad-dump:
     mkdir -p {{grad_dir}}

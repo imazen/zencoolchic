@@ -7,6 +7,7 @@ auto-regressive entropy model, upsampling and a small synthesis CNN, about 2000 
 **Status: still-image decoder and experimental encoder.** The decoder's integer latents
 match upstream on 12 oracle streams; floating-point reconstruction differs by at most one
 output step. Inter frames are not ported. See [`PORTING.md`](PORTING.md) for evidence.
+[Remaining work](docs/REMAINING-WORK.md) maps the unported features to source and tests.
 
 ```rust
 let data = std::fs::read("kodim14.cool")?;

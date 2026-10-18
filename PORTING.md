@@ -4,6 +4,9 @@ Upstream: [Cool-chic](https://github.com/Orange-OpenSource/Cool-Chic) `a6fe38a` 
 v5.0.1), BSD-3-Clause (notice in `upstream-notices/`). Entropy coder: `constriction` 0.4.2
 (the Python package's Rust source) with `probability` 0.20.3's Laplace CDF.
 
+[Remaining work and implementation entry points](docs/REMAINING-WORK.md) distinguishes
+missing codec features, validation gaps, performance work and integration limits.
+
 ## Decoder
 
 | Module | Upstream | Status | Parity evidence |
@@ -13,12 +16,12 @@ v5.0.1), BSD-3-Clause (notice in `upstream-notices/`). Entropy coder: `constrict
 | Fixed-point ARM / IFCE | `bitstream/component/armint.py` | done | latents bit-exact on 12 streams, incl. no-IFCE and no-stabiliser |
 | Wavefront latent decode | `bitstream/component/latent.py` | done (wavefront and width ≤ 9 raster order) | latents bit-exact on 12 streams |
 | Range decoder + leaky quantized Laplace | constriction 0.4.2 `queue.rs`, `quantize.rs` | done | latents bit-exact on 12 streams; exhaustive `exp` audit below |
-| Upsampling (train-mode kron kernels) | `component/core/upsampling.py` | done, scalar | raw output max abs error ≤ 9.3e-7 (9.24e-7) on 12 streams |
-| Synthesis | `component/core/synthesis.py` | done, scalar | as above |
-| Final resize (bicubic; nearest / bilinear ported) | `F.interpolate` | bicubic tested (`mid_lat1_debug`, latents from 1/2 resolution); nearest and bilinear are only used by the motion decoder and are untested | `mid_lat1_debug` |
+| Upsampling (train-mode kron kernels) | `component/core/upsampling.py` | done; SIMD AXPY | raw output max abs error ≤ 9.3e-7 (9.24e-7) on 12 streams |
+| Synthesis | `component/core/synthesis.py` | done; SIMD AXPY | as above |
+| Final resize (bicubic; nearest / bilinear ported) | `F.interpolate` | bicubic tested (`mid_lat1_debug`, latents from 1/2 resolution); nearest/bilinear implementations lack independent frozen upstream cases | `mid_lat1_debug` |
 | Common randomness | `component/core/noise.py` | done | `mid_wasserstein_debug` (`--tune wasserstein`): all samples identical |
 | YUV 4:2:0 / 4:4:4 output | `io/format/yuv.py` | done | `yuv420_8b_debug`, `yuv444_10b_debug` (10-bit) |
-| Inter frames (P/B), warper, global motion | `bitstream/decode.py`, `intercoding/` | not ported: `Error::Unsupported` | — |
+| Inter frames (P/B), warper, global motion | `bitstream/decode.py`, `component/intercoding/` | not ported: `Error::Unsupported`; multiple I frames are also refused | — |
 
 ### Measured parity (2026-10-17, mac, torch 2.14.1 CPU)
 
@@ -72,14 +75,14 @@ Reuse plan (user, 2026-10-17: reuse owned code, relicensed): zensim-train-core /
 | Piece | Upstream | Status | Evidence |
 |---|---|---|---|
 | Bitstream writer: range encoder, exp-Golomb encoder, headers | `bitstream/encode.py`, constriction encoder | done (`encoder` feature) | all 12 oracle streams re-encode byte for byte (`write::tests`) |
-| Training forward: quantizer (softround ∘ noise ∘ softround, Kumaraswamy), float ARM + IFCE, Laplace rate, train-mode upsampling, synthesis, MSE + λ·rate | `component/core/*.py`, `training/loss.py` | done, scalar, full-resolution latents only | loss within 3e-8 of torch (`just grad`) |
-| Backward of all of the above | torch autograd | done, scalar | vs float64 torch: worst relative gradient error 3.7e-4 (mid130×97 hop), 7.3e-4 (64×64 hop), 5.8e-4 (64×64 small); torch's own float32 pass is off by up to 1.4e-2 on the same tensors |
+| Training forward: quantizer (softround ∘ noise ∘ softround, Kumaraswamy), float ARM + IFCE, Laplace rate, train-mode upsampling, synthesis, MSE + λ·rate | `component/core/*.py`, `training/loss.py` | done; SIMD/rayon, full-resolution latents only | loss within 3e-8 of torch (`just grad`) |
+| Backward of all of the above | torch autograd | done; SIMD/rayon | vs float64 torch: worst relative gradient error 3.7e-4 (mid130×97 hop), 7.3e-4 (64×64 hop), 5.8e-4 (64×64 small); torch's own float32 pass is off by up to 1.4e-2 on the same tensors |
 | SOAP optimizer (Adam mode for latents and 1-D tensors) | `training/soap.py` | done, scalar | vs upstream after 25 steps on fixed gradients (`just soap`): 20×20 weight 2.1e-4 of the parameter movement, 1-D 6.6e-7, latents 1.3e-6. Rank-deficient factors (non-square weights) are not comparable: upstream against itself with a rotated null-space basis differs by 1.6% (`scripts/oracle/soap_null_space_probe.py`); this port differs by 2.2% |
-| Training loop: grad clip 0.1, cosine LR, softround / noise schedules, patience, best-model restore; initializers; intra preset; 5 → 2 → 1 warm-up; lambda-dependent encoder gain | `training/train.py`, `presets.py`, `warmup.py`, `initialize_parameters` | done, scalar; RNG is not torch's | small64 (64×64), 2000 itr, λ 1e-3, hop, one seed each: upstream 33.808 dB / 0.5983 bpp latent / loss 1.0143e-3 in 20.7 s (torch CPU); this port 34.094 dB / 0.5949 bpp / 0.984e-3 in 25.8 s (1 thread, scalar). Not yet compared over several seeds or images |
-| Network quantization search (per module, every weight/bias step; exp-Golomb orders from upstream's bit estimate) | `nnquant/quantizemodel.py` | done, scalar | small64 end to end (below) |
-| RDOQ (greedy ±1..15-step moves with upstream's local scores) | `nnquant/rdoq.py` | done, scalar; every score is a full pass (no incremental update yet) | small64 below |
+| Training loop: grad clip 0.1, cosine LR, softround / noise schedules, patience, best-model restore; initializers; intra preset; 5 → 2 → 1 warm-up; lambda-dependent encoder gain | `training/train.py`, `presets.py`, `warmup.py`, `initialize_parameters` | done; parallel deterministic noise; RNG is not torch's | small64 (64×64), 2000 itr, λ 1e-3, hop, one seed each: upstream 33.808 dB / 0.5983 bpp latent / loss 1.0143e-3 in 20.7 s (torch CPU); this port 34.094 dB / 0.5949 bpp / 0.984e-3 in 25.8 s (1 thread, scalar). Not yet compared over several seeds or images |
+| Network quantization search (per module, every weight/bias step; exp-Golomb orders from upstream's bit estimate) | `nnquant/quantizemodel.py` | done; shared SIMD/rayon evaluation | small64 end to end (below) |
+| RDOQ (greedy ±1..15-step moves with upstream's local scores) | `nnquant/rdoq.py` | done; per-module invariant caches, full affected-stage scoring; spatial incremental updates absent | small64 below |
 | Trained model → stream integers → bitstream | `bitstream/encode.py` | done | upstream's decoder reads this encoder's stream: small64 decodes to 33.828 dB in both decoders |
-| SIMD / threaded training kernels | — | not started | — |
+| SIMD / threaded training kernels | — | implemented: AXPY/dot, batched ARM/IFCE, convolution forward/backward and work splitting; further tuning remains | `src/simd.rs`, `src/train/{ops,arm_batch,ifce}.rs`; step and tiny-stream identity with 1/4 threads |
 
 End to end on small64 (64×64, 2000 itr, λ 1e-3, hop; `examples/encode.rs`, 2026-10-17, one
 seed per side):
@@ -110,15 +113,9 @@ a usable reference at 1e-3.
 
 Ordinary regression tests use the [frozen references](tests/fixtures/upstream/README.md)
 in this repository: `just oracle-all` needs Rust, not Python or external data.
-The upstream environment below is only for regenerating or extending the oracle.
-
-```bash
-git clone https://github.com/Orange-OpenSource/Cool-Chic.git ~/tmp/coolchic-src/Cool-Chic
-cd ~/tmp/coolchic-src/Cool-Chic
-uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements.txt
-mkdir -p ~/tmp/coolchic-ref && cp samples/bitstreams/kodim14.cool ~/tmp/coolchic-ref/
-cd ~/work/zen/zencoolchic && just oracle-dump && just oracle
-```
+For regenerating or extending the oracle, [oracle maintenance](scripts/oracle/README.md)
+records the exact upstream revision, environment, saved inputs and commands. The
+Python checkout/venv can be rebuilt; the original golden arrays are preserved in git.
 
 Upstream's decoder builds fresh `nn.Module`s, which are in training mode, so it runs the
 non-separable `kron(w, wᵀ)` upsampling kernels. The port follows that path.
@@ -150,4 +147,5 @@ bounds are unchanged.
 Independent check (2026-10-17, mac): `examples/codec_encode.rs` at minimum generic effort
 (2000 iterations, default hop/lambda/seed/RDOQ) encoded a 4×3 RGB8 pattern (`sample[i] = 7*i`,
 36 samples). Upstream `a6fe38a` `cc_decode.py` and this crate's `examples/decode.rs` produced
-identical 36/36 RGB8 samples. No stream binary is stored in git.
+identical 36/36 RGB8 samples. That particular generated stream is not a checked-in
+fixture; the upstream decoder/writer oracle streams are preserved in compressed form.
