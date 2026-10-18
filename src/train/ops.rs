@@ -432,8 +432,10 @@ fn sym_conv_backward(
     }
 }
 
-/// Synthesis conv forward (replicate padding, bias, residual; no activation).
+/// Synthesis conv forward (replicate padding, bias, residual; no activation). Parallel
+/// over output channels.
 pub(super) fn conv_forward(l: &ConvLayer, x: &[f32], h: usize, w: usize) -> Vec<f32> {
+    use rayon::prelude::*;
     let (k, p) = (l.k, l.k / 2);
     let pw = w + 2 * p;
     let n = h * w;
@@ -445,8 +447,7 @@ pub(super) fn conv_forward(l: &ConvLayer, x: &[f32], h: usize, w: usize) -> Vec<
             .collect()
     };
     let mut out = vec![0.0f32; l.c_out * n];
-    for o in 0..l.c_out {
-        let dst = &mut out[o * n..(o + 1) * n];
+    out.par_chunks_mut(n).enumerate().for_each(|(o, dst)| {
         dst.fill(l.b[o]);
         for i in 0..l.c_in {
             let wk = &l.w[(o * l.c_in + i) * k * k..(o * l.c_in + i + 1) * k * k];
@@ -469,10 +470,12 @@ pub(super) fn conv_forward(l: &ConvLayer, x: &[f32], h: usize, w: usize) -> Vec<
                 *d += *s;
             }
         }
-    }
+    });
     out
 }
 
+/// Backward of [`conv_forward`]; parallel over input channels (each owns its input
+/// gradient and its column of weight gradients).
 fn conv_backward(
     l: &ConvLayer,
     x: &[f32],
@@ -482,41 +485,55 @@ fn conv_backward(
     dx: &mut [f32],
     g: &mut ConvLayer,
 ) {
+    use rayon::prelude::*;
     let (k, p) = (l.k, l.k / 2);
     let pw = w + 2 * p;
     let n = h * w;
-    for i in 0..l.c_in {
-        let xi = &x[i * n..(i + 1) * n];
-        if k == 1 {
-            let dxi = &mut dx[i * n..(i + 1) * n];
+    let kk = k * k;
+    // Per input channel: its weight gradients `[o][ky][kx]`.
+    let gws: Vec<Vec<f32>> = dx[..l.c_in * n]
+        .par_chunks_mut(n)
+        .enumerate()
+        .map(|(i, dxi)| {
+            let xi = &x[i * n..(i + 1) * n];
+            let mut gw = vec![0.0f32; l.c_out * kk];
+            if k == 1 {
+                for o in 0..l.c_out {
+                    let d = &dout[o * n..(o + 1) * n];
+                    let widx = o * l.c_in + i;
+                    gw[o] = dot(d, xi);
+                    axpy(dxi, l.w[widx], d);
+                }
+                return gw;
+            }
+            let xp = pad(xi, h, w, p, true);
+            let mut dxp = vec![0.0f32; xp.len()];
             for o in 0..l.c_out {
                 let d = &dout[o * n..(o + 1) * n];
-                let widx = o * l.c_in + i;
-                g.w[widx] += dot(d, xi);
-                axpy(dxi, l.w[widx], d);
-            }
-            continue;
-        }
-        let xp = pad(xi, h, w, p, true);
-        let mut dxp = vec![0.0f32; xp.len()];
-        for o in 0..l.c_out {
-            let d = &dout[o * n..(o + 1) * n];
-            for ky in 0..k {
-                for kx in 0..k {
-                    let widx = ((o * l.c_in + i) * k + ky) * k + kx;
-                    let wv = l.w[widx];
-                    let mut gw = 0.0f64;
-                    for y in 0..h {
-                        let base = (y + ky) * pw + kx;
-                        let drow = &d[y * w..(y + 1) * w];
-                        gw += dot(drow, &xp[base..base + w]) as f64;
-                        axpy(&mut dxp[base..base + w], wv, drow);
+                for ky in 0..k {
+                    for kx in 0..k {
+                        let wv = l.w[((o * l.c_in + i) * k + ky) * k + kx];
+                        let mut acc = 0.0f64;
+                        for y in 0..h {
+                            let base = (y + ky) * pw + kx;
+                            let drow = &d[y * w..(y + 1) * w];
+                            acc += dot(drow, &xp[base..base + w]) as f64;
+                            axpy(&mut dxp[base..base + w], wv, drow);
+                        }
+                        gw[o * kk + ky * k + kx] = acc as f32;
                     }
-                    g.w[widx] += gw as f32;
                 }
             }
+            unpad(&dxp, h, w, p, true, dxi);
+            gw
+        })
+        .collect();
+    for (i, gw) in gws.iter().enumerate() {
+        for o in 0..l.c_out {
+            for t in 0..kk {
+                g.w[(o * l.c_in + i) * kk + t] += gw[o * kk + t];
+            }
         }
-        unpad(&dxp, h, w, p, true, &mut dx[i * n..(i + 1) * n]);
     }
     for o in 0..l.c_out {
         let d = &dout[o * n..(o + 1) * n];
@@ -741,16 +758,25 @@ pub(super) fn step(
         let ki = step_i % n_ups;
         let mut next = Vec::with_capacity((uc + 1) * th * tw);
         next.extend(sym_conv_forward(&q[t], th, tw, &k2_c[ki], shape.ups_pre_k));
-        for c in 0..uc {
-            next.extend(conv_t_forward(
-                &up[c * uh * uw..(c + 1) * uh * uw],
-                uh,
-                uw,
-                &k2_t[ki],
-                shape.ups_k,
-                th,
-                tw,
-            ));
+        {
+            use rayon::prelude::*;
+            let chans: Vec<Vec<f32>> = (0..uc)
+                .into_par_iter()
+                .map(|c| {
+                    conv_t_forward(
+                        &up[c * uh * uw..(c + 1) * uh * uw],
+                        uh,
+                        uw,
+                        &k2_t[ki],
+                        shape.ups_k,
+                        th,
+                        tw,
+                    )
+                })
+                .collect();
+            for ch in chans {
+                next.extend(ch);
+            }
         }
         ups_tape.push(UpsTape {
             prev: core::mem::take(&mut up),
@@ -883,19 +909,35 @@ pub(super) fn step(
         );
         let mut dprev = vec![0.0f32; tape.pc * tape.ph * tape.pw];
         let pn = tape.ph * tape.pw;
-        for c in 0..tape.pc {
-            conv_t_backward(
-                &tape.prev[c * pn..(c + 1) * pn],
-                tape.ph,
-                tape.pw,
-                &k2_t[ki],
-                shape.ups_k,
-                th,
-                tw,
-                &dcur[(1 + c) * n..(2 + c) * n],
-                &mut dprev[c * pn..(c + 1) * pn],
-                &mut dk2_t[ki],
-            );
+        {
+            // Parallel over channels; kernel gradients merged in channel order.
+            use rayon::prelude::*;
+            let k2 = &k2_t[ki];
+            let dks: Vec<Vec<f32>> = dprev
+                .par_chunks_mut(pn)
+                .enumerate()
+                .map(|(c, dp)| {
+                    let mut dk = vec![0.0f32; k2.len()];
+                    conv_t_backward(
+                        &tape.prev[c * pn..(c + 1) * pn],
+                        tape.ph,
+                        tape.pw,
+                        k2,
+                        shape.ups_k,
+                        th,
+                        tw,
+                        &dcur[(1 + c) * n..(2 + c) * n],
+                        dp,
+                        &mut dk,
+                    );
+                    dk
+                })
+                .collect();
+            for dk in dks {
+                for (a, b) in dk2_t[ki].iter_mut().zip(&dk) {
+                    *a += *b;
+                }
+            }
         }
         dcur = dprev;
         dc -= 1;

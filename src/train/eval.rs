@@ -205,4 +205,48 @@ mod tests {
         assert_eq!(rate, want.rate_bits);
         assert_eq!(mse, want.mse);
     }
+
+    #[test]
+    fn training_step_is_independent_of_thread_count() {
+        use super::super::{Quantizer, StepCfg, forward_backward};
+        let hdr = config::header(config::Arch::High, 70, 90);
+        let a = crate::decode::arch(&hdr).unwrap();
+        let shape = Shape::new(&hdr, &a).unwrap();
+        let mut p = shape.zero_params(&hdr, &a);
+        let mut rng = Rng::new(9);
+        initialize(&mut p, &shape, &mut rng);
+        p.for_each_mut(|t| {
+            for v in t.iter_mut() {
+                *v += rng.normal() * 0.1;
+            }
+        });
+        let target: Vec<f32> = (0..3 * 70 * 90)
+            .map(|i| ((i * 7919) % 256) as f32 / 255.0)
+            .collect();
+        let n_lat: usize = p.latents.iter().map(|l| l.len()).sum();
+        let noise: Vec<f32> = (0..n_lat).map(|_| rng.normal() * 0.2).collect();
+        let cfg = StepCfg {
+            quantizer: Quantizer::Softround { temperature: 0.3 },
+            gain: 16.0,
+            lambda: 1e-3,
+            eval_bitdepth: None,
+        };
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut g = p.zeros_like();
+                let t = forward_backward(&shape, &p, &target, &noise, cfg, &mut g);
+                let bits: Vec<u32> = g
+                    .tensors()
+                    .iter()
+                    .flat_map(|t| t.iter().map(|v| v.to_bits()))
+                    .collect();
+                (t.loss.to_bits(), bits)
+            })
+        };
+        assert_eq!(run(1), run(4));
+    }
 }
