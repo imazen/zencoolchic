@@ -82,6 +82,17 @@ fn matches_upstream_decoder() {
         let got_px: Vec<u16> = pic.planes.iter().flatten().copied().collect();
         assert_eq!(got_px.len(), want_px.len(), "{name}: pixel count");
         assert_eq!(pic.bitdepth as u64, meta["bitdepth"].as_u64().unwrap());
+        let data_type = match pic.data_type {
+            zencoolchic::FrameDataType::Rgb => "rgb",
+            zencoolchic::FrameDataType::Yuv420 => "yuv420",
+            zencoolchic::FrameDataType::Yuv444 => "yuv444",
+            zencoolchic::FrameDataType::Flow => "flow",
+        };
+        assert_eq!(
+            Some(data_type),
+            meta["frame_data_type"].as_str(),
+            "{name}: color model"
+        );
         let shapes = meta["plane_shapes"].as_array().unwrap();
         assert_eq!(pic.planes.len(), shapes.len(), "{name}: plane count");
         for ((plane, &(w, h)), shape) in pic.planes.iter().zip(&pic.plane_dims).zip(shapes) {

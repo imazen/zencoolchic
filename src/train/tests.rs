@@ -209,6 +209,7 @@ fn gradients_match_torch_autograd() {
             };
             let diff: Vec<f32> = mine.iter().zip(v).map(|(a, b)| a - b).collect();
             let r = l2(&diff) / l2(v).max(1e-30);
+            assert!(r.is_finite(), "{pname}: nonfinite gradient comparison");
             worst = worst.max(r);
             std::eprintln!("  {pname:<70} |g| {:.3e}  rel err {r:.2e}", l2(v));
         }
