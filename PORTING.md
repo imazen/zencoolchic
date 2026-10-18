@@ -74,7 +74,8 @@ Reuse plan (user, 2026-10-17: reuse owned code, relicensed): zensim-train-core /
 | Bitstream writer: range encoder, exp-Golomb encoder, headers | `bitstream/encode.py`, constriction encoder | done (`encoder` feature) | all 12 oracle streams re-encode byte for byte (`write::tests`) |
 | Training forward: quantizer (softround ∘ noise ∘ softround, Kumaraswamy), float ARM + IFCE, Laplace rate, train-mode upsampling, synthesis, MSE + λ·rate | `component/core/*.py`, `training/loss.py` | done, scalar, full-resolution latents only | loss within 3e-8 of torch (`just grad`) |
 | Backward of all of the above | torch autograd | done, scalar | vs float64 torch: worst relative gradient error 3.7e-4 (mid130×97 hop), 7.3e-4 (64×64 hop), 5.8e-4 (64×64 small); torch's own float32 pass is off by up to 1.4e-2 on the same tensors |
-| Optimizers (Adam for latents, SOAP for weights), grad clip, cosine LR, schedules | `training/train.py`, `soap.py` | not started | — |
+| SOAP optimizer (Adam mode for latents and 1-D tensors) | `training/soap.py` | done, scalar | vs upstream after 25 steps on fixed gradients (`just soap`): 20×20 weight 2.1e-4 of the parameter movement, 1-D 6.6e-7, latents 1.3e-6. Rank-deficient factors (non-square weights) are not comparable: upstream against itself with a rotated null-space basis differs by 1.6% (`scripts/oracle/soap_null_space_probe.py`); this port differs by 2.2% |
+| Grad clip, cosine LR, schedules, training loop | `training/train.py` | not started | — |
 | Warm-up, presets | `training/warmup.py`, `presets.py` | not started | — |
 | Network quantization search, RDOQ | `nnquant/*.py` | not started | — |
 | SIMD / threaded training kernels | — | not started | — |

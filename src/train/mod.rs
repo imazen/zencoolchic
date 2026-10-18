@@ -24,6 +24,7 @@ use crate::latent::{MASK_SIZE, context_window_indices};
 use crate::nn::{layer_dims, symmetric_kernel};
 
 mod ops;
+pub(crate) mod soap;
 #[cfg(all(test, feature = "oracle"))]
 mod tests;
 

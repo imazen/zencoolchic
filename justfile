@@ -29,3 +29,13 @@ grad-dump:
 # Training forward/backward vs torch.autograd (float64).
 grad:
     ZENCOOLCHIC_GRAD_DIR={{grad_dir}} cargo test --release --features oracle --lib train -- --nocapture
+
+soap_dir := env_var_or_default("ZENCOOLCHIC_SOAP_DIR", env_var("HOME") + "/tmp/coolchic-soap")
+
+soap-dump:
+    mkdir -p {{soap_dir}}
+    {{coolchic}}/.venv/bin/python -I scripts/oracle/dump_soap.py {{coolchic}} {{soap_dir}}/soap
+
+# SOAP optimizer vs upstream.
+soap:
+    ZENCOOLCHIC_SOAP_DIR={{soap_dir}} cargo test --release --features oracle --lib soap -- --nocapture
