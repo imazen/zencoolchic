@@ -36,6 +36,10 @@ Encoding YUV/10-bit input, common randomness / Wasserstein tuning, latents start
 full resolution, and video are not supported. [Encoder details](docs/ENCODER.md) covers
 settings, determinism, the training pipeline, and parity evidence.
 
+Optional `zencodec` support provides RGB probing/decoding and, with `encoder`, a public
+trainer-backed encoder configuration. See [the trait API](docs/ENCODER.md#zencodec-api)
+for cancellation, limits and the uncalibrated quality dial.
+
 ## License
 
 BSD-3-Clause. Derived from Cool-chic (BSD-3-Clause, © Orange), whose notice is in

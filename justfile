@@ -51,4 +51,21 @@ check:
     cargo clippy --all-targets --features std -- -D warnings
     cargo clippy --all-targets --features encoder -- -D warnings
     cargo clippy --all-targets --features oracle -- -D warnings
+    cargo clippy --all-targets --features zencodec -- -D warnings
+    cargo clippy --all-targets --features zencodec,encoder -- -D warnings
     cargo test --release --lib --features encoder
+    cargo test --release --features zencodec,encoder
+    cargo test --doc --features zencodec,encoder
+
+# Compile the decode-only bridge (including its no_std path).
+codec-check:
+    cargo check --features zencodec
+    cargo check --features zencodec,encoder
+
+# Test the common codec contracts and tiny encoder.
+codec-test:
+    cargo test --release --features zencodec,encoder
+
+# Public trait example; raw packed RGB8 sRGB input, minimum effort (2000 iterations).
+codec-encode input width height output:
+    cargo run --release --example codec_encode --features encoder,zencodec -- {{input}} {{width}} {{height}} {{output}}

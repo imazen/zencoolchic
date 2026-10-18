@@ -17,6 +17,9 @@ All notable changes to this project are documented here. The format follows
 
 - Source-based assessment of shared NN primitives in `docs/zennn-assessment.md`.
 
+- Optional zencodec RGB still-image bridge and public encoder configuration; cooperative
+  cancellation, header-only probe, strided buffers, and documented uncalibrated quality.
+
 - Encoder usage and pipeline documentation in `docs/ENCODER.md`.
 
 - Cool-chic 5 image decoder: headers, exp-Golomb network parameters, fixed-point ARM and

@@ -62,6 +62,18 @@ pub fn encode_rgb8(
     opt: &TrainOptions,
     log: &mut dyn FnMut(String),
 ) -> crate::Result<EncodeReport> {
+    encode_rgb8_with_stop(rgb, width, height, opt, log, &enough::Unstoppable)
+}
+
+pub(crate) fn encode_rgb8_with_stop(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    opt: &TrainOptions,
+    log: &mut dyn FnMut(String),
+    stop: &dyn enough::Stop,
+) -> crate::Result<EncodeReport> {
+    stop.check()?;
     let (hdr, shape, template, target, pb_lambda, gain) = setup(rgb, width, height, opt)?;
     let pb = Problem {
         shape: &shape,
@@ -71,17 +83,17 @@ pub fn encode_rgb8(
         gain,
     };
     let n_pix = (width as usize * height as usize) as f64;
-    let (p, l) = run_training(&pb, &template, opt, log);
+    let (p, l) = run_training(&pb, &template, opt, log, stop)?;
     let trained = TrainReport {
         psnr_db: -10.0 * libm::log10(l.mse),
         rate_latent_bpp: l.rate_bits / n_pix,
         loss: l.loss,
     };
     let has_ifce = p.ifce.iter().any(|m| m.is_some());
-    let (mut pq, q) = crate::train::quantize::quantize_model(&pb, &p, has_ifce);
+    let (mut pq, q) = crate::train::quantize::quantize_model(&pb, &p, has_ifce, stop)?;
     if opt.rdoq {
         let mut rng = trainer::Rng::new(opt.seed ^ 0x5244_4f51);
-        crate::train::rdoq::rdoq(&pb, &mut pq, &q, &mut rng, log);
+        crate::train::rdoq::rdoq(&pb, &mut pq, &q, &mut rng, log, stop)?;
     }
     let mut scratch = pq.zeros_like();
     let lq = trainer::evaluate(&pb, &pq, &mut scratch);
@@ -106,6 +118,7 @@ pub fn encode_rgb8(
         .zip(lat)
         .map(|(&(gh, gw), data)| crate::latent::Grid { h: gh, w: gw, data })
         .collect();
+    stop.check()?;
     let bitstream = crate::write::write_image(&h, crate::FrameDataType::Rgb, 8, &ints, &grids)?;
     Ok(EncodeReport {
         trained,
@@ -125,8 +138,23 @@ type Setup = (
 
 fn setup(rgb: &[u8], width: u32, height: u32, opt: &TrainOptions) -> crate::Result<Setup> {
     let (w, h) = (width as usize, height as usize);
-    if rgb.len() != 3 * w * h {
-        return Err(crate::Error::Invalid("rgb buffer size"));
+    if width == 0 || height == 0 || width > 16383 || height > 16383 {
+        return Err(crate::Error::InvalidArgument(
+            "dimensions must be 1..=16383",
+        ));
+    }
+    if w.checked_mul(h).and_then(|n| n.checked_mul(3)) != Some(rgb.len()) {
+        return Err(crate::Error::InvalidArgument("rgb buffer size"));
+    }
+    if !opt.lambda.is_finite() || opt.lambda <= 0.0 || opt.lambda > 1.0 {
+        return Err(crate::Error::InvalidArgument(
+            "lambda must be finite in (0, 1]",
+        ));
+    }
+    if !opt.start_lr.is_finite() || opt.start_lr <= 0.0 || opt.n_itr < 2000 || opt.arch > 3 {
+        return Err(crate::Error::InvalidArgument(
+            "lr must be positive, iterations >= 2000, arch <= 3",
+        ));
     }
     let arch = match opt.arch {
         0 => Arch::VeryHigh,
@@ -159,7 +187,8 @@ fn run_training(
     template: &crate::train::Params,
     opt: &TrainOptions,
     log: &mut dyn FnMut(String),
-) -> (crate::train::Params, crate::train::LossTerms) {
+    stop: &dyn enough::Stop,
+) -> crate::Result<(crate::train::Params, crate::train::LossTerms)> {
     let preset = Preset::intra(opt.lambda, opt.start_lr, opt.n_itr);
     let n_pix = (pb.shape.img.0 * pb.shape.img.1) as f64;
     let mut total = 0usize;
@@ -175,7 +204,7 @@ fn run_training(
                 ));
             }
         };
-    trainer::encode_training(pb, template, &preset, opt.seed, &mut progress)
+    trainer::encode_training(pb, template, &preset, opt.seed, &mut progress, stop)
 }
 
 /// Trains a Cool-chic on an interleaved 8-bit RGB picture. `log` receives one line per
@@ -196,7 +225,7 @@ pub fn train_rgb8(
         gain,
     };
     let n_pix = (width as usize * height as usize) as f64;
-    let (_p, l) = run_training(&pb, &template, opt, log);
+    let (_p, l) = run_training(&pb, &template, opt, log, &enough::Unstoppable)?;
     Ok(TrainReport {
         psnr_db: -10.0 * libm::log10(l.mse),
         rate_latent_bpp: l.rate_bits / n_pix,
@@ -232,6 +261,13 @@ pub fn bench_train_steps(
     ph.max_itr = n;
     ph.freq_valid = n + 1; // one validation at the end only
     let t = std::time::Instant::now();
-    let _ = trainer::train(&pb, p, &ph, &mut rng, &mut |_, _, _| {});
+    let _ = trainer::train(
+        &pb,
+        p,
+        &ph,
+        &mut rng,
+        &mut |_, _, _| {},
+        &enough::Unstoppable,
+    )?;
     Ok(t.elapsed().as_secs_f64() * 1e3 / n as f64)
 }

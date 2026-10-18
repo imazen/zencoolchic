@@ -57,7 +57,8 @@ pub(crate) fn rdoq(
     q: &NnQuant,
     rng: &mut Rng,
     log: &mut dyn FnMut(alloc::string::String),
-) {
+    stop: &dyn enough::Stop,
+) -> crate::Result<()> {
     let shape = pb.shape;
     let qlat = eval::quantize_hard(p, pb.gain);
     for m in Module::SORTED {
@@ -90,6 +91,7 @@ pub(crate) fn rdoq(
                 let mut best_value = initial;
                 for sign in [-1.0f32, 1.0] {
                     for shift in 1..16 {
+                        stop.check()?;
                         *module_values_mut(p, m, is_bias)[idx] =
                             initial + sign * shift as f32 * step;
                         evals += 1;
@@ -111,4 +113,5 @@ pub(crate) fn rdoq(
             ));
         }
     }
+    Ok(())
 }

@@ -222,7 +222,12 @@ fn loss_with_nn(pb: &Problem<'_>, t: &LossTerms, nn_bits: f32) -> f64 {
 
 /// Upstream `quantize_model`: per module (sorted by name), try every (weight, bias) step and
 /// keep the one with the lowest loss; the exp-Golomb orders minimize the estimated rate.
-pub(crate) fn quantize_model(pb: &Problem<'_>, fp: &Params, has_ifce: bool) -> (Params, NnQuant) {
+pub(crate) fn quantize_model(
+    pb: &Problem<'_>,
+    fp: &Params,
+    has_ifce: bool,
+    stop: &dyn enough::Stop,
+) -> crate::Result<(Params, NnQuant)> {
     let mut q = NnQuant::default();
     let mut cur = fp.clone();
     let mut scratch = fp.zeros_like();
@@ -234,6 +239,7 @@ pub(crate) fn quantize_model(pb: &Problem<'_>, fp: &Params, has_ifce: bool) -> (
         let mut best: Option<(f64, [i32; 2], [u32; 2])> = None;
         for sw in rw.clone() {
             for sb in rb.clone() {
+                stop.check()?;
                 let Some(cand) = quantize_module(&cur, m, [sw, sb]) else {
                     continue;
                 };
@@ -253,7 +259,7 @@ pub(crate) fn quantize_model(pb: &Problem<'_>, fp: &Params, has_ifce: bool) -> (
         q.expgol[m.slot()] = eg;
         cur = quantize_module(&cur, m, s).unwrap();
     }
-    (cur, q)
+    Ok((cur, q))
 }
 
 /// Integers of every network parameter in stream order (`decode::plan`), and the latents

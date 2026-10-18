@@ -499,23 +499,36 @@ fn decode_latents(
     a: &Arch,
     nets: &Networks,
     latent_bytes: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<Grid>> {
     let mut rc = RangeDecoder::new(latent_bytes)?;
-    code_latents(h, a, nets, &mut rc)
+    code_latents_checked(h, a, nets, &mut rc, check)
 }
 
 /// Walks the grids coarsest first, computing each grid's IFCE context from the grids
 /// already coded.
+#[cfg(feature = "encoder")]
 pub(crate) fn code_latents(
     h: &CoolChicHeader,
     a: &Arch,
     nets: &Networks,
     rc: &mut impl GridCoder,
 ) -> Result<Vec<Grid>> {
+    code_latents_checked(h, a, nets, rc, &mut || Ok(()))
+}
+
+fn code_latents_checked(
+    h: &CoolChicHeader,
+    a: &Arch,
+    nets: &Networks,
+    rc: &mut impl GridCoder,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<Grid>> {
     let window = latent::context_window_indices(h.spatial_context_arm as usize)?;
     let n = a.size_per_latent.len();
     let mut grids: Vec<Option<Grid>> = (0..n).map(|_| None).collect();
     for idx in (0..n).rev() {
+        check()?;
         let (gh, gw) = a.size_per_latent[idx];
         let inter = if a.flag_ifce {
             let coded: Vec<&Grid> = grids[idx + 1..]
@@ -574,7 +587,12 @@ fn synthesize(h: &CoolChicHeader, a: &Arch, nets: &Networks, grids: &[Grid]) -> 
 /// Synthesis output, decoded grids, hyperlatent flags, remaining bytes.
 type CoolChicOut<'a> = (Planes, Vec<Grid>, Vec<bool>, &'a [u8]);
 
-fn decode_coolchic<'a>(data: &'a [u8], limits: &Limits) -> Result<CoolChicOut<'a>> {
+fn decode_coolchic<'a>(
+    data: &'a [u8],
+    limits: &Limits,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<CoolChicOut<'a>> {
+    check()?;
     let (h, rest) = CoolChicHeader::parse(data)?;
     let px = h.img_size[0] as u64 * h.img_size[1] as u64;
     if px == 0 {
@@ -592,8 +610,11 @@ fn decode_coolchic<'a>(data: &'a [u8], limits: &Limits) -> Result<CoolChicOut<'a
     let (nn_bytes, rest) = rest.split_at(nn_len);
     let (lat_bytes, rest) = rest.split_at(lat_len);
     let (nets, _) = build_networks(&h, &a, nn_bytes)?;
-    let grids = decode_latents(&h, &a, &nets, lat_bytes)?;
+    check()?;
+    let grids = decode_latents(&h, &a, &nets, lat_bytes, check)?;
+    check()?;
     let out = synthesize(&h, &a, &nets, &grids);
+    check()?;
     Ok((out, grids, a.is_hyperlatent, rest))
 }
 
@@ -604,15 +625,29 @@ fn quantize(v: f32, max: f32) -> f32 {
 
 /// Decodes the first frame of a Cool-chic bitstream (an image).
 pub fn decode(data: &[u8], limits: &Limits) -> Result<Picture> {
-    decode_inner(data, limits).map(|(p, _)| p)
+    decode_inner(data, limits, &mut || Ok(())).map(|(p, _)| p)
 }
 
 /// Like [`decode`], also returning the decoded latents and the unquantized synthesis output.
 pub fn decode_with_details(data: &[u8], limits: &Limits) -> Result<(Picture, DecodeDetails)> {
-    decode_inner(data, limits)
+    decode_inner(data, limits, &mut || Ok(()))
 }
 
-fn decode_inner(data: &[u8], limits: &Limits) -> Result<(Picture, DecodeDetails)> {
+#[cfg(feature = "zencodec")]
+pub(crate) fn decode_checked(
+    data: &[u8],
+    limits: &Limits,
+    stop: &dyn enough::Stop,
+) -> Result<Picture> {
+    decode_inner(data, limits, &mut || stop.check().map_err(Error::from)).map(|(p, _)| p)
+}
+
+fn decode_inner(
+    data: &[u8],
+    limits: &Limits,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<(Picture, DecodeDetails)> {
+    check()?;
     let (vh, rest) = VideoHeader::parse(data)?;
     if vh.n_frames > limits.max_frames {
         return Err(Error::LimitExceeded("frames"));
@@ -624,7 +659,7 @@ fn decode_inner(data: &[u8], limits: &Limits) -> Result<(Picture, DecodeDetails)
     if fh.frame_type != FrameType::I {
         return Err(Error::Unsupported("inter frames"));
     }
-    let (raw, grids, hyper, _rest) = decode_coolchic(rest, limits)?;
+    let (raw, grids, hyper, _rest) = decode_coolchic(rest, limits, check)?;
     if raw.c < 3 {
         return Err(Error::Invalid("synthesis has fewer than 3 output channels"));
     }

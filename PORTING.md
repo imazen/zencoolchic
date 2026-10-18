@@ -118,3 +118,32 @@ cd ~/work/zen/zencoolchic && just oracle-dump && just oracle
 
 Upstream's decoder builds fresh `nn.Module`s, which are in training mode, so it runs the
 non-separable `kron(w, wᵀ)` upsampling kernels. The port follows that path.
+
+## zencodec bridge
+
+The optional `zencodec` feature adds header-only probing, RGB8/RGB16 decode and custom
+`coolchic` format registration. Add `encoder` for public trainer-backed encode configurations.
+The registered eight-byte still header is `00 10 01 00 00 00 80 00`: the 16-bit header-length
+field starts after three 12-bit fields, not at a byte boundary. This was checked against
+upstream's kodim14 stream and the writer's output. Detection is heuristic, not magic.
+
+RGB8 sRGB is the only encode descriptor. Nonidentity metadata orientation is baked through
+`zenpixels-convert`; YUV, HDR, other descriptors and video are refused. Finite working-memory
+budgets are refused because this codec has no complete heap accounting; it does not advertise
+memory-limit enforcement. Input/output bytes, dimensions, pixels and frames are checked.
+Cancellation reaches each training iteration, network quantization/RDOQ candidate and decode
+grid/stage. A whole convolution or latent grid is not interruptible. Quality mapping and
+resource estimates are uncalibrated/unknown, respectively.
+
+Tests cover native-versus-trait decode, nonzero 8/10/16-bit output, strided encode/sink buffers,
+minimum-effort training and cancellation, output caps, orientation versus pre-oriented input,
+and complete tiny-stream identity with 1 and 4 threads. Published testkit 0.1.0's capability,
+metadata-leakage, error-envelope and truncation checks apply. Its pixel/orientation round-trip
+checks require original-pixel identity and do not apply to lossy encoding; the orientation
+replacement retains exact comparison of the two encoded streams. Existing upstream parity
+bounds are unchanged.
+
+Independent check (2026-10-17, mac): `examples/codec_encode.rs` at minimum generic effort
+(2000 iterations, default hop/lambda/seed/RDOQ) encoded a 4×3 RGB8 pattern (`sample[i] = 7*i`,
+36 samples). Upstream `a6fe38a` `cc_decode.py` and this crate's `examples/decode.rs` produced
+identical 36/36 RGB8 samples. No stream binary is stored in git.
