@@ -26,6 +26,7 @@ use crate::nn::{layer_dims, symmetric_kernel};
 mod arm_batch;
 pub(crate) mod config;
 pub(crate) mod eval;
+pub(crate) mod ifce;
 mod ops;
 pub(crate) mod quantize;
 pub(crate) mod rdoq;
@@ -222,6 +223,8 @@ pub(crate) struct Shape {
     pub(crate) ups_pre_k: usize,
     /// `Some(n)`: the synthesis stabiliser reads the first `n` input channels.
     pub(crate) syn_stab_in: Option<usize>,
+    /// IFCE input layout of every grid (a function of the grid sizes only).
+    pub(crate) ifce_stacks: Vec<ifce::Stack>,
 }
 
 impl Shape {
@@ -245,6 +248,9 @@ impl Shape {
             syn_stab_in: h
                 .linear_stabiliser_synth
                 .then_some(a.input_feature_synthesis),
+            ifce_stacks: (0..a.size_per_latent.len())
+                .map(|i| ifce::stack_for(&a.size_per_latent, i))
+                .collect(),
         })
     }
 

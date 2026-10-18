@@ -30,7 +30,7 @@ impl Rng {
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let r = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
         let t = self.s[1] << 17;
         self.s[2] ^= self.s[0];
@@ -310,16 +310,20 @@ pub(crate) fn train(
         }
         let noise_slice: &[f32] = match (ph.hardround, ph.noise) {
             (true, _) | (_, Noise::None) => &[],
-            (false, Noise::Gaussian) => {
-                for v in noise.iter_mut() {
-                    *v = rng.normal() * noise_param;
-                }
-                &noise
-            }
-            (false, Noise::Kumaraswamy) => {
-                for v in noise.iter_mut() {
-                    *v = super::ops::kumaraswamy(rng.uniform(), noise_param);
-                }
+            (false, kind) => {
+                // One generator per fixed 4096-value block, seeded from the main generator:
+                // parallel and independent of the thread count.
+                use rayon::prelude::*;
+                let seed = rng.next_u64();
+                noise.par_chunks_mut(4096).enumerate().for_each(|(bi, ch)| {
+                    let mut r = Rng::new(seed ^ (bi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    for v in ch.iter_mut() {
+                        *v = match kind {
+                            Noise::Gaussian => r.normal() * noise_param,
+                            _ => super::ops::kumaraswamy(r.uniform(), noise_param),
+                        };
+                    }
+                });
                 &noise
             }
         };

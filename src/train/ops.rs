@@ -6,12 +6,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::arm_batch::{
-    ArmBackward, MlpGrad as ArmGrad, arm_pass, to_channel_major, to_pixel_major,
-};
-use super::{
-    ConvLayer, Linear, LossTerms, Mlp, Params, Quantizer, Shape, StepCfg, WINDOW, full_kernel,
-};
+use super::arm_batch::{ArmBackward, MlpGrad as ArmGrad, arm_pass};
+use super::{ConvLayer, LossTerms, Params, Quantizer, Shape, StepCfg, WINDOW, full_kernel};
 use crate::simd::{axpy, dot};
 
 const PAD: usize = (WINDOW - 1) / 2;
@@ -86,134 +82,6 @@ pub(super) fn rate_and_grads(x: f32, mu: f32, raw_ls: f32) -> (f32, f32, f32, f3
         0.0
     };
     (rate, dx, dmu, dls)
-}
-
-// ---------------------------------------------------------------------------------------
-// MLP (one context vector at a time)
-
-/// Forward through an MLP; `acts[l]` receives layer `l`'s input, `acts[n]` the output.
-pub(super) fn mlp_forward(m: &Mlp, x: &[f32], acts: &mut Vec<Vec<f32>>) {
-    acts.resize(m.layers.len() + 1, Vec::new());
-    acts[0].clear();
-    acts[0].extend_from_slice(x);
-    let last = m.layers.len() - 1;
-    for (l, lin) in m.layers.iter().enumerate() {
-        let (inp, out) = acts.split_at_mut(l + 1);
-        let h = &inp[l];
-        let y = &mut out[0];
-        y.clear();
-        for o in 0..lin.n_out {
-            let row = &lin.w[o * lin.n_in..(o + 1) * lin.n_in];
-            let mut acc = lin.b[o];
-            for i in 0..lin.n_in {
-                acc += row[i] * h[i];
-            }
-            if lin.residual {
-                acc += h[o];
-            }
-            y.push(if l < last { acc.max(0.0) } else { acc });
-        }
-    }
-    if let Some(st) = &m.stabiliser {
-        let n = acts.len() - 1;
-        for o in 0..st.n_out {
-            let row = &st.w[o * st.n_in..(o + 1) * st.n_in];
-            let mut acc = st.b[o];
-            for i in 0..st.n_in {
-                acc += row[i] * x[i];
-            }
-            acts[n][o] += acc;
-        }
-    }
-}
-
-/// Backward for [`mlp_forward`]: accumulates weight gradients into `g` (f64) and writes the
-/// input gradient to `dx`.
-#[inline(never)]
-fn mlp_backward(m: &Mlp, acts: &[Vec<f32>], dout: &[f32], g: &mut MlpGrad, dx: &mut [f32]) {
-    let x = &acts[0];
-    dx.fill(0.0);
-    if let Some(st) = &m.stabiliser {
-        let gs = g.stab.as_mut().unwrap();
-        for o in 0..st.n_out {
-            let d = dout[o];
-            gs.b[o] += d as f64;
-            for i in 0..st.n_in {
-                gs.w[o * st.n_in + i] += (d * x[i]) as f64;
-                dx[i] += st.w[o * st.n_in + i] * d;
-            }
-        }
-    }
-    let n = m.layers.len();
-    let mut d: Vec<f32> = dout.to_vec();
-    for l in (0..n).rev() {
-        let lin = &m.layers[l];
-        let h = &acts[l];
-        if l < n - 1 {
-            // ReLU on this layer's output.
-            for (dv, &a) in d.iter_mut().zip(&acts[l + 1]) {
-                if a <= 0.0 {
-                    *dv = 0.0;
-                }
-            }
-        }
-        let gl = &mut g.layers[l];
-        let mut dh = vec![0.0f32; lin.n_in];
-        for o in 0..lin.n_out {
-            let dv = d[o];
-            gl.b[o] += dv as f64;
-            for i in 0..lin.n_in {
-                gl.w[o * lin.n_in + i] += (dv * h[i]) as f64;
-                dh[i] += lin.w[o * lin.n_in + i] * dv;
-            }
-            if lin.residual {
-                dh[o] += dv;
-            }
-        }
-        d = dh;
-    }
-    for (a, b) in dx.iter_mut().zip(&d) {
-        *a += *b;
-    }
-}
-
-struct LinGrad {
-    w: Vec<f64>,
-    b: Vec<f64>,
-}
-
-struct MlpGrad {
-    layers: Vec<LinGrad>,
-    stab: Option<LinGrad>,
-}
-
-impl MlpGrad {
-    fn new(m: &Mlp) -> Self {
-        let lg = |l: &Linear| LinGrad {
-            w: vec![0.0; l.w.len()],
-            b: vec![0.0; l.b.len()],
-        };
-        Self {
-            layers: m.layers.iter().map(lg).collect(),
-            stab: m.stabiliser.as_ref().map(lg),
-        }
-    }
-
-    fn write(&self, dst: &mut Mlp) {
-        for (d, s) in dst
-            .layers
-            .iter_mut()
-            .chain(dst.stabiliser.as_mut())
-            .zip(self.layers.iter().chain(self.stab.as_ref()))
-        {
-            for (a, b) in d.w.iter_mut().zip(&s.w) {
-                *a = *b as f32;
-            }
-            for (a, b) in d.b.iter_mut().zip(&s.b) {
-                *a = *b as f32;
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -535,60 +403,40 @@ fn conv_backward(
             }
         }
     }
-    for o in 0..l.c_out {
-        let d = &dout[o * n..(o + 1) * n];
-        g.b[o] += d.iter().map(|&v| v as f64).sum::<f64>() as f32;
-        if l.residual {
-            for (a, b) in dx[o * n..(o + 1) * n].iter_mut().zip(d) {
-                *a += *b;
-            }
-        }
+    let bs: Vec<f64> = (0..l.c_out)
+        .into_par_iter()
+        .map(|o| {
+            dout[o * n..(o + 1) * n]
+                .iter()
+                .map(|&v| v as f64)
+                .sum::<f64>()
+        })
+        .collect();
+    for (b, s) in g.b.iter_mut().zip(&bs) {
+        *b += *s as f32;
     }
-}
-
-// ---------------------------------------------------------------------------------------
-// IFCE stacking
-
-/// For grid `idx`, where each channel of its IFCE input comes from: `(grid, flat index map)`
-/// per channel, at the resolution `(uh, uw)` of grid `idx + 1`.
-pub(super) struct Stack {
-    pub(super) uh: usize,
-    pub(super) uw: usize,
-    /// (source grid, source flat index per stacked pixel); empty = the all-zero channel of
-    /// the coarsest grid.
-    pub(super) channels: Vec<(usize, Vec<u32>)>,
-}
-
-pub(super) fn ifce_stack(shape: &Shape, idx: usize) -> Stack {
-    let n = shape.grids.len();
-    if idx == n - 1 {
-        let (h, w) = shape.grids[idx];
-        return Stack {
-            uh: h,
-            uw: w,
-            channels: vec![(usize::MAX, Vec::new())],
-        };
-    }
-    let (uh, uw) = shape.grids[idx + 1];
-    let mut channels = Vec::new();
-    for j in idx + 1..n {
-        let (_, gw) = shape.grids[j];
-        let mut map = Vec::with_capacity(uh * uw);
-        for y in 0..uh {
-            for x in 0..uw {
-                let (mut yy, mut xx) = (y, x);
-                for m in idx + 1..j {
-                    if shape.grids[m] != shape.grids[m + 1] {
-                        yy /= 2;
-                        xx /= 2;
-                    }
+    if l.residual {
+        dx[..l.c_out * n]
+            .par_chunks_mut(n)
+            .zip(dout.par_chunks(n))
+            .for_each(|(a, d)| {
+                for (x, y) in a.iter_mut().zip(d) {
+                    *x += *y;
                 }
-                map.push((yy * gw + xx) as u32);
-            }
-        }
-        channels.push((j, map));
+            });
     }
-    Stack { uh, uw, channels }
+}
+
+/// `dst += src`, in parallel.
+fn par_add(dst: &mut [f32], src: &[f32]) {
+    use rayon::prelude::*;
+    dst.par_chunks_mut(1 << 14)
+        .zip(src.par_chunks(1 << 14))
+        .for_each(|(a, b)| {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x += *y;
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------------------
@@ -609,97 +457,41 @@ pub(super) fn step(
     let (ih, iw) = shape.img;
     let n_pix = ih * iw;
 
-    // 1. Quantize.
+    // 1. Quantize (parallel, element-wise).
     let mut q: Vec<Vec<f32>> = Vec::with_capacity(n_grids);
     let mut dq_dy: Vec<Vec<f32>> = Vec::with_capacity(n_grids);
     let mut off = 0;
     for lat in &p.latents {
-        let mut qq = Vec::with_capacity(lat.len());
-        let mut dd = Vec::with_capacity(lat.len());
-        for (i, &y) in lat.iter().enumerate() {
-            let x = y * cfg.gain;
-            match cfg.quantizer {
-                Quantizer::Softround { temperature } => {
-                    let (s1, d1) = softround(x, temperature);
-                    let n = noise.get(off + i).copied().unwrap_or(0.0);
-                    let (s2, d2) = softround(s1 + n, temperature);
-                    qq.push(s2);
-                    dd.push(cfg.gain * d1 * d2);
+        use rayon::prelude::*;
+        let nz = noise.get(off..off + lat.len());
+        let (qq, dd): (Vec<f32>, Vec<f32>) = lat
+            .par_iter()
+            .enumerate()
+            .map(|(i, &y)| {
+                let x = y * cfg.gain;
+                match cfg.quantizer {
+                    Quantizer::Softround { temperature } => {
+                        let (s1, d1) = softround(x, temperature);
+                        let n = nz.map_or(0.0, |z| z[i]);
+                        let (s2, d2) = softround(s1 + n, temperature);
+                        (s2, cfg.gain * d1 * d2)
+                    }
+                    Quantizer::Hardround => (libm::rintf(x), 0.0),
                 }
-                Quantizer::Hardround => {
-                    qq.push(libm::rintf(x));
-                    dd.push(0.0);
-                }
-            }
-        }
+            })
+            .unzip();
         off += lat.len();
         q.push(qq);
         dq_dy.push(dd);
     }
     let mut dq: Vec<Vec<f32>> = q.iter().map(|g| vec![0.0; g.len()]).collect();
 
-    // 2. IFCE contexts (forward).
+    // 2. IFCE contexts (channel-major).
     let n_ifce = shape.n_ifce_out;
-    struct IfceTape {
-        stack: Stack,
-        input: Vec<f32>, // pixel-major, channels
-        out: Vec<f32>,   // pixel-major, n_ifce
-    }
-    let mut ifce_tape: Vec<Option<IfceTape>> = (0..n_grids).map(|_| None).collect();
-    let mut inter: Vec<Option<Vec<f32>>> = (0..n_grids).map(|_| None).collect();
-    if n_ifce > 0 {
-        for idx in 0..n_grids {
-            let (gh, gw) = shape.grids[idx];
-            let mut ctx = vec![0.0f32; gh * gw * n_ifce];
-            if let Some(m) = &p.ifce[idx] {
-                let st = ifce_stack(shape, idx);
-                let uc = st.channels.len();
-                let mut input = vec![0.0f32; st.uh * st.uw * uc];
-                for (c, (j, map)) in st.channels.iter().enumerate() {
-                    if *j == usize::MAX {
-                        continue;
-                    }
-                    for (px, &s) in map.iter().enumerate() {
-                        input[px * uc + c] = q[*j][s as usize];
-                    }
-                }
-                let mut out = vec![0.0f32; st.uh * st.uw * n_ifce];
-                let mut acts = Vec::new();
-                for px in 0..st.uh * st.uw {
-                    mlp_forward(m, &input[px * uc..(px + 1) * uc], &mut acts);
-                    out[px * n_ifce..(px + 1) * n_ifce].copy_from_slice(&acts[acts.len() - 1]);
-                }
-                for y in 0..gh {
-                    for x in 0..gw {
-                        let s = ((y / 2) * st.uw + x / 2) * n_ifce;
-                        ctx[(y * gw + x) * n_ifce..(y * gw + x + 1) * n_ifce]
-                            .copy_from_slice(&out[s..s + n_ifce]);
-                    }
-                }
-                ifce_tape[idx] = Some(IfceTape {
-                    stack: st,
-                    input,
-                    out,
-                });
-            }
-            inter[idx] = Some(ctx);
-        }
-    }
-    let mut d_inter: Vec<Vec<f32>> = inter
-        .iter()
-        .map(|c| c.as_ref().map_or(Vec::new(), |c| vec![0.0; c.len()]))
-        .collect();
+    let (inter_cm, ifce_tape) = super::ifce::forward(shape, &p.ifce, &q);
 
     // 3. ARM + rate (row-batched, `arm_batch`).
     let rate_w = lambda / n_pix as f32;
-    let inter_cm: Vec<Option<Vec<f32>>> = inter
-        .iter()
-        .enumerate()
-        .map(|(g, c)| {
-            c.as_ref()
-                .map(|c| to_channel_major(c, shape.grids[g].0 * shape.grids[g].1, n_ifce))
-        })
-        .collect();
     let mut d_inter_cm: Vec<Vec<f32>> = inter_cm
         .iter()
         .map(|c| c.as_ref().map_or(Vec::new(), |c| vec![0.0; c.len()]))
@@ -719,12 +511,8 @@ pub(super) fn step(
     );
     if backward {
         arm_g.write(&mut grads.arm);
-        for (g, d) in d_inter_cm.iter().enumerate() {
-            if !d.is_empty() {
-                d_inter[g] = to_pixel_major(d, shape.grids[g].0 * shape.grids[g].1, n_ifce);
-            }
-        }
     }
+    let _ = n_ifce;
 
     // 4. Upsampling + synthesis forward, with the tape needed for backward.
     let lat_idx: Vec<usize> = (0..n_grids).filter(|&g| !shape.is_hyper[g]).collect();
@@ -792,44 +580,50 @@ pub(super) fn step(
     }
     debug_assert_eq!((uh, uw), (ih, iw));
 
+    use rayon::prelude::*;
     let mut syn_inputs: Vec<Vec<f32>> = Vec::with_capacity(p.syn.len());
     let mut cur = up.clone();
     for l in &p.syn {
-        syn_inputs.push(cur.clone());
         let mut o = conv_forward(l, &cur, ih, iw);
         if l.relu {
-            for v in &mut o {
-                *v = v.max(0.0);
-            }
+            o.par_iter_mut().for_each(|v| *v = v.max(0.0));
         }
-        cur = o;
+        syn_inputs.push(core::mem::replace(&mut cur, o));
     }
     if let Some(st) = &p.syn_stab {
         let s = conv_forward(st, &up[..st.c_in * n_pix], ih, iw);
-        for (a, b) in cur.iter_mut().zip(&s) {
-            *a += *b;
-        }
+        par_add(&mut cur, &s);
     }
     let pre_out = cur;
     let raw = conv_forward(&p.out_transform, &pre_out, ih, iw);
 
     // 5. Loss.
     let n_el = raw.len();
-    let mut mse = 0.0f64;
     let mut draw = vec![0.0f32; n_el];
     let out_max = cfg.eval_bitdepth.map(|b| ((1u32 << b) - 1) as f32);
-    for i in 0..n_el {
-        let mut c = raw[i].clamp(0.0, 1.0);
-        if let Some(m) = out_max {
-            c = libm::rintf(c * m) / m;
-        }
-        let e = c - target[i];
-        mse += (e * e) as f64;
-        if (0.0..=1.0).contains(&raw[i]) {
-            draw[i] = 2.0 * e / n_el as f32;
-        }
-    }
-    let mse = mse / n_el as f64;
+    // Fixed-size chunks: partial sums are added in chunk order (thread-count independent).
+    const CH: usize = 1 << 14;
+    let partial: Vec<f64> = draw
+        .par_chunks_mut(CH)
+        .zip(raw.par_chunks(CH))
+        .zip(target.par_chunks(CH))
+        .map(|((dr, rw), tg)| {
+            let mut m = 0.0f64;
+            for ((d, &r), &t) in dr.iter_mut().zip(rw).zip(tg) {
+                let mut c = r.clamp(0.0, 1.0);
+                if let Some(mx) = out_max {
+                    c = libm::rintf(c * mx) / mx;
+                }
+                let e = c - t;
+                m += (e * e) as f64;
+                if (0.0..=1.0).contains(&r) {
+                    *d = 2.0 * e / n_el as f32;
+                }
+            }
+            m
+        })
+        .collect();
+    let mse = partial.iter().sum::<f64>() / n_el as f64;
     if !backward {
         return LossTerms {
             loss: mse + lambda as f64 * rate_total / n_pix as f64,
@@ -871,20 +665,18 @@ pub(super) fn step(
             } else {
                 &pre_out_before_stab(&p.syn, &syn_inputs, ih, iw)
             };
-            for (dv, &ov) in d.iter_mut().zip(o) {
+            d.par_iter_mut().zip(o.par_iter()).for_each(|(dv, &ov)| {
                 if ov <= 0.0 {
                     *dv = 0.0;
                 }
-            }
+            });
         }
         let g = &mut grads.syn[li];
         let mut dx = vec![0.0f32; x.len()];
         conv_backward(l, x, ih, iw, &d, &mut dx, g);
         d = dx;
     }
-    for (a, b) in d_up.iter_mut().zip(&d) {
-        *a += *b;
-    }
+    par_add(&mut d_up, &d);
 
     // 7. Upsampling backward.
     let mut dk2_t: Vec<Vec<f32>> = k2_t.iter().map(|k| vec![0.0; k.len()]).collect();
@@ -956,46 +748,14 @@ pub(super) fn step(
     }
 
     // 8. IFCE backward.
-    for idx in 0..n_grids {
-        let (Some(m), Some(tape)) = (&p.ifce[idx], &ifce_tape[idx]) else {
-            continue;
-        };
-        let (gh, gw) = shape.grids[idx];
-        let st = &tape.stack;
-        let uc = st.channels.len();
-        let mut dout = vec![0.0f32; st.uh * st.uw * n_ifce];
-        for y in 0..gh {
-            for x in 0..gw {
-                let s = ((y / 2) * st.uw + x / 2) * n_ifce;
-                for k in 0..n_ifce {
-                    dout[s + k] += d_inter[idx][(y * gw + x) * n_ifce + k];
-                }
-            }
-        }
-        let mut mg = MlpGrad::new(m);
-        let mut acts = Vec::new();
-        let mut dx = vec![0.0f32; uc];
-        for px in 0..st.uh * st.uw {
-            mlp_forward(m, &tape.input[px * uc..(px + 1) * uc], &mut acts);
-            debug_assert_eq!(
-                acts[acts.len() - 1][..],
-                tape.out[px * n_ifce..(px + 1) * n_ifce]
-            );
-            mlp_backward(
-                m,
-                &acts,
-                &dout[px * n_ifce..(px + 1) * n_ifce],
-                &mut mg,
-                &mut dx,
-            );
-            for (c, (j, map)) in st.channels.iter().enumerate() {
-                if *j != usize::MAX {
-                    dq[*j][map[px] as usize] += dx[c];
-                }
-            }
-        }
-        mg.write(grads.ifce[idx].as_mut().unwrap());
-    }
+    super::ifce::backward(
+        shape,
+        &p.ifce,
+        &ifce_tape,
+        &d_inter_cm,
+        &mut dq,
+        &mut grads.ifce,
+    );
 
     // 9. Quantizer backward.
     for g in 0..n_grids {
