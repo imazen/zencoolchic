@@ -46,7 +46,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --features std -- -D warnings
+      - run: cargo clippy --all-targets --features encoder -- -D warnings
       - run: cargo test --all-targets --features std
+      - run: cargo test --lib --features encoder
 
   i686:
     name: Test (i686)

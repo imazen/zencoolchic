@@ -23,10 +23,12 @@ use crate::decode::Arch;
 use crate::latent::{MASK_SIZE, context_window_indices};
 use crate::nn::{layer_dims, symmetric_kernel};
 
+pub(crate) mod config;
 mod ops;
 pub(crate) mod soap;
 #[cfg(all(test, feature = "oracle"))]
 mod tests;
+pub(crate) mod trainer;
 
 /// Float linear layer, `y = W x + b (+ x if residual)`, `W` row-major `[out][in]`.
 #[derive(Clone, Debug)]
@@ -108,6 +110,62 @@ impl Params {
         p
     }
 
+    /// Every tensor's shape and role, in [`Params::for_each_mut`] order.
+    pub(crate) fn layout(&self) -> Vec<(Vec<usize>, Role)> {
+        let mut out = Vec::new();
+        for l in &self.latents {
+            out.push((vec![1, 1, l.len()], Role::Latent));
+        }
+        let mlp = |m: &Mlp, out: &mut Vec<(Vec<usize>, Role)>| {
+            for l in m.layers.iter().chain(m.stabiliser.as_ref()) {
+                out.push((vec![l.n_out, l.n_in], Role::Weight));
+                out.push((vec![l.n_out], Role::Weight));
+            }
+        };
+        mlp(&self.arm, &mut out);
+        for m in self.ifce.iter().flatten() {
+            mlp(m, &mut out);
+        }
+        for k in self.ups_t.iter().chain(&self.ups_c) {
+            out.push((vec![k.len()], Role::Weight));
+        }
+        for c in self.syn.iter().chain(self.syn_stab.as_ref()) {
+            out.push((vec![c.c_out, c.c_in, c.k, c.k], Role::Weight));
+            out.push((vec![c.c_out], Role::Weight));
+        }
+        let c = &self.out_transform;
+        out.push((vec![c.c_out, c.c_in, c.k, c.k], Role::Frozen));
+        out.push((vec![c.c_out], Role::Frozen));
+        out
+    }
+
+    /// Read-only views of every tensor, in [`Params::for_each_mut`] order.
+    pub(crate) fn tensors(&self) -> Vec<&[f32]> {
+        let mut out: Vec<&[f32]> = Vec::new();
+        for l in &self.latents {
+            out.push(l);
+        }
+        for m in core::iter::once(&self.arm).chain(self.ifce.iter().flatten()) {
+            for l in m.layers.iter().chain(m.stabiliser.as_ref()) {
+                out.push(&l.w);
+                out.push(&l.b);
+            }
+        }
+        for k in self.ups_t.iter().chain(&self.ups_c) {
+            out.push(k);
+        }
+        for c in self
+            .syn
+            .iter()
+            .chain(self.syn_stab.as_ref())
+            .chain(Some(&self.out_transform))
+        {
+            out.push(&c.w);
+            out.push(&c.b);
+        }
+        out
+    }
+
     /// Visits every tensor (latents, weights, biases, including the frozen ones).
     pub(crate) fn for_each_mut(&mut self, mut f: impl FnMut(&mut [f32])) {
         for l in &mut self.latents {
@@ -136,6 +194,15 @@ impl Params {
             f(&mut c.b);
         }
     }
+}
+
+/// Which optimizer group a tensor belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    Latent,
+    Weight,
+    /// The synthesis output transform: never optimized upstream.
+    Frozen,
 }
 
 /// Static shape information derived from the header-level architecture.

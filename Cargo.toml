@@ -33,3 +33,15 @@ lto = "thin"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[[example]]
+name = "train"
+required-features = ["encoder"]
+
+[[example]]
+name = "decode"
+required-features = ["std"]
+
+[[example]]
+name = "exp_audit"
+required-features = ["std"]

@@ -28,6 +28,9 @@ mod simd;
 #[cfg(feature = "encoder")]
 mod train;
 #[cfg(feature = "encoder")]
+#[doc(hidden)]
+pub mod unstable;
+#[cfg(feature = "encoder")]
 mod write;
 
 pub use decode::{DecodeDetails, Limits, Picture, decode, decode_with_details};
