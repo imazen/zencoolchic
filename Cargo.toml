@@ -49,3 +49,7 @@ required-features = ["std"]
 [[example]]
 name = "encode"
 required-features = ["encoder"]
+
+[[example]]
+name = "bench_train"
+required-features = ["encoder"]

@@ -5,9 +5,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::ops::{
-    conv_forward, conv_t_forward, ifce_stack, kron, mlp_forward, rate_and_grads, sym_conv_forward,
-};
+use super::arm_batch::{arm_pass, to_channel_major};
+use super::ops::{conv_forward, conv_t_forward, ifce_stack, kron, mlp_forward, sym_conv_forward};
 use super::{Mlp, Params, Shape, WINDOW, full_kernel};
 
 const PAD: usize = (WINDOW - 1) / 2;
@@ -64,52 +63,24 @@ pub(crate) fn ifce_contexts(
         .collect()
 }
 
-/// Total latent rate in bits under the float ARM.
+/// Total latent rate in bits under the float ARM (`inter` pixel-major, as
+/// [`ifce_contexts`] returns it).
 pub(crate) fn latent_rate(
     shape: &Shape,
     arm: &Mlp,
     q: &[Vec<f32>],
     inter: &[Option<Vec<f32>>],
 ) -> f64 {
-    let n_sp = shape.window.len();
     let n_ifce = shape.n_ifce_out;
-    let dim = n_sp + n_ifce;
-    let offsets: Vec<(isize, isize)> = shape
-        .window
+    let inter_cm: Vec<Option<Vec<f32>>> = inter
         .iter()
-        .map(|&cell| {
-            (
-                (cell / WINDOW) as isize - PAD as isize,
-                (cell % WINDOW) as isize - PAD as isize,
-            )
+        .enumerate()
+        .map(|(g, c)| {
+            c.as_ref()
+                .map(|c| to_channel_major(c, shape.grids[g].0 * shape.grids[g].1, n_ifce))
         })
         .collect();
-    let mut ctx = vec![0.0f32; dim];
-    let mut acts = Vec::new();
-    let mut total = 0.0f64;
-    for (g, qg) in q.iter().enumerate() {
-        let (gh, gw) = shape.grids[g];
-        for y in 0..gh {
-            for x in 0..gw {
-                for (c, &(dy, dx)) in ctx.iter_mut().zip(&offsets) {
-                    let (sy, sx) = (y as isize + dy, x as isize + dx);
-                    *c = if sy >= 0 && sx >= 0 && (sy as usize) < gh && (sx as usize) < gw {
-                        qg[sy as usize * gw + sx as usize]
-                    } else {
-                        0.0
-                    };
-                }
-                if let Some(ic) = &inter[g] {
-                    let o = (y * gw + x) * n_ifce;
-                    ctx[n_sp..].copy_from_slice(&ic[o..o + n_ifce]);
-                }
-                mlp_forward(arm, &ctx, &mut acts);
-                let out = &acts[acts.len() - 1];
-                total += rate_and_grads(qg[y * gw + x], out[0], out[1]).0 as f64;
-            }
-        }
-    }
-    total
+    arm_pass(shape, arm, q, &inter_cm, None)
 }
 
 /// Upsampling of the non-hyper grids: the synthesis input, `[c][h][w]`.

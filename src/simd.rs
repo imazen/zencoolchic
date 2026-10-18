@@ -40,6 +40,63 @@ fn axpy_impl(token: Token, acc: &mut [f32], w: f32, x: &[f32]) {
     }
 }
 
+/// `Σ a[i] · b[i]` with a fixed reduction order on every tier: eight lane accumulators
+/// (element `i` goes to lane `i % 8`, fused multiply-add), the tail into lanes `0..`, then
+/// `((l0 + l1) + (l2 + l3)) + ((l4 + l5) + (l6 + l7))`.
+#[inline]
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(target_arch = "x86_64")]
+    if let Some(t) = X64V3Token::summon() {
+        return dot_impl_v3(t, a, b);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(t) = NeonToken::summon() {
+        return dot_impl_neon(t, a, b);
+    }
+    dot_fused_scalar(a, b)
+}
+
+#[inline(always)]
+fn reduce8(l: [f32; 8]) -> f32 {
+    ((l[0] + l[1]) + (l[2] + l[3])) + ((l[4] + l[5]) + (l[6] + l[7]))
+}
+
+// The macro also emits an (unfused, unused) `dot_impl_scalar`.
+#[allow(dead_code)]
+#[magetypes(define(f32x8), v3, neon)]
+fn dot_impl(token: Token, a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut acc = f32x8::zero(token);
+    let (ac, at) = a.as_chunks::<8>();
+    let (bc, bt) = b.as_chunks::<8>();
+    for (x, y) in ac.iter().zip(bc) {
+        acc = f32x8::load_t(token, x).mul_add(f32x8::load_t(token, y), acc);
+    }
+    let mut l = [0.0f32; 8];
+    acc.store(&mut l);
+    for (i, (&x, &y)) in at.iter().zip(bt).enumerate() {
+        l[i] = libm::fmaf(x, y, l[i]);
+    }
+    reduce8(l)
+}
+
+fn dot_fused_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut l = [0.0f32; 8];
+    let (ac, at) = a.as_chunks::<8>();
+    let (bc, bt) = b.as_chunks::<8>();
+    for (x, y) in ac.iter().zip(bc) {
+        for k in 0..8 {
+            l[k] = libm::fmaf(x[k], y[k], l[k]);
+        }
+    }
+    for (i, (&x, &y)) in at.iter().zip(bt).enumerate() {
+        l[i] = libm::fmaf(x, y, l[i]);
+    }
+    reduce8(l)
+}
+
 /// Scalar tier, fused like the SIMD tiers (magetypes' own scalar backend is unfused).
 fn axpy_fused_scalar(acc: &mut [f32], w: f32, x: &[f32]) {
     for (a, &xv) in acc.iter_mut().zip(x) {
@@ -73,6 +130,12 @@ mod tests {
                 b.iter().map(|v| v.to_bits()).collect(),
             );
             assert_eq!(a, b, "n = {n}");
+            let y: Vec<f32> = (0..n).map(|_| rnd()).collect();
+            assert_eq!(
+                dot(&x, &y).to_bits(),
+                dot_fused_scalar(&x, &y).to_bits(),
+                "dot n = {n}"
+            );
         }
     }
 }

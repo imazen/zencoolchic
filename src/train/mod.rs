@@ -23,6 +23,7 @@ use crate::decode::Arch;
 use crate::latent::{MASK_SIZE, context_window_indices};
 use crate::nn::{layer_dims, symmetric_kernel};
 
+mod arm_batch;
 pub(crate) mod config;
 pub(crate) mod eval;
 mod ops;

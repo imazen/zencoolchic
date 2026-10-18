@@ -6,6 +6,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::arm_batch::{
+    ArmBackward, MlpGrad as ArmGrad, arm_pass, to_channel_major, to_pixel_major,
+};
 use super::{
     ConvLayer, Linear, LossTerms, Mlp, Params, Quantizer, Shape, StepCfg, WINDOW, full_kernel,
 };
@@ -628,69 +631,41 @@ pub(super) fn step(
         .map(|c| c.as_ref().map_or(Vec::new(), |c| vec![0.0; c.len()]))
         .collect();
 
-    // 3. ARM + rate, forward and backward per position.
-    let n_sp = shape.window.len();
-    let dim = n_sp + if n_ifce > 0 { n_ifce } else { 0 };
-    let mut arm_g = MlpGrad::new(&p.arm);
-    let mut acts = Vec::new();
-    let mut ctx = vec![0.0f32; dim];
-    let mut dctx = vec![0.0f32; dim];
-    let mut rate_total = 0.0f64;
+    // 3. ARM + rate (row-batched, `arm_batch`).
     let rate_w = lambda / n_pix as f32;
-    for g in 0..n_grids {
-        let (gh, gw) = shape.grids[g];
-        let qg = &q[g];
-        let offsets: Vec<(isize, isize)> = shape
-            .window
-            .iter()
-            .map(|&cell| {
-                (
-                    (cell / WINDOW) as isize - PAD as isize,
-                    (cell % WINDOW) as isize - PAD as isize,
-                )
-            })
-            .collect();
-        for y in 0..gh {
-            for x in 0..gw {
-                for (c, &(dy, dx)) in ctx.iter_mut().zip(&offsets) {
-                    let (sy, sx) = (y as isize + dy, x as isize + dx);
-                    *c = if sy >= 0 && sx >= 0 && (sy as usize) < gh && (sx as usize) < gw {
-                        qg[sy as usize * gw + sx as usize]
-                    } else {
-                        0.0
-                    };
-                }
-                if let Some(ic) = &inter[g] {
-                    let o = (y * gw + x) * n_ifce;
-                    ctx[n_sp..].copy_from_slice(&ic[o..o + n_ifce]);
-                }
-                mlp_forward(&p.arm, &ctx, &mut acts);
-                let out = &acts[acts.len() - 1];
-                let xv = qg[y * gw + x];
-                let (rate, drx, dmu, dls) = rate_and_grads(xv, out[0], out[1]);
-                rate_total += rate as f64;
-                if !backward {
-                    continue;
-                }
-                let dout = [dmu * rate_w, dls * rate_w];
-                mlp_backward(&p.arm, &acts, &dout, &mut arm_g, &mut dctx);
-                dq[g][y * gw + x] += drx * rate_w;
-                for (dc, &(dy, dx)) in dctx.iter().zip(&offsets) {
-                    let (sy, sx) = (y as isize + dy, x as isize + dx);
-                    if sy >= 0 && sx >= 0 && (sy as usize) < gh && (sx as usize) < gw {
-                        dq[g][sy as usize * gw + sx as usize] += *dc;
-                    }
-                }
-                if inter[g].is_some() {
-                    let o = (y * gw + x) * n_ifce;
-                    for k in 0..n_ifce {
-                        d_inter[g][o + k] += dctx[n_sp + k];
-                    }
-                }
+    let inter_cm: Vec<Option<Vec<f32>>> = inter
+        .iter()
+        .enumerate()
+        .map(|(g, c)| {
+            c.as_ref()
+                .map(|c| to_channel_major(c, shape.grids[g].0 * shape.grids[g].1, n_ifce))
+        })
+        .collect();
+    let mut d_inter_cm: Vec<Vec<f32>> = inter_cm
+        .iter()
+        .map(|c| c.as_ref().map_or(Vec::new(), |c| vec![0.0; c.len()]))
+        .collect();
+    let mut arm_g = ArmGrad::new(&p.arm);
+    let rate_total = arm_pass(
+        shape,
+        &p.arm,
+        &q,
+        &inter_cm,
+        backward.then_some(ArmBackward {
+            grad: &mut arm_g,
+            dq: &mut dq,
+            d_inter: &mut d_inter_cm,
+            rate_w,
+        }),
+    );
+    if backward {
+        arm_g.write(&mut grads.arm);
+        for (g, d) in d_inter_cm.iter().enumerate() {
+            if !d.is_empty() {
+                d_inter[g] = to_pixel_major(d, shape.grids[g].0 * shape.grids[g].1, n_ifce);
             }
         }
     }
-    arm_g.write(&mut grads.arm);
 
     // 4. Upsampling + synthesis forward, with the tape needed for backward.
     let lat_idx: Vec<usize> = (0..n_grids).filter(|&g| !shape.is_hyper[g]).collect();

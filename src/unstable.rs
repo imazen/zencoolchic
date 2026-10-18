@@ -203,3 +203,35 @@ pub fn train_rgb8(
         loss: l.loss,
     })
 }
+
+/// Runs `n` training steps (main-phase settings) and returns milliseconds per step; for
+/// benchmarks and profiles.
+pub fn bench_train_steps(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    arch: u8,
+    n: usize,
+) -> crate::Result<f64> {
+    let opt = TrainOptions {
+        arch,
+        ..Default::default()
+    };
+    let (_hdr, shape, template, target, lambda, gain) = setup(rgb, width, height, &opt)?;
+    let pb = Problem {
+        shape: &shape,
+        target: &target,
+        bitdepth: 8,
+        lambda,
+        gain,
+    };
+    let mut rng = trainer::Rng::new(1);
+    let mut p = template.clone();
+    trainer::initialize(&mut p, &shape, &mut rng);
+    let mut ph = Preset::intra(lambda, 1e-2, 10_000).phases[0].clone();
+    ph.max_itr = n;
+    ph.freq_valid = n + 1; // one validation at the end only
+    let t = std::time::Instant::now();
+    let _ = trainer::train(&pb, p, &ph, &mut rng, &mut |_, _, _| {});
+    Ok(t.elapsed().as_secs_f64() * 1e3 / n as f64)
+}
