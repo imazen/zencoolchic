@@ -69,3 +69,32 @@ codec-test:
 # Public trait example; raw packed RGB8 sRGB input, minimum effort (2000 iterations).
 codec-encode input width height output:
     cargo run --release --example codec_encode --features encoder,zencodec -- {{input}} {{width}} {{height}} {{output}}
+
+# Developer measurement only: requires sibling zqi and zenpng checkouts.
+# Run outside the parent workspace's local Cargo patches.
+fixture-compression input output:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "$HOME/tmp"
+    cd "$HOME/tmp"
+    cargo run --release --manifest-path '{{justfile_directory()}}/tools/fixture-compression/Cargo.toml' -- '{{input}}' '{{output}}'
+
+fixture-compression-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "$HOME/tmp"
+    cd "$HOME/tmp"
+    cargo build --release --manifest-path '{{justfile_directory()}}/tools/fixture-compression/Cargo.toml'
+
+fixture-compression-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$HOME/tmp"
+    cargo fmt --manifest-path '{{justfile_directory()}}/tools/fixture-compression/Cargo.toml' -p zencoolchic-fixture-compression -- --check
+    cargo clippy --manifest-path '{{justfile_directory()}}/tools/fixture-compression/Cargo.toml' -- -D warnings
+
+fixture-compression-fmt:
+    cargo fmt --manifest-path '{{justfile_directory()}}/tools/fixture-compression/Cargo.toml' -p zencoolchic-fixture-compression
+
+fixture-compression-summary input output log csv python="python3":
+    '{{python}}' tools/fixture-compression/summarize.py '{{input}}' '{{output}}' '{{log}}' '{{csv}}'

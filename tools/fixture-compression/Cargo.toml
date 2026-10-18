@@ -1,0 +1,26 @@
+[package]
+name = "zencoolchic-fixture-compression"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Measurement tool only; these codecs never enter zencoolchic's dependency graph.
+[workspace]
+
+[dependencies]
+imij = { path = "../../../zqi/imij" }
+zenpng = { path = "../../../zenpng", default-features = false }
+enough = "0.4.5"
+imgref = "1.12.3"
+rgb = "0.8.53"
+serde_json = "1.0.154"
+
+[patch.crates-io]
+zencodec = { git = "https://github.com/imazen/zencodec", rev = "5ed2daded81407e7206fd8de6e8f1d93a5447b5b" }
+zenpixels = { git = "https://github.com/imazen/zenpixels", rev = "789d69dbc314e748676b7f2f19542c17473ba40b" }
+zenpixels-convert = { git = "https://github.com/imazen/zenpixels", rev = "789d69dbc314e748676b7f2f19542c17473ba40b" }
+zenflate = { git = "https://github.com/imazen/zenflate", rev = "a0ea03637a2cc9a193e343018ae2cfb1a6c31edd" }
+how-far = { git = "https://github.com/imazen/how-far", rev = "571bf1a2fc92e5b99c3777f8ff81bafab7666a75" }
+
+[profile.release]
+lto = "thin"
