@@ -72,3 +72,49 @@ encoder; no multi-image, multi-seed rate-distortion or quality calibration exist
 Run `just check` for the local gate and `just oracle-all` for decoder, writer, gradient and
 optimizer parity. The oracle needs the external pinned upstream checkout and dumps described
 in [PORTING.md](../PORTING.md#reference-environment).
+
+## zencodec API
+
+With `zencodec,encoder`, use the public `codec::CoolChicEncoderConfig` rather than the
+experimental raw-buffer entry point. It wraps the same trainer and writer, accepts strided
+`zenpixels::PixelSlice` RGB8 sRGB input, and implements the usual config → job → encoder flow:
+
+```rust,no_run
+use zencodec::encode::{EncodeJob, Encoder, EncoderConfig};
+use zencoolchic::codec::{Architecture, CoolChicEncoderConfig};
+# fn encode(pixels: zenpixels::PixelSlice<'_>) -> Result<(), Box<dyn std::error::Error>> {
+let output = CoolChicEncoderConfig::default()
+    .with_lambda(0.001)
+    .with_iterations(2000)
+    .with_architecture(Architecture::High)
+    .with_seed(0)
+    .with_rdoq(true)
+    .job()
+    .encoder()?
+    .encode(pixels)?;
+# Ok(()) }
+```
+
+Jobs accept `with_stop(StopToken)` and `with_limits(ResourceLimits)`. Cancellation is
+cooperative per iteration, quantization/RDOQ candidate, and decode grid/stage. The final
+stream is checked against `max_output_bytes` before returning it; encoding is not streaming.
+Finite working-memory caps are refused rather than silently ignored. Encoding uses the
+ambient rayon pool; a sequential job policy is refused, so install a single-thread caller
+pool when needed. No calibrated memory/time estimates exist.
+
+Generic quality is explicitly **uncalibrated**: for q clamped to 0–100,
+`lambda = 10^(-1 - 4*q/100)`. Higher q lowers lambda monotonically; it does not promise any
+SSIM2/zensim target. Nonfinite q is rejected. Generic effort clamps to 0–10 and sets
+`2000 + 2000*effort` training iterations. Explicit lambda/iteration setters clear the
+corresponding generic setting. Quantization and RDOQ run in addition to that budget.
+
+Encode metadata has no container carrier. The encoder bakes the supplied orientation once
+before training, then drops metadata. Input descriptors and color contexts that require a
+color conversion are rejected. The decoder assumes full-range sRGB for RGB streams (there
+is no color carrier); it refuses YUV. Source bit depth is reported separately while 9–16-bit
+samples are scaled to full-range RGB16 with nearest integer rounding.
+
+`just codec-encode input.rgb width height output.cool` demonstrates the public trait API
+on packed raw RGB8 sRGB input at minimum effort. `just codec-test` exercises trait contracts,
+including tiny full-stream identity with 1 and 4 threads. This is still not a cross-platform
+training determinism guarantee. See the bridge's rustdoc for design mismatches.

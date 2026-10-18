@@ -49,6 +49,8 @@ jobs:
       - run: cargo clippy --all-targets --features encoder -- -D warnings
       - run: cargo test --all-targets --features std
       - run: cargo test --lib --features encoder
+      - run: cargo clippy --all-targets --features zencodec,encoder -- -D warnings
+      - run: cargo test --release --features zencodec,encoder
 
   i686:
     name: Test (i686)
@@ -61,6 +63,7 @@ jobs:
         with:
           key: cross-i686
       - run: cross test --target i686-unknown-linux-gnu --lib --tests
+      - run: cross test --target i686-unknown-linux-gnu --release --lib --features zencodec,encoder
 
   no-std:
     name: no_std (wasm32)
@@ -73,6 +76,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --no-default-features
       - run: cargo check --no-default-features --target wasm32-unknown-unknown
+      - run: cargo check --features zencodec --target wasm32-unknown-unknown
 
   msrv:
     name: MSRV (1.89)
