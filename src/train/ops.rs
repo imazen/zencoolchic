@@ -7,8 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::{
-    ConvLayer, ENCODER_GAIN, Linear, LossTerms, Mlp, Params, QuantizerCfg, Shape, WINDOW,
-    full_kernel,
+    ConvLayer, Linear, LossTerms, Mlp, Params, Quantizer, Shape, StepCfg, WINDOW, full_kernel,
 };
 
 const PAD: usize = (WINDOW - 1) / 2;
@@ -29,7 +28,7 @@ fn softround(x: f32, t: f32) -> (f32, f32) {
 
 /// `generate_kumaraswamy_noise`.
 #[inline]
-fn kumaraswamy(u: f32, a: f32) -> f32 {
+pub(super) fn kumaraswamy(u: f32, a: f32) -> f32 {
     let b = (libm::powf(2.0, a) * (a - 1.0) + 1.0) / a;
     libm::powf(1.0 - libm::powf(1.0 - u, 1.0 / b), 1.0 / a) - 0.5
 }
@@ -537,11 +536,12 @@ pub(super) fn step(
     shape: &Shape,
     p: &Params,
     target: &[f32],
-    uniform: &[f32],
-    qc: QuantizerCfg,
-    lambda: f32,
+    noise: &[f32],
+    cfg: StepCfg,
     grads: &mut Params,
 ) -> LossTerms {
+    let lambda = cfg.lambda;
+    let backward = cfg.eval_bitdepth.is_none();
     grads.for_each_mut(|v| v.fill(0.0));
     let n_grids = shape.grids.len();
     let (ih, iw) = shape.img;
@@ -555,12 +555,20 @@ pub(super) fn step(
         let mut qq = Vec::with_capacity(lat.len());
         let mut dd = Vec::with_capacity(lat.len());
         for (i, &y) in lat.iter().enumerate() {
-            let x = y * ENCODER_GAIN;
-            let (s1, d1) = softround(x, qc.temperature);
-            let noisy = s1 + kumaraswamy(uniform[off + i], qc.noise_parameter);
-            let (s2, d2) = softround(noisy, qc.temperature);
-            qq.push(s2);
-            dd.push(ENCODER_GAIN * d1 * d2);
+            let x = y * cfg.gain;
+            match cfg.quantizer {
+                Quantizer::Softround { temperature } => {
+                    let (s1, d1) = softround(x, temperature);
+                    let n = noise.get(off + i).copied().unwrap_or(0.0);
+                    let (s2, d2) = softround(s1 + n, temperature);
+                    qq.push(s2);
+                    dd.push(cfg.gain * d1 * d2);
+                }
+                Quantizer::Hardround => {
+                    qq.push(libm::rintf(x));
+                    dd.push(0.0);
+                }
+            }
         }
         off += lat.len();
         q.push(qq);
@@ -661,6 +669,9 @@ pub(super) fn step(
                 let xv = qg[y * gw + x];
                 let (rate, drx, dmu, dls) = rate_and_grads(xv, out[0], out[1]);
                 rate_total += rate as f64;
+                if !backward {
+                    continue;
+                }
                 let dout = [dmu * rate_w, dls * rate_w];
                 mlp_backward(&p.arm, &acts, &dout, &mut arm_g, &mut dctx);
                 dq[g][y * gw + x] += drx * rate_w;
@@ -763,8 +774,12 @@ pub(super) fn step(
     let n_el = raw.len();
     let mut mse = 0.0f64;
     let mut draw = vec![0.0f32; n_el];
+    let out_max = cfg.eval_bitdepth.map(|b| ((1u32 << b) - 1) as f32);
     for i in 0..n_el {
-        let c = raw[i].clamp(0.0, 1.0);
+        let mut c = raw[i].clamp(0.0, 1.0);
+        if let Some(m) = out_max {
+            c = libm::rintf(c * m) / m;
+        }
         let e = c - target[i];
         mse += (e * e) as f64;
         if (0.0..=1.0).contains(&raw[i]) {
@@ -772,6 +787,13 @@ pub(super) fn step(
         }
     }
     let mse = mse / n_el as f64;
+    if !backward {
+        return LossTerms {
+            loss: mse + lambda as f64 * rate_total / n_pix as f64,
+            mse,
+            rate_bits: rate_total,
+        };
+    }
 
     // 6. Synthesis backward.
     let mut d_pre = vec![0.0f32; pre_out.len()];

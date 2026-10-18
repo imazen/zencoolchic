@@ -28,9 +28,6 @@ pub(crate) mod soap;
 #[cfg(all(test, feature = "oracle"))]
 mod tests;
 
-/// Encoder gain applied to the latents before quantization (upstream `encoder_gain`).
-pub(crate) const ENCODER_GAIN: f32 = 16.0;
-
 /// Float linear layer, `y = W x + b (+ x if residual)`, `W` row-major `[out][in]`.
 #[derive(Clone, Debug)]
 pub(crate) struct Linear {
@@ -230,12 +227,25 @@ impl Shape {
     }
 }
 
-/// Quantizer settings of one training step.
+/// How latents are quantized in one forward pass (upstream `quantize`).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct QuantizerCfg {
-    pub(crate) temperature: f32,
-    /// Kumaraswamy parameter `a` (upstream `noise_parameter`).
-    pub(crate) noise_parameter: f32,
+pub(crate) enum Quantizer {
+    /// `softround(softround(gain · y, T) + noise, T)`; noise is supplied by the caller.
+    Softround { temperature: f32 },
+    /// `round(gain · y)`: no gradient reaches the latents.
+    Hardround,
+}
+
+/// Settings of one forward pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StepCfg {
+    pub(crate) quantizer: Quantizer,
+    /// Upstream `encoder_gain` (16, or 20 / 24 at low lambda).
+    pub(crate) gain: f32,
+    pub(crate) lambda: f32,
+    /// `Some(bitdepth)`: evaluation pass (upstream `test()`): output rounded to the bit
+    /// depth before the MSE, no backward pass.
+    pub(crate) eval_bitdepth: Option<u32>,
 }
 
 /// Loss terms of one forward pass.
@@ -246,18 +256,23 @@ pub(crate) struct LossTerms {
     pub(crate) rate_bits: f64,
 }
 
-/// One training forward + backward. `uniform` holds one U(0, 1) sample per latent value
-/// (all grids concatenated, finest first); `grads` is overwritten.
+/// One forward pass, plus the backward pass unless `cfg.eval_bitdepth` is set. `noise` is
+/// the additive quantization noise, one value per latent (all grids concatenated, finest
+/// first); empty for no noise. `grads` is overwritten (left zero for an evaluation pass).
 pub(crate) fn forward_backward(
     shape: &Shape,
     p: &Params,
     target: &[f32],
-    uniform: &[f32],
-    q: QuantizerCfg,
-    lambda: f32,
+    noise: &[f32],
+    cfg: StepCfg,
     grads: &mut Params,
 ) -> LossTerms {
-    ops::step(shape, p, target, uniform, q, lambda, grads)
+    ops::step(shape, p, target, noise, cfg, grads)
+}
+
+/// Kumaraswamy noise from uniform samples (upstream `generate_kumaraswamy_noise`).
+pub(crate) fn kumaraswamy_noise(uniform: &[f32], a: f32) -> Vec<f32> {
+    uniform.iter().map(|&u| ops::kumaraswamy(u, a)).collect()
 }
 
 pub(crate) fn full_kernel(half: &[f32], k: usize) -> Vec<f32> {

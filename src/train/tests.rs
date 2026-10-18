@@ -175,19 +175,16 @@ fn gradients_match_torch_autograd() {
             }
         }
         let mut g = p.zeros_like();
-        let qc = QuantizerCfg {
-            temperature: cfg["softround_temperature"].as_f64().unwrap() as f32,
-            noise_parameter: cfg["noise_parameter"].as_f64().unwrap() as f32,
+        let noise = kumaraswamy_noise(&uniform, cfg["noise_parameter"].as_f64().unwrap() as f32);
+        let step = StepCfg {
+            quantizer: Quantizer::Softround {
+                temperature: cfg["softround_temperature"].as_f64().unwrap() as f32,
+            },
+            gain: 16.0,
+            lambda: cfg["lmbda"].as_f64().unwrap() as f32,
+            eval_bitdepth: None,
         };
-        let terms = forward_backward(
-            &shape,
-            &p,
-            &target,
-            &uniform,
-            qc,
-            cfg["lmbda"].as_f64().unwrap() as f32,
-            &mut g,
-        );
+        let terms = forward_backward(&shape, &p, &target, &noise, step, &mut g);
         let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-30);
         std::eprintln!(
             "{}: loss {:.7} vs {:.7} (rel {:.1e}); mse rel {:.1e}; rate {:.2} vs {:.2} (rel {:.1e})",
