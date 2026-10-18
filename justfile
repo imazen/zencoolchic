@@ -11,7 +11,7 @@ oracle-dump:
 
 # Differential test against the upstream decoder dumps.
 oracle:
-    ZENCOOLCHIC_ORACLE_DIR={{oracle_dir}} cargo test --release --features oracle --test oracle -- --nocapture
+    cargo test --release --features oracle --test oracle -- --nocapture
 
 clippy:
     cargo clippy --all-targets --features oracle
@@ -28,7 +28,7 @@ grad-dump:
 
 # Training forward/backward vs torch.autograd (float64).
 grad:
-    ZENCOOLCHIC_GRAD_DIR={{grad_dir}} cargo test --release --features oracle --lib train::tests -- --nocapture
+    cargo test --release --features oracle --lib train::tests -- --nocapture
 
 soap_dir := env_var_or_default("ZENCOOLCHIC_SOAP_DIR", env_var("HOME") + "/tmp/coolchic-soap")
 
@@ -38,11 +38,15 @@ soap-dump:
 
 # SOAP optimizer vs upstream.
 soap:
-    ZENCOOLCHIC_SOAP_DIR={{soap_dir}} cargo test --release --features oracle --lib soap -- --nocapture
+    cargo test --release --features oracle --lib soap -- --nocapture
 
 # Every upstream-oracle test (decoder, re-encode, gradients, SOAP).
 oracle-all:
-    ZENCOOLCHIC_ORACLE_DIR={{oracle_dir}} ZENCOOLCHIC_GRAD_DIR={{grad_dir}} ZENCOOLCHIC_SOAP_DIR={{soap_dir}} cargo test --release --features oracle
+    cargo test --release --features oracle
+
+# Compare explicitly regenerated raw dumps; missing required cases fail.
+oracle-external decoder gradients soap:
+    ZENCOOLCHIC_ORACLE_DIR='{{decoder}}' ZENCOOLCHIC_GRAD_DIR='{{gradients}}' ZENCOOLCHIC_SOAP_DIR='{{soap}}' cargo test --release --features oracle
 
 # Gate before pushing: fmt, clippy on every feature set, tests.
 check:
@@ -54,7 +58,7 @@ check:
     cargo clippy --all-targets --features zencodec -- -D warnings
     cargo clippy --all-targets --features zencodec,encoder -- -D warnings
     cargo test --release --lib --features encoder
-    cargo test --release --features zencodec,encoder
+    cargo test --release --features oracle,zencodec
     cargo test --doc --features zencodec,encoder
 
 # Compile the decode-only bridge (including its no_std path).
@@ -106,3 +110,7 @@ fixture-zstd input output:
     mkdir -p "$HOME/tmp"
     cd "$HOME/tmp"
     cargo run --release --manifest-path '{{justfile_directory()}}/tools/fixture-compression/Cargo.toml' --bin zstd_fixtures -- '{{input}}' '{{output}}'
+
+# Maintenance only: freeze raw dumps with zstd 1.5.7, preserving their hashes.
+fixture-pack input output:
+    python3 scripts/oracle/pack_fixtures.py '{{input}}' '{{output}}'

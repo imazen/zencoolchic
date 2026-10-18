@@ -70,8 +70,9 @@ settings, bytes, PSNR, loss and wall time for both encoders. It is one image and
 encoder; no multi-image, multi-seed rate-distortion or quality calibration exists yet.
 
 Run `just check` for the local gate and `just oracle-all` for decoder, writer, gradient and
-optimizer parity. The oracle needs the external pinned upstream checkout and dumps described
-in [PORTING.md](../PORTING.md#reference-environment).
+optimizer parity. Frozen dumps are checked in and decompressed in Rust during the tests.
+Only regeneration needs the pinned upstream environment described in
+[PORTING.md](../PORTING.md#reference-environment).
 
 ## zencodec API
 

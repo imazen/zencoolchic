@@ -14,6 +14,10 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(all(test, feature = "oracle"))]
+#[path = "../tests/support/oracle_fixtures.rs"]
+mod oracle_fixtures;
+
 mod arm;
 mod bitio;
 #[cfg(feature = "zencodec")]

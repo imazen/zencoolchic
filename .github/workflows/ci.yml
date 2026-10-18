@@ -14,8 +14,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# The upstream-oracle tests (`--features oracle`) need the upstream Python decoder's dumps,
-# which CI does not have, so that feature is never enabled here.
+# Frozen upstream references are checked in and decoded in memory by Rust tests.
 jobs:
   fmt:
     name: Format
@@ -49,8 +48,8 @@ jobs:
       - run: cargo clippy --all-targets --features encoder -- -D warnings
       - run: cargo test --all-targets --features std
       - run: cargo test --lib --features encoder
-      - run: cargo clippy --all-targets --features zencodec,encoder -- -D warnings
-      - run: cargo test --release --features zencodec,encoder
+      - run: cargo clippy --all-targets --features oracle,zencodec -- -D warnings
+      - run: cargo test --release --features oracle,zencodec
 
   i686:
     name: Test (i686)
@@ -63,7 +62,7 @@ jobs:
         with:
           key: cross-i686
       - run: cross test --target i686-unknown-linux-gnu --lib --tests
-      - run: cross test --target i686-unknown-linux-gnu --release --lib --features zencodec,encoder
+      - run: cross test --target i686-unknown-linux-gnu --release --lib --tests --features oracle,zencodec
 
   no-std:
     name: no_std (wasm32)

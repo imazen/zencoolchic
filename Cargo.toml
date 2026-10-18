@@ -17,8 +17,7 @@ std = []
 encoder = ["std", "dep:rayon", "dep:enough"]
 # Codec trait bridge; add encoder for the encode half.
 zencodec = ["dep:zencodec", "dep:zenpixels", "dep:whereat", "dep:enough", "dep:zenpixels-convert"]
-# Differential tests against the upstream Python decoder's dumps
-# (`scripts/oracle/dump_decode.py`). Needs ZENCOOLCHIC_ORACLE_DIR.
+# Differential tests against checked-in upstream reference dumps.
 oracle = ["std", "encoder"]
 
 [dependencies]
@@ -36,6 +35,8 @@ enough = { version = "0.4.5", optional = true, default-features = false }
 [dev-dependencies]
 zencodec-testkit = ">=0.1.0, <0.3.0"
 serde_json = "1.0.154"
+sha2 = { version = "0.11.1", default-features = false }
+zenzstd = { git = "https://github.com/imazen/zenzstd", rev = "21ba0c294900ef8d346eaa7255a489d84fdce8f3", default-features = false, features = ["std", "hash"] }
 
 [profile.release]
 debug = 1

@@ -143,19 +143,13 @@ pub(crate) fn reencode(data: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     #[test]
     fn reencode_is_byte_identical() {
-        let dir = std::env::var("ZENCOOLCHIC_ORACLE_DIR").expect("ZENCOOLCHIC_ORACLE_DIR");
         let mut n = 0;
-        for e in std::fs::read_dir(&dir).unwrap() {
-            let p = e.unwrap().path();
-            if p.extension().is_none_or(|e| e != "cool") {
-                continue;
-            }
-            let data = std::fs::read(&p).unwrap();
+        for name in crate::oracle_fixtures::cases("decoder") {
+            let data = crate::oracle_fixtures::read("decoder", &std::format!("{name}.cool"));
             let again = super::reencode(&data).unwrap();
             assert!(
                 again == data,
-                "{}: re-encoded {} bytes vs {} original",
-                p.display(),
+                "{name}: re-encoded {} bytes vs {} original",
                 again.len(),
                 data.len()
             );

@@ -108,6 +108,10 @@ a usable reference at 1e-3.
 
 ## Reference environment
 
+Ordinary regression tests use the [frozen references](tests/fixtures/upstream/README.md)
+in this repository: `just oracle-all` needs Rust, not Python or external data.
+The upstream environment below is only for regenerating or extending the oracle.
+
 ```bash
 git clone https://github.com/Orange-OpenSource/Cool-Chic.git ~/tmp/coolchic-src/Cool-Chic
 cd ~/tmp/coolchic-src/Cool-Chic

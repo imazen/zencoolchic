@@ -122,18 +122,16 @@ fn l2(v: &[f32]) -> f64 {
 
 #[test]
 fn gradients_match_torch_autograd() {
-    let dir = std::env::var("ZENCOOLCHIC_GRAD_DIR")
-        .expect("ZENCOOLCHIC_GRAD_DIR (dumps of scripts/oracle/dump_grad.py)");
     let mut found = 0;
-    for e in std::fs::read_dir(&dir).unwrap() {
-        let path = e.unwrap().path();
-        if path.extension().is_none_or(|x| x != "json") {
-            continue;
-        }
+    for name in crate::oracle_fixtures::cases("gradients") {
         found += 1;
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let bin = std::fs::read(path.with_extension("bin")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_slice(&crate::oracle_fixtures::read(
+            "gradients",
+            &std::format!("{name}.json"),
+        ))
+        .unwrap();
+        let bin = crate::oracle_fixtures::read("gradients", &std::format!("{name}.bin"));
+        assert!(bin.len().is_multiple_of(4), "{name}: unaligned F32 dump");
         let floats: Vec<f32> = bin
             .as_chunks::<4>()
             .0
@@ -155,6 +153,7 @@ fn gradients_match_torch_autograd() {
             ));
             off += n;
         }
+        assert_eq!(off, floats.len(), "{name}: complete tensor payload");
         let h = header_from(&cfg);
         let a = crate::decode::arch(&h).unwrap();
         let shape = Shape::new(&h, &a).unwrap();
@@ -188,7 +187,7 @@ fn gradients_match_torch_autograd() {
         let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-30);
         std::eprintln!(
             "{}: loss {:.7} vs {:.7} (rel {:.1e}); mse rel {:.1e}; rate {:.2} vs {:.2} (rel {:.1e})",
-            path.file_name().unwrap().to_string_lossy(),
+            name,
             terms.loss,
             cfg["loss"].as_f64().unwrap(),
             rel(terms.loss, cfg["loss"].as_f64().unwrap()),
@@ -220,5 +219,5 @@ fn gradients_match_torch_autograd() {
         );
         assert!(worst < 1e-3, "gradient mismatch");
     }
-    assert!(found > 0, "no dumps in {dir}");
+    assert!(found > 0, "no gradient dumps");
 }

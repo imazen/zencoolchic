@@ -484,12 +484,10 @@ mod oracle {
 
     #[test]
     fn matches_upstream_soap() {
-        let dir = std::env::var("ZENCOOLCHIC_SOAP_DIR")
-            .expect("ZENCOOLCHIC_SOAP_DIR (scripts/oracle/dump_soap.py)");
         let meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(std::format!("{dir}/soap.json")).unwrap())
-                .unwrap();
-        let bin = std::fs::read(std::format!("{dir}/soap.bin")).unwrap();
+            serde_json::from_slice(&crate::oracle_fixtures::read("soap", "soap.json")).unwrap();
+        let bin = crate::oracle_fixtures::read("soap", "soap.bin");
+        assert!(bin.len().is_multiple_of(4), "unaligned SOAP F32 dump");
         let f: Vec<f32> = bin
             .as_chunks::<4>()
             .0
@@ -559,5 +557,6 @@ mod oracle {
                 assert!(err / moved < 1e-3, "{}", c["name"]);
             }
         }
+        assert_eq!(off, f.len(), "complete SOAP tensor payload");
     }
 }

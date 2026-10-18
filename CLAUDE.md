@@ -15,12 +15,23 @@ Read `PORTING.md` first: the status table and the parity evidence.
   pinned-f64 code and MUST reproduce upstream's decoded latents exactly. Any mismatch is a bug.
 - Float networks (upsampling, synthesis, resize) match PyTorch to rounding only; the measured
   difference is recorded in `PORTING.md`. Don't loosen a recorded bound without asking.
-- Upstream Python is the differential oracle and lives outside the repo
-  (`~/tmp/coolchic-src/Cool-Chic` with a `.venv`); oracle dumps live outside too
-  (`ZENCOOLCHIC_ORACLE_DIR`, default `~/tmp/coolchic-ref`). No bitstreams in git without the
-  user's OK.
+- Upstream Python is the differential oracle. Frozen dumps live in
+  `tests/fixtures/upstream/` and decompress in Rust during `--features oracle` tests.
+  Python and the pinned upstream checkout are needed only for regeneration.
+  `ZENCOOLCHIC_ORACLE_DIR` / `ZENCOOLCHIC_GRAD_DIR` / `ZENCOOLCHIC_SOAP_DIR` explicitly
+  select uncompressed regenerated dumps; no missing-file fallback occurs.
+- The user approved the initial frozen binary fixture set on 2026-10-18. Future binary
+  additions and changes to golden references still need approval.
 
 ## Commands
 
-- `just test`, `just clippy`
-- `just oracle-dump` (needs the upstream venv), then `just oracle`
+- `just check` (includes codec conformance and the frozen upstream oracle)
+- `just oracle-all`, or `cargo test --release --features oracle,zencodec`
+- `just oracle-dump` regenerates decoder dumps with the upstream venv; ordinary tests do
+  not regenerate references. See `tests/fixtures/upstream/README.md`.
+
+## Known Bugs
+
+- Fixed validation gap (2026-10-18): the decoder oracle printed reconstruction errors
+  without asserting the recorded bounds and could overlook a missing whole case. The
+  frozen inventory, lengths, shapes, hashes, raw bound and sample bound are now enforced.

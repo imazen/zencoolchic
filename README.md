@@ -40,6 +40,13 @@ Optional `zencodec` support provides RGB probing/decoding and, with `encoder`, a
 trainer-backed encoder configuration. See [the trait API](docs/ENCODER.md#zencodec-api)
 for cancellation, limits and the uncalibrated quality dial.
 
+## Testing
+
+`just check` runs lint, codec conformance and frozen upstream regression checks.
+`just oracle-all` runs the upstream comparisons alone. The compressed references
+are [in the repo](tests/fixtures/upstream/README.md) and decompress during Rust tests;
+Python and external data are needed only to regenerate them.
+
 ## License
 
 BSD-3-Clause. Derived from Cool-chic (BSD-3-Clause, © Orange), whose notice is in
