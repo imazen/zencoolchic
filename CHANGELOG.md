@@ -15,6 +15,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Source-based assessment of shared NN primitives in `docs/zennn-assessment.md`.
+
 - Optional zencodec RGB still-image bridge and public encoder configuration; cooperative
   cancellation, header-only probe, strided buffers, and documented uncalibrated quality.
 
