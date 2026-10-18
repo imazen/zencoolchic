@@ -78,6 +78,48 @@ pub(crate) fn write_coolchic(
     Ok(out)
 }
 
+/// Writes a single-image stream from quantized integers: `params` in stream order,
+/// `grids` finest first. The header's quantization fields must already be set.
+pub(crate) fn write_image(
+    h: &CoolChicHeader,
+    data_type: crate::header::FrameDataType,
+    bitdepth: u32,
+    params: &[i64],
+    grids: &[latent::Grid],
+) -> Result<Vec<u8>> {
+    let a = decode::arch(h)?;
+    let orders = decode::param_orders(h, &a)?;
+    if orders.len() != params.len() {
+        return Err(Error::Invalid(
+            "parameter count does not match the architecture",
+        ));
+    }
+    // The fixed-point ARM is built from the integers exactly as the decoder will build it.
+    let (nn_bytes, pad) = expgolomb::encode(params, &orders);
+    let mut hh = h.clone();
+    hh.nn_n_bit_pad = pad;
+    let (nets, back) = decode::build_networks(&hh, &a, &nn_bytes)?;
+    debug_assert_eq!(back, params);
+    let vh = VideoHeader {
+        n_frames: 1,
+        intra_pos: alloc::vec![0],
+        p_pos: Vec::new(),
+    };
+    let fh = FrameHeader {
+        display_index: 0,
+        frame_type: crate::header::FrameType::I,
+        frame_data_type: data_type,
+        bitdepth,
+        index_references: Vec::new(),
+        global_flow: Vec::new(),
+        warp_filter_size: None,
+    };
+    let mut out = vh.to_bytes();
+    out.extend_from_slice(&fh.to_bytes());
+    out.extend_from_slice(&write_coolchic(h, &nets, params, grids)?);
+    Ok(out)
+}
+
 /// Decodes a single-image stream to its integers and writes it back. Every byte must
 /// come back identical: proves the writer and the decoder agree on the format.
 pub(crate) fn reencode(data: &[u8]) -> Result<Vec<u8>> {

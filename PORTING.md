@@ -76,8 +76,16 @@ Reuse plan (user, 2026-10-17: reuse owned code, relicensed): zensim-train-core /
 | Backward of all of the above | torch autograd | done, scalar | vs float64 torch: worst relative gradient error 3.7e-4 (mid130×97 hop), 7.3e-4 (64×64 hop), 5.8e-4 (64×64 small); torch's own float32 pass is off by up to 1.4e-2 on the same tensors |
 | SOAP optimizer (Adam mode for latents and 1-D tensors) | `training/soap.py` | done, scalar | vs upstream after 25 steps on fixed gradients (`just soap`): 20×20 weight 2.1e-4 of the parameter movement, 1-D 6.6e-7, latents 1.3e-6. Rank-deficient factors (non-square weights) are not comparable: upstream against itself with a rotated null-space basis differs by 1.6% (`scripts/oracle/soap_null_space_probe.py`); this port differs by 2.2% |
 | Training loop: grad clip 0.1, cosine LR, softround / noise schedules, patience, best-model restore; initializers; intra preset; 5 → 2 → 1 warm-up; lambda-dependent encoder gain | `training/train.py`, `presets.py`, `warmup.py`, `initialize_parameters` | done, scalar; RNG is not torch's | small64 (64×64), 2000 itr, λ 1e-3, hop, one seed each: upstream 33.808 dB / 0.5983 bpp latent / loss 1.0143e-3 in 20.7 s (torch CPU); this port 34.094 dB / 0.5949 bpp / 0.984e-3 in 25.8 s (1 thread, scalar). Not yet compared over several seeds or images |
-| Network quantization search, RDOQ | `nnquant/*.py` | not started | — |
+| Network quantization search (per module, every weight/bias step; exp-Golomb orders from upstream's bit estimate) | `nnquant/quantizemodel.py` | done, scalar | small64 end to end (below) |
+| RDOQ | `nnquant/rdoq.py` | not started | — |
+| Trained model → stream integers → bitstream | `bitstream/encode.py` | done | upstream's decoder reads this encoder's stream: small64 decodes to 33.828 dB in both decoders |
 | SIMD / threaded training kernels | — | not started | — |
+
+End to end on small64 (64×64, 2000 itr, λ 1e-3, hop; `examples/encode.rs`, 2026-10-17): this
+port writes 1,909 bytes (3.73 bpp) decoding to 33.828 dB, in this crate's decoder and in
+upstream's `cc_decode.py` alike, 27.5 s. Upstream's encoder on the same image and settings:
+1,767 bytes (3.45 bpp), 33.32 dB, after RDOQ, which this port does not run yet. On a 64×64
+picture the network parameters are most of the stream (2.9 of the 3.7 bpp).
 
 The gradient check compares against a float64 run of upstream (`dump_grad.py ... f64`): the
 rate term `F(q + ½) − F(q − ½)` cancels badly in float32, so torch's float32 gradients are not

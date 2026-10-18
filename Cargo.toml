@@ -45,3 +45,7 @@ required-features = ["std"]
 [[example]]
 name = "exp_audit"
 required-features = ["std"]
+
+[[example]]
+name = "encode"
+required-features = ["encoder"]
