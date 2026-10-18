@@ -277,7 +277,9 @@ pub(crate) fn train(
     ph: &Phase,
     rng: &mut Rng,
     progress: Progress<'_>,
-) -> (Params, LossTerms) {
+    stop: &dyn enough::Stop,
+) -> crate::Result<(Params, LossTerms)> {
+    stop.check()?;
     let mut grads = p.zeros_like();
     let mut best = evaluate(pb, &p, &mut grads);
     let mut best_p = p.clone();
@@ -300,6 +302,7 @@ pub(crate) fn train(
     let mut cnt_record = 0usize;
     let mut noise = vec![0.0f32; n_lat];
     for cnt in 0..ph.max_itr {
+        stop.check()?;
         if cnt - cnt_record > ph.patience {
             if ph.schedule_lr {
                 p = best_p.clone();
@@ -409,7 +412,7 @@ pub(crate) fn train(
         }
         progress(cnt, &terms, valid.as_ref());
     }
-    (best_p, best)
+    Ok((best_p, best))
 }
 
 /// Upstream `warmup()` followed by the preset's training phases.
@@ -419,7 +422,9 @@ pub(crate) fn encode_training(
     preset: &Preset,
     seed: u64,
     progress: Progress<'_>,
-) -> (Params, LossTerms) {
+    stop: &dyn enough::Stop,
+) -> crate::Result<(Params, LossTerms)> {
+    stop.check()?;
     let mut rng = Rng::new(seed);
     let n0 = preset.warmup.first().map_or(1, |w| w.0);
     let mut candidates: Vec<(Params, LossTerms)> = (0..n0)
@@ -444,7 +449,8 @@ pub(crate) fn encode_training(
                 ph,
                 &mut rng,
                 progress,
-            );
+                stop,
+            )?;
             *c = (p, l);
         }
         candidates.sort_by(|a, b| {
@@ -455,9 +461,9 @@ pub(crate) fn encode_training(
     }
     let (mut p, mut l) = candidates.swap_remove(0);
     for ph in &preset.phases {
-        let r = train(pb, p, ph, &mut rng, progress);
+        let r = train(pb, p, ph, &mut rng, progress, stop)?;
         p = r.0;
         l = r.1;
     }
-    (p, l)
+    Ok((p, l))
 }

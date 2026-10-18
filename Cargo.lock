@@ -200,10 +200,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d107c80dd656e1a2c254dfb1d57ece73b7f515b8a8684c270c23cab68f4a440d"
 
 [[package]]
+name = "enough"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "877362cb7b70d1c617f0cd3c67708bd58d894a86af5104018e2c10ebaee3c02f"
+
+
+[[package]]
 name = "zencoolchic"
 version = "0.0.1"
 dependencies = [
  "archmage",
+ "enough",
  "libm",
  "magetypes",
  "rayon",
