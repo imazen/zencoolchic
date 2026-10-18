@@ -16,6 +16,8 @@ extern crate std;
 
 mod arm;
 mod bitio;
+#[cfg(feature = "zencodec")]
+pub mod codec;
 mod decode;
 mod error;
 mod expgolomb;

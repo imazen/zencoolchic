@@ -13,8 +13,10 @@ publish = false
 [features]
 default = []
 std = []
-# Bitstream writer (and, later, the encoder).
+# Training, quantization and bitstream writer.
 encoder = ["std", "dep:rayon", "dep:enough"]
+# Codec trait bridge; add encoder for the encode half.
+zencodec = ["dep:zencodec", "dep:zenpixels", "dep:whereat", "dep:enough", "dep:zenpixels-convert"]
 # Differential tests against the upstream Python decoder's dumps
 # (`scripts/oracle/dump_decode.py`). Needs ZENCOOLCHIC_ORACLE_DIR.
 oracle = ["std", "encoder"]
@@ -25,9 +27,14 @@ libm = "0.2.16"
 magetypes = "0.9.30"
 rayon = { version = "1.12.0", optional = true }
 
+zencodec = { version = ">=0.1.26, <0.3.0", optional = true }
+zenpixels = { version = ">=0.2.16, <0.4.0", optional = true }
+zenpixels-convert = { version = ">=0.2.16, <0.4.0", optional = true, default-features = false }
+whereat = { version = "0.1.5", optional = true }
 enough = { version = "0.4.5", optional = true, default-features = false }
 
 [dev-dependencies]
+zencodec-testkit = ">=0.1.0, <0.3.0"
 serde_json = "1.0.154"
 
 [profile.release]
@@ -56,3 +63,7 @@ required-features = ["encoder"]
 [[example]]
 name = "bench_train"
 required-features = ["encoder"]
+
+[[example]]
+name = "codec_encode"
+required-features = ["encoder", "zencodec"]
