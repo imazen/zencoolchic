@@ -76,6 +76,14 @@ fn main() {
         n_itr,
         ..Default::default()
     };
+    // WARP_FILTER=2|4|8|12 overrides upstream's default warp filter size.
+    let warp = std::env::var("WARP_FILTER")
+        .ok()
+        .map(|v| v.parse().unwrap());
+    let mut vopt = zencoolchic::unstable::VideoOptions {
+        warp_filter_size: warp,
+        ..Default::default()
+    };
     let r = zencoolchic::unstable::encode_video(
         zencoolchic::FrameDataType::Rgb,
         8,
@@ -83,7 +91,7 @@ fn main() {
         &[0],
         &[n - 1],
         &opt,
-        &mut zencoolchic::unstable::VideoOptions::default(),
+        &mut vopt,
         &mut |s| eprintln!("{s}"),
     )
     .unwrap();

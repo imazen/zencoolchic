@@ -1503,6 +1503,70 @@ mod tests {
         assert!(decoded.iter().all(|f| f.bitdepth == 10));
     }
 
+    /// Every warp filter size round-trips end to end: the header records it and
+    /// the produced stream decodes. Filter 4 is covered by
+    /// `video_external_flow_and_warp_filter`; this sweeps 2 (bilinear), 8 and 12
+    /// (sinc kernels) through a two-frame I/P encode.
+    #[test]
+    fn video_warp_filter_variants() {
+        let (w, h) = (16usize, 16usize);
+        let data: Vec<Vec<u16>> = (0..2)
+            .map(|shift| {
+                (0..3 * w * h)
+                    .map(|i| ((i * 11 + shift * 53) % 256) as u16)
+                    .collect()
+            })
+            .collect();
+        let frames: Vec<Vec<Plane>> = data
+            .iter()
+            .map(|d| {
+                (0..3)
+                    .map(|c| Plane {
+                        width: w as u32,
+                        height: h as u32,
+                        samples: &d[c * w * h..(c + 1) * w * h],
+                    })
+                    .collect()
+            })
+            .collect();
+        let views: Vec<&[Plane]> = frames.iter().map(|f| f.as_slice()).collect();
+        let opt = TrainOptions {
+            arch: 3,
+            n_itr: 2000,
+            rdoq: false,
+            ..Default::default()
+        };
+        for filter in [2u32, 8, 12] {
+            let mut vopt = VideoOptions {
+                warp_filter_size: Some(filter),
+                itr_motion_pretrain: 100,
+                flow: None,
+            };
+            let report = encode_video(
+                crate::FrameDataType::Rgb,
+                8,
+                &views,
+                &[0],
+                &[1],
+                &opt,
+                &mut vopt,
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(report.frames[1].header.warp_filter_size, Some(filter));
+            assert!(report.frames.iter().all(|f| f.psnr_db.is_finite()));
+            let decoded = crate::decode_video(
+                &report.bitstream,
+                &crate::Limits {
+                    max_frames: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(decoded.len(), 2);
+        }
+    }
+
     /// Plane layout, dimension and sample-range violations are argument errors.
     #[test]
     fn frame_input_validation() {
