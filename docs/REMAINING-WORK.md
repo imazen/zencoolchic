@@ -4,11 +4,12 @@ Target: upstream [Cool-chic v5.0.1 at a6fe38a414dd098b39c41636bd6e423626402f7e](
 Audited against Rust and pinned upstream source on 2026-10-18.
 
 **Still missing:** video encoding's per-frame orchestration — reference
-management, warmup candidates, the external-flow pretraining hook,
-frame-type-aware presets and serialization (the joint residue+motion
-objective and the synchronous two-model trainer are landed and
-oracle-verified). There are also untested decoder variants and incomplete
-resource/streaming integrations. The current
+management, the external-flow pretraining hook and per-frame serialization
+(the joint residue+motion objective, the synchronous two-model trainer,
+`PresetInter` + motion-pretrain, inter warm-up candidates and the
+inter/motion header configs are landed; the YUV `img_min_max` output
+transform is now initialized like upstream). There are also untested decoder
+variants and incomplete resource/streaming integrations. The current
 implementation is a still-image and video decoder (intra + P/B inter) plus an
 experimental planar RGB/YUV 8–16-bit encoder, not a complete port of every
 upstream workflow.

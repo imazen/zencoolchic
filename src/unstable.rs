@@ -178,7 +178,7 @@ pub(crate) fn encode_frame_with_stop(
     stop: &dyn enough::Stop,
 ) -> crate::Result<EncodeReport> {
     stop.check()?;
-    let (hdr, shape, template, target, wass, dist, gain, n_pix) =
+    let (hdr, shape, template, target, wass, dist, gain, n_pix, out_init) =
         setup(frame_data_type, bitdepth, planes, opt)?;
     let pb = Problem {
         shape: &shape,
@@ -190,6 +190,7 @@ pub(crate) fn encode_frame_with_stop(
         dist,
         wass: wass.as_ref(),
         inter: None,
+        out_init,
     };
     let n_pix = n_pix as f64;
     let (p, l) = run_training(&pb, &template, opt, log, stop)?;
@@ -247,6 +248,7 @@ type Setup = (
     Dist,
     f32,
     usize,
+    Option<[(f32, f32); 3]>,
 );
 
 fn setup(
@@ -366,6 +368,25 @@ fn setup(
         .as_ref()
         .filter(|_| flag_cr)
         .map(|v| Wasserstein::new(v.clone(), &target, h, w));
+    // Upstream `img_min_max`: only for I-frames with YUV data — per-plane
+    // (min, max) of the normalized samples (420 chroma is scored at its own
+    // resolution, like upstream's per-plane `c.min()`).
+    let out_init = match frame_data_type {
+        crate::FrameDataType::Yuv420 | crate::FrameDataType::Yuv444 => {
+            let mut mm = [(0.0f32, 0.0f32); 3];
+            for (i, p) in planes.iter().enumerate() {
+                let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+                for &s in p.samples {
+                    let v = s as f32 / max;
+                    mn = mn.min(v);
+                    mx = mx.max(v);
+                }
+                mm[i] = (mn, mx);
+            }
+            Some(mm)
+        }
+        _ => None,
+    };
     Ok((
         hdr,
         shape,
@@ -375,6 +396,7 @@ fn setup(
         dist,
         trainer::encoder_gain(opt.lambda),
         w * h,
+        out_init,
     ))
 }
 
@@ -432,7 +454,7 @@ pub fn train_frame(
     opt: &TrainOptions,
     log: &mut dyn FnMut(String),
 ) -> crate::Result<TrainReport> {
-    let (_hdr, shape, template, target, wass, dist, gain, n_pix) =
+    let (_hdr, shape, template, target, wass, dist, gain, n_pix, out_init) =
         setup(frame_data_type, bitdepth, planes, opt)?;
     let pb = Problem {
         shape: &shape,
@@ -444,6 +466,7 @@ pub fn train_frame(
         dist,
         wass: wass.as_ref(),
         inter: None,
+        out_init,
     };
     let n_pix = n_pix as f64;
     let (_p, l) = run_training(&pb, &template, opt, log, &enough::Unstoppable)?;
@@ -476,7 +499,7 @@ pub fn bench_train_steps(
             samples: b,
         })
         .collect();
-    let (_hdr, shape, template, target, wass, dist, gain, _n_pix) =
+    let (_hdr, shape, template, target, wass, dist, gain, _n_pix, out_init) =
         setup(crate::FrameDataType::Rgb, 8, &planes, &opt)?;
     let pb = Problem {
         shape: &shape,
@@ -488,6 +511,7 @@ pub fn bench_train_steps(
         dist,
         wass: wass.as_ref(),
         inter: None,
+        out_init,
     };
     let mut rng = trainer::Rng::new(1);
     let mut p = template.clone();

@@ -178,8 +178,8 @@ impl Phase {
     }
 }
 
-/// Upstream `PresetIntra`: two warm-up stages (5 then 2 candidates), the main softround
-/// phase with a cosine learning rate, then 500 hardround iterations.
+/// Upstream `PresetIntra`/`PresetInter`: warm-up stages, the training phases
+/// and the optional motion pre-training phase.
 #[derive(Clone, Debug)]
 pub(crate) struct Preset {
     pub(crate) lambda: f32,
@@ -188,6 +188,10 @@ pub(crate) struct Preset {
     /// (candidates, phase) per warm-up stage.
     pub(crate) warmup: Vec<(usize, Phase)>,
     pub(crate) phases: Vec<Phase>,
+    /// Upstream `motion_pretrain_phase`: one fixed-lr Kumaraswamy phase
+    /// (`Some` only on the inter preset). The problem carrying it sets
+    /// `lambda = 20 · preset.lambda` like upstream's `lmbda=20 * self.lmbda`.
+    pub(crate) motion_pretrain: Option<Phase>,
 }
 
 impl Preset {
@@ -238,6 +242,45 @@ impl Preset {
             dist,
             warmup,
             phases: vec![main, ste],
+            motion_pretrain: None,
+        }
+    }
+
+    /// Upstream `PresetInter`: one warm-up stage (2 candidates, 600 iterations),
+    /// a single softround main phase, plus the motion pre-training phase.
+    /// Upstream requires `n_itr >= 2000` only for the intra preset; inter frames
+    /// have no warmup candidates below `n_candidates` though, so `n_itr` stays
+    /// free like upstream.
+    pub(crate) fn inter(
+        lambda: f32,
+        start_lr: f32,
+        n_itr: usize,
+        itr_motion: usize,
+        dist: Dist,
+    ) -> Self {
+        // Warm-up: 2 candidates, constant lr, strong noise.
+        let mut wu = Phase::defaults(start_lr, 600);
+        wu.freq_valid = 600;
+        wu.patience = 100000;
+        wu.noise_parameter = (2.0, 2.0);
+        wu.betas_latent = (0.725, 0.97);
+        wu.precondition_frequency_model = 1;
+        let mut main = Phase::defaults(start_lr, n_itr);
+        main.patience = 5000;
+        main.schedule_lr = true;
+        main.noise = Noise::Gaussian;
+        main.softround_temperature = (0.3, 0.1);
+        main.noise_parameter = (0.25, 0.1);
+        main.dist = dist;
+        let mut motion = Phase::defaults(1.0e-2, itr_motion);
+        motion.patience = itr_motion;
+        motion.noise_parameter = (2.0, 2.0);
+        Self {
+            lambda,
+            dist,
+            warmup: vec![(2, wu)],
+            phases: vec![main],
+            motion_pretrain: Some(motion),
         }
     }
 }
@@ -258,6 +301,7 @@ fn linear_schedule(r: (f32, f32), cur: usize, max: usize) -> f32 {
 }
 
 /// Everything the training loop needs about the picture.
+#[derive(Clone)]
 pub(crate) struct Problem<'a> {
     pub(crate) shape: &'a Shape,
     /// Normalized frame data in `frame_data_type` layout: `[c][h][w]` planes for
@@ -276,6 +320,22 @@ pub(crate) struct Problem<'a> {
     pub(crate) wass: Option<&'a Wasserstein>,
     /// Reference/motion context for a P/B frame objective (`None` for intra).
     pub(crate) inter: Option<super::inter::InterCtx<'a>>,
+    /// Upstream `img_min_max`: per-channel `(min, max)` of the frame data,
+    /// applied by `init_output_transform` to every warm-up candidate's
+    /// residue synthesis. `Some` only for I-frames with YUV data — upstream
+    /// leaves it `None` for RGB and for all inter frames.
+    pub(crate) out_init: Option<[(f32, f32); 3]>,
+}
+
+/// Upstream `Synthesis.init_output_transform(img_min_max)`: a frozen diagonal
+/// affine mapping unit-range synthesis output into the frame's per-channel
+/// range (identity init plus `w[c][c] = max - min`, `b[c] = min`).
+pub(crate) fn init_output_transform(p: &mut Params, mm: &[(f32, f32); 3]) {
+    let ot = &mut p.out_transform;
+    for (c, &(mn, mx)) in mm.iter().enumerate().take(ot.c_out) {
+        ot.w[c * ot.c_in + c] = mx - mn;
+        ot.b[c] = mn;
+    }
 }
 
 impl Problem<'_> {
@@ -512,7 +572,7 @@ pub(crate) struct FramePair<'a> {
     /// Motion model's problem (2-channel output for P, 4 for B).
     pub(crate) mot: Problem<'a>,
     /// References + global translations + warper parameters.
-    pub(crate) shared: super::inter::SharedInter,
+    pub(crate) shared: &'a super::inter::SharedInter,
     /// Current residue parameters.
     pub(crate) p_r: Params,
     /// Current motion parameters.
@@ -541,7 +601,6 @@ pub(crate) fn train_pair(
     } = pair;
     let pb_r = &pb_r;
     let pb_m = &pb_m;
-    let shared = &shared;
     let mut opt_r = Opt::new(p_r);
     let mut opt_m = Opt::new(p_m);
     // Joint eval loss: shared distortion + both models' rate terms.
@@ -720,6 +779,9 @@ pub(crate) fn encode_training(
         .map(|_| {
             let mut p = template.clone();
             initialize(&mut p, pb.shape, &mut rng);
+            if let Some(mm) = pb.out_init {
+                init_output_transform(&mut p, &mm);
+            }
             (
                 p,
                 LossTerms {
@@ -755,4 +817,101 @@ pub(crate) fn encode_training(
         l = r.1;
     }
     Ok((p, l))
+}
+
+/// Upstream's candidate construction + `warmup()` + the preset's training
+/// phases for a P/B frame. `pretrained_motion` carries the optional
+/// flow-guided initialization (`guided_motion_pretraining`): it replaces the
+/// motion parameters of every odd-numbered candidate, its latent grids
+/// pre-scaled by `gain_ratio` (upstream's `motion.encoder_gain /
+/// pre_trained.encoder_gain` — 1 when both use the default 16).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_training_pair(
+    res: &Problem<'_>,
+    mot: &Problem<'_>,
+    shared: &super::inter::SharedInter,
+    t_r: &Params,
+    t_m: &Params,
+    preset: &Preset,
+    pretrained_motion: Option<(&Params, f32)>,
+    seed: u64,
+    progress: Progress<'_>,
+    stop: &dyn enough::Stop,
+) -> crate::Result<(Params, Params, LossTerms)> {
+    stop.check()?;
+    let mut rng = Rng::new(seed);
+    let n0 = preset.warmup.first().map_or(1, |w| w.0);
+    let mut candidates: Vec<(Params, Params, LossTerms)> = (0..n0)
+        .map(|i| {
+            let mut r = t_r.clone();
+            initialize(&mut r, res.shape, &mut rng);
+            let mut m = t_m.clone();
+            initialize(&mut m, mot.shape, &mut rng);
+            // Upstream loads the pre-trained motion only on odd candidates.
+            if i % 2 == 1
+                && let Some((pm, ratio)) = pretrained_motion
+            {
+                m = pm.clone();
+                if ratio != 1.0 {
+                    for l in &mut m.latents {
+                        for v in l.iter_mut() {
+                            *v *= ratio;
+                        }
+                    }
+                }
+            }
+            (
+                r,
+                m,
+                LossTerms {
+                    loss: f64::INFINITY,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    for (n, ph) in &preset.warmup {
+        candidates.truncate(*n);
+        for c in candidates.iter_mut() {
+            let (r, m, l) = train_pair(
+                FramePair {
+                    res: res.clone(),
+                    mot: mot.clone(),
+                    shared,
+                    p_r: core::mem::replace(&mut c.0, t_r.clone()),
+                    p_m: core::mem::replace(&mut c.1, t_m.clone()),
+                },
+                ph,
+                &mut rng,
+                progress,
+                stop,
+            )?;
+            *c = (r, m, l);
+        }
+        candidates.sort_by(|a, b| {
+            a.2.loss
+                .partial_cmp(&b.2.loss)
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+    }
+    let (mut r, mut m, mut l) = candidates.swap_remove(0);
+    for ph in &preset.phases {
+        let (nr, nm, nl) = train_pair(
+            FramePair {
+                res: res.clone(),
+                mot: mot.clone(),
+                shared,
+                p_r: r,
+                p_m: m,
+            },
+            ph,
+            &mut rng,
+            progress,
+            stop,
+        )?;
+        r = nr;
+        m = nm;
+        l = nl;
+    }
+    Ok((r, m, l))
 }

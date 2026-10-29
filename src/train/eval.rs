@@ -241,6 +241,7 @@ mod tests {
             dist: crate::train::Dist::MSE,
             wass: None,
             inter: None,
+            out_init: None,
         };
         let mut scratch = p.zeros_like();
         let want = evaluate(&pb, &p, &mut scratch);
@@ -308,13 +309,14 @@ mod tests {
                 dist: crate::train::Dist::MSE,
                 wass: None,
                 inter: None,
+                out_init: None,
             }
         }
         let (p_r2, p_m2, best) = train_pair(
             FramePair {
                 res: pb(&s_r, &target),
                 mot: pb(&s_m, &target),
-                shared,
+                shared: &shared,
                 p_r,
                 p_m,
             },
@@ -348,6 +350,126 @@ mod tests {
                     .iter()
                     .all(|t| t.iter().all(|v| v.is_finite()))
         );
+    }
+
+    /// Upstream's candidate loop + `warmup()` for a pair: fresh models, the
+    /// pretrained-motion injection on odd candidates, selection by joint loss.
+    #[test]
+    fn encode_training_pair_warmup_smoke() {
+        use super::super::trainer::{Preset, encode_training_pair};
+        let mk = |outs: u32| {
+            let mut hdr = config::header(config::Arch::Low, 24, 32);
+            let n = hdr.layers_synthesis.len();
+            for (i, l) in hdr.layers_synthesis.iter_mut().enumerate() {
+                if i + 2 >= n {
+                    l.out_ft = outs;
+                }
+            }
+            let a = crate::decode::arch(&hdr).unwrap();
+            (hdr, a)
+        };
+        let (h_r, a_r) = mk(5);
+        let (h_m, a_m) = mk(4);
+        let s_r = Shape::new(&h_r, &a_r).unwrap();
+        let s_m = Shape::new(&h_m, &a_m).unwrap();
+        let t_r = s_r.zero_params(&h_r, &a_r);
+        let t_m = s_m.zero_params(&h_m, &a_m);
+        // The "pre-trained" motion model: any valid params exercise the
+        // injection path (upstream ships them on odd candidates).
+        let mut pre_m = s_m.zero_params(&h_m, &a_m);
+        let mut rng = Rng::new(5);
+        initialize(&mut pre_m, &s_m, &mut rng);
+        for l in &mut pre_m.latents {
+            l.fill(0.25);
+        }
+        let target: Vec<f32> = (0..3 * 24 * 32)
+            .map(|i| ((i * 31) % 256) as f32 / 255.0)
+            .collect();
+        let mkref = |seed: u32| crate::nn::Planes {
+            c: 3,
+            h: 24,
+            w: 32,
+            data: (0..3 * 24 * 32)
+                .map(|i| (((i * 17 + seed as usize) % 251) as f32) / 255.0)
+                .collect(),
+        };
+        let shared = crate::train::inter::SharedInter {
+            refs: alloc::vec::Vec::from([mkref(3), mkref(91)]),
+            global_flow: alloc::vec::Vec::from([(1, -1), (-2, 0)]),
+            warp_filter: 4,
+            frame_type: crate::header::FrameType::B,
+        };
+        fn pb<'a>(s: &'a Shape, target: &'a [f32]) -> Problem<'a> {
+            Problem {
+                shape: s,
+                target,
+                frame_data_type: crate::header::FrameDataType::Rgb,
+                bitdepth: 8,
+                lambda: 1e-3,
+                gain: 16.0,
+                dist: crate::train::Dist::MSE,
+                wass: None,
+                inter: None,
+                out_init: None,
+            }
+        }
+        let pb_r = pb(&s_r, &target);
+        let pb_m = pb(&s_m, &target);
+        let mut preset = Preset::inter(1e-3, 3e-3, 8, 4, crate::train::Dist::MSE);
+        for (_, ph) in preset.warmup.iter_mut() {
+            ph.max_itr = 3;
+            ph.freq_valid = 3;
+        }
+        for ph in preset.phases.iter_mut() {
+            ph.max_itr = 4;
+            ph.freq_valid = 2;
+        }
+        let (r, m, l) = encode_training_pair(
+            &pb_r,
+            &pb_m,
+            &shared,
+            &t_r,
+            &t_m,
+            &preset,
+            Some((&pre_m, 1.0)),
+            11,
+            &mut |_, _, _| {},
+            &enough::Unstoppable,
+        )
+        .unwrap();
+        assert!(l.loss.is_finite() && l.mse.is_finite());
+        for p in [&r, &m] {
+            assert!(p.tensors().iter().all(|t| t.iter().all(|v| v.is_finite())));
+        }
+    }
+
+    /// Upstream `init_output_transform(img_min_max)`: diagonal weight
+    /// `max - min`, bias `min`, frozen afterwards (`Role::Frozen`).
+    #[test]
+    fn output_transform_affine_init() {
+        let hdr = config::header(config::Arch::Low, 24, 32);
+        let a = crate::decode::arch(&hdr).unwrap();
+        let s = Shape::new(&hdr, &a).unwrap();
+        let mut p = s.zero_params(&hdr, &a);
+        let mut rng = Rng::new(5);
+        initialize(&mut p, &s, &mut rng);
+        super::super::trainer::init_output_transform(&mut p, &[(0.1, 0.9), (0.2, 0.8), (0.3, 0.7)]);
+        let ot = &p.out_transform;
+        for c in 0..3 {
+            let diff = [0.9f32, 0.8, 0.7][c] - [0.1, 0.2, 0.3][c];
+            for i in 0..ot.c_in {
+                let want = if i == c { diff } else { 0.0 };
+                assert_eq!(ot.w[c * ot.c_in + i], want);
+            }
+            assert_eq!(ot.b[c], [0.1, 0.2, 0.3][c]);
+        }
+        // Frozen: the tensor layout marks it Role::Frozen so SOAP skips it.
+        let frozen = p
+            .layout()
+            .iter()
+            .filter(|(_, r)| *r == super::super::Role::Frozen)
+            .count();
+        assert_eq!(frozen, 2); // out_transform weight + bias
     }
 
     #[test]
