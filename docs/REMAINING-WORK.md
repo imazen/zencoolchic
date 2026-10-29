@@ -73,8 +73,20 @@ headers.
   `evenk64_bilinear_debug` (same stream with `final_upsampling` re-tagged to
   bilinear — a variant upstream's encoder never emits but its decoder accepts)
   both decode bit-identically to upstream v5.0.1; pinned as fuzz seeds plus
-  [stream_variants](../src/decode.rs) checksum tests. The trait tests' synthetic
-  16-bit path is still not an upstream 16-bit golden reference.
+  [stream_variants](../src/decode.rs) checksum tests. An upstream-encoded
+  10-bit 4:2:0 still (lop cfg, IFCE=2) decodes bit-identically on all 6,144
+  samples — the deepest-bitdepth upstream golden available, since upstream's
+  own encoder input caps at 8/10-bit `.yuv`. Above-10-bit headers remain
+  self-validated only; upstream cannot produce such streams. An
+  upstream-encoded 128×128 I/P 10-bit 4:2:0 stream with non-preset custom
+  residue and motion cfgs (arm 9,2 / 5,1, custom layer strings, latent
+  2-6 / 1-4, ups 6+5 / 4+3) also validates: the I frame decodes
+  bit-identically and the P frame agrees to 73.6 dB (1,115/24,576 samples
+  off by ≤2 — the same float-accumulation class as `pb_128`). Note
+  upstream v5.0.1's own checkpoint-resume path serializes the wrong
+  `frame_data_type`/`bitdepth` (`rgb`/8) for still-yuv encodes; a fresh
+  `cc_encode` run produces correct headers, and resume is unported here
+  anyway.
 - SOAP's [rank-deficient eigenspaces](../src/train/soap.rs) have arbitrary bases.
   Full-rank/Adam cases retain their asserted trajectory bound; non-square
   trajectories are diagnostic. Read the tracked [null-space probe](../scripts/oracle/soap_null_space_probe.py)
