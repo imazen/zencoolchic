@@ -360,6 +360,46 @@ fn animation_encode_rejects_mismatched_dims_and_zero_frames() {
     );
 }
 
+#[test]
+fn encode_memory_budget_checked_once_dims_known() {
+    let (w, h) = (8u32, 8u32);
+    let buf = PixelBuffer::from_vec(
+        vec![3u8; (3 * w * h) as usize],
+        w,
+        h,
+        PixelDescriptor::RGB8_SRGB,
+    )
+    .unwrap();
+    // Tiny budgets refuse at encode() time — after dims are parsed, before
+    // training — with the Memory limit kind.
+    let e = fast_config()
+        .job()
+        .with_limits(ResourceLimits::none().with_max_memory(1))
+        .encoder()
+        .unwrap()
+        .encode(buf.as_slice())
+        .err()
+        .unwrap();
+    assert_eq!(category(e), ResourceError::Limits(LimitKind::Memory).into());
+    // A generous budget lets the encode run.
+    fast_config()
+        .job()
+        .with_limits(ResourceLimits::none().with_max_memory(1 << 26))
+        .encoder()
+        .unwrap()
+        .encode(buf.as_slice())
+        .unwrap();
+    // Animation: the check lands on finish(), once the frame count is known.
+    let mut enc = fast_config()
+        .job()
+        .with_limits(ResourceLimits::none().with_max_memory(1))
+        .animation_frame_encoder()
+        .unwrap();
+    enc.push_frame(buf.as_slice(), 0, None).unwrap();
+    let e = enc.finish(None).err().unwrap();
+    assert_eq!(category(e), ResourceError::Limits(LimitKind::Memory).into());
+}
+
 #[derive(Clone)]
 struct CancelAfter {
     polls: Arc<AtomicUsize>,

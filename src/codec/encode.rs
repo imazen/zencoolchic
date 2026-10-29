@@ -181,13 +181,11 @@ impl EncodeJob for CoolChicEncodeJob {
     fn encoder(self) -> Result<Self::Enc, Self::Error> {
         self.config.validate()?;
         self.stop.check().map_err(Error::from)?;
-        check_budget_support(&self.limits)?;
         Ok(CoolChicEncoder { job: self })
     }
     fn animation_frame_encoder(self) -> Result<Self::AnimationFrameEnc, Self::Error> {
         self.config.validate()?;
         self.stop.check().map_err(Error::from)?;
-        check_budget_support(&self.limits)?;
         Ok(CoolChicAnimationEncoder {
             job: self,
             frames: Vec::new(),
@@ -236,6 +234,7 @@ impl Encoder for CoolChicEncoder {
         if l.max_output_bytes == Some(0) {
             l.check_output_size(1).map_err(limit)?;
         }
+        check_encode_budget(l, self.job.config.options.arch, width, height, 1)?;
         // Borrow tightly packed inputs; gather only logical rows for strided input.
         let oriented;
         let pixels = if self.job.orientation.is_identity() {
@@ -272,6 +271,38 @@ impl Encoder for CoolChicEncoder {
         stop.check().map_err(Error::from)?;
         Ok(EncodeOutput::new(report.bitstream, coolchic_format()))
     }
+}
+
+/// Pre-flight trainer working-set check, run once dimensions are known:
+/// `estimate_encode_bytes` bounds params + gradients + SOAP state +
+/// activations + retained references for the architecture the encode
+/// will train (`config::header`, or `header_inter` for video).
+fn check_encode_budget(
+    limits: &ResourceLimits,
+    arch_idx: u8,
+    w: u32,
+    h: u32,
+    n_frames: u32,
+) -> Result<(), At<CodecError>> {
+    if limits.max_memory_bytes.is_none() {
+        return Ok(());
+    }
+    let arch = match arch_idx {
+        0 => crate::train::config::Arch::VeryHigh,
+        1 => crate::train::config::Arch::High,
+        2 => crate::train::config::Arch::Medium,
+        _ => crate::train::config::Arch::Low,
+    };
+    let inter = n_frames > 1;
+    // Inter residue headers carry 3 + n_refs output channels; B frames use
+    // at most two references, so 5 bounds every inter payload's arch.
+    let hdr = if inter {
+        crate::train::config::header_inter(arch, h, w, 5)
+    } else {
+        crate::train::config::header(arch, h, w)
+    };
+    let est = crate::decode::estimate_encode_bytes(&hdr, inter, u64::from(n_frames), 3)?;
+    limits.check_memory(est).map_err(limit)
 }
 
 /// Combines the job-level stop token with `push_frame`/`finish`'s per-call one.
@@ -384,6 +415,7 @@ impl AnimationFrameEncoder for CoolChicAnimationEncoder {
             Some(crate::train::SequentialPool::install())
         };
         let (w, h) = self.dims.unwrap_or((0, 0));
+        check_encode_budget(&self.job.limits, self.job.config.options.arch, w, h, n)?;
         let planes: Vec<Vec<crate::unstable::Plane>> = self
             .frames
             .iter()

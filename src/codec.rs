@@ -29,10 +29,10 @@
 //!
 //! Dimension, pixel, frame, input and output caps are enforced. Decode honors
 //! `max_memory_bytes` via a pre-flight working-set estimate (params, latents and
-//! contexts, conv buffers, stored reference frames, output). A sequential threading
-//! policy runs encode on one thread (identical bytes; only speed changes). Encode
-//! working-memory accounting is unavailable: a finite `max_memory_bytes` is refused
-//! there rather than ignored.
+//! contexts, conv buffers, stored reference frames, output); encode estimates the
+//! trainer peak the same way (plus gradients, SOAP state and backward activations)
+//! once frame dimensions are known. A sequential threading policy runs encode on
+//! one thread (identical bytes; only speed changes).
 
 use crate::Error;
 use crate::header::{CoolChicHeader, FrameDataType, FrameHeader, FrameType, VideoHeader};
@@ -159,20 +159,6 @@ impl DecoderConfig for CoolChicDecoderConfig {
     fn job<'a>(self) -> Self::Job<'a> {
         CoolChicDecodeJob::default()
     }
-}
-
-/// Decode paths support `max_memory_bytes` as a pre-flight working-set
-/// estimate (`estimate_decode_bytes`); encode refuses it — the trainer's
-/// peak (SOAP preconditioners, gradients, activations) is not bounded yet.
-#[cfg(feature = "encoder")]
-fn check_budget_support(limits: &ResourceLimits) -> Result<(), At<CodecError>> {
-    if limits.max_memory_bytes.is_some() {
-        return Err(Error::InvalidArgument(
-            "finite working-memory budgets are not supported on encode",
-        )
-        .into());
-    }
-    Ok(())
 }
 
 fn check_decode_budget(

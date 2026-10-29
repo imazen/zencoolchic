@@ -1207,6 +1207,78 @@ pub(crate) fn estimate_decode_bytes(
     Ok(payload + inter_extra + n_frames * 4 * 3 * px + 2 * 3 * px + bpp * px)
 }
 
+/// Upper-bound working-set estimate (bytes) for *encoding* `n_frames` frames of
+/// `px` pixels each with the decoder architecture `h` would carry — the
+/// zencodec bridge's encode-side `max_memory_bytes` check. On top of the
+/// equivalent decode peak, training holds per-tensor gradients and SOAP state:
+/// Adam moments for every parameter, a `d × d` preconditioner pair per
+/// weight axis (latents get `max_precond_dim 0`, weights 256, matching
+/// `trainer.rs`) plus eigendecomposition transients, the f32 latent grids and
+/// their moments, forward/backward activation sets, the quantized-parameter
+/// working copies RDOQ keeps, and the decoded reference frames an inter
+/// encode retains. Like [`estimate_decode_bytes`] it pads transients upward,
+/// so a passing encode is known to fit.
+#[cfg(all(feature = "zencodec", feature = "encoder"))]
+pub(crate) fn estimate_encode_bytes(
+    h: &CoolChicHeader,
+    inter: bool,
+    n_frames: u64,
+    bpp: u64,
+) -> Result<u64> {
+    let a = arch(h)?;
+    let s = shapes(h, &a)?;
+    let px = u64::from(h.img_size[0]) * u64::from(h.img_size[1]);
+    let params: u64 = plan(&s).tensors.iter().map(|t| t.2 as u64).sum();
+    let grids: u64 = a.size_per_latent.iter().map(|&(h, w)| (h * w) as u64).sum();
+    // SOAP preconditioner pairs (gg + q, f32) over each weight tensor's
+    // axes — 2-D+ tensors only, axes capped at 256 — and the largest
+    // eigendecomposition workspace (f32 + f64 copies and rotations).
+    let mut soap_d2 = 0u64;
+    let mut d_max = 0u64;
+    let mut weight_axes = |dims: &[usize]| {
+        let d2: u64 = dims
+            .iter()
+            .filter(|&&d| d <= 256)
+            .map(|&d| (d as u64) * (d as u64))
+            .sum();
+        soap_d2 += 2 * d2;
+        d_max = d_max.max(dims.iter().copied().max().unwrap_or(0) as u64);
+    };
+    for &(i, o) in s.arm_dims.iter().chain(&s.ifce) {
+        weight_axes(&[o, i]);
+    }
+    for &(ci, co, k) in &s.syn_layers {
+        weight_axes(&[co, ci, k, k]);
+    }
+    if let Some(n) = s.syn_stab_in {
+        weight_axes(&[1, n, 1, 1]);
+    }
+    weight_axes(&[3, s.syn_out, 1, 1]);
+    // Trainer set: params + grads + two Adam moments (f32), SOAP pairs and
+    // transients, f32 latents with grads/moments and their i64 stream forms,
+    // forward+backward activations (~3× the decode conv set), and the
+    // quantized candidates RDOQ evaluates (another decode payload).
+    let syn_in = a.input_feature_synthesis as u64 * px;
+    let conv = s
+        .syn_layers
+        .iter()
+        .map(|&(ci, co, k)| {
+            let p = (k - 1) / 2;
+            (ci * (h.img_size[0] as usize + 2 * p + 4) * (h.img_size[1] as usize + 2 * p + 4)
+                + 2 * co * h.img_size[0] as usize * h.img_size[1] as usize) as u64
+        })
+        .max()
+        .unwrap_or(0)
+        + 3 * s.syn_out as u64 * px;
+    let trainer = 4 * 4 * params
+        + 4 * soap_d2
+        + 48 * d_max * d_max
+        + grids * 32
+        + 3 * 4 * (2 * syn_in + conv + 8 * px)
+        + n_frames * 4 * 4 * px;
+    Ok(estimate_decode_bytes(h, inter, n_frames, bpp)? + trainer)
+}
+
 /// Decodes all frames in coding order (upstream `decode_video` + `decode_frame`),
 /// returning them in display order. `single_frame` selects the still-image API:
 /// streams with more than one frame are rejected, and the frame's internals are
