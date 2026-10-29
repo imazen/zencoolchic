@@ -645,6 +645,11 @@ pub(super) fn step(
     let mse = partial.iter().sum::<f64>() / n_el as f64;
     let mut draw = vec![0.0f32; raw.len()];
     match cfg.frame_data_type {
+        crate::header::FrameDataType::Flow => {
+            // Flow data is the raw output unscored by a clamp — the gradient
+            // passes straight through.
+            draw.copy_from_slice(&d_dec);
+        }
         crate::header::FrameDataType::Yuv420 => {
             // Luma is clamped sample-wise; each chroma dict sample receives
             // 1/4 of its gradient at every source position of its 2×2 block.
@@ -690,10 +695,12 @@ pub(super) fn step(
     // per-channel VGG path does not support 4:2:0 frame data.
     let mut wass_dist = 0.0f64;
     if cfg.dist.wass != 0.0 {
-        assert_ne!(
-            cfg.frame_data_type,
-            crate::header::FrameDataType::Yuv420,
-            "wasserstein on 4:2:0 frame data is not supported"
+        assert!(
+            !matches!(
+                cfg.frame_data_type,
+                crate::header::FrameDataType::Yuv420 | crate::header::FrameDataType::Flow
+            ),
+            "wasserstein needs a full-resolution 3-channel picture"
         );
         let w = wass.expect("wasserstein weight without feature weights");
         if backward {

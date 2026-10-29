@@ -146,9 +146,10 @@ pub(crate) fn quantized(raw: &[f32], bitdepth: u32) -> Vec<f32> {
 
 /// The frame data the distortion sees (upstream `frame.forward`'s tail):
 /// `clamp(raw)` for RGB/YUV444; `clamp(convert_444_to_420(raw))` for YUV420 —
-/// chroma planes are 2×2 averages at half resolution. `out_max` additionally
-/// quantizes each sample to `round(v · max) / max` (upstream `test()` mode).
-/// Returns `[y | u | v]`/`[r | g | b]` concatenated planes.
+/// chroma planes are 2×2 averages at half resolution; the raw output
+/// unmodified for Flow (dense outputs — motion pretraining). `out_max`
+/// additionally quantizes each sample to `round(v · max) / max` (upstream
+/// `test()` mode). Returns `[y | u | v]`/`[r | g | b]` concatenated planes.
 pub(crate) fn decoded_dict(
     raw: &[f32],
     w: usize,
@@ -159,6 +160,7 @@ pub(crate) fn decoded_dict(
     let n = w * h;
     let mut dec: Vec<f32> = Vec::with_capacity(match frame_data_type {
         crate::header::FrameDataType::Yuv420 => 3 * n / 2,
+        crate::header::FrameDataType::Flow => raw.len(),
         _ => 3 * n,
     });
     match frame_data_type {
@@ -181,6 +183,7 @@ pub(crate) fn decoded_dict(
                 }
             }
         }
+        crate::header::FrameDataType::Flow => dec.extend_from_slice(raw),
         _ => dec.extend(raw.iter().map(|&r| r.clamp(0.0, 1.0))),
     }
     if let Some(m) = out_max {

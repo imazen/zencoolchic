@@ -204,6 +204,7 @@ fn gradients_match_torch_autograd() {
                 None | Some("rgb") => crate::header::FrameDataType::Rgb,
                 Some("yuv420") => crate::header::FrameDataType::Yuv420,
                 Some("yuv444") => crate::header::FrameDataType::Yuv444,
+                Some("flow") => crate::header::FrameDataType::Flow,
                 Some(other) => panic!("{name}: unknown frame_data_type {other}"),
             },
         };
