@@ -22,7 +22,8 @@
     "small64_miniwass",
     "small64_small",
     "small64_yuv420",
-    "small64_lop"
+    "small64_lop",
+    "small64_flow"
   ],
   "files": [
     {
@@ -522,6 +523,22 @@
       "compressed_sha256": "c886900293f1e9ecf23442e4c0033052fbe4c9410d194d6b85334e4e207454ba"
     },
     {
+      "path": "gradients/small64_flow.bin",
+      "bytes": 101648,
+      "sha256": "6ecfadadacc47ee35fc76d68e04fa65331145d9a1ca6c8fa7728a0ec3b7c99b7",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 86729,
+      "compressed_sha256": "69b287d831306ccfb94dee72dac7437610ebd8584ca1bdf85aa3457fdc9012cb"
+    },
+    {
+      "path": "gradients/small64_flow.json",
+      "bytes": 10424,
+      "sha256": "0112eea71586f7961862e4185c6c79f3c733ce6d5a10b8ce7fbde1009a90043d",
+      "shuffle_word_bytes": 1,
+      "compressed_bytes": 1047,
+      "compressed_sha256": "1f5184b3e2616036b2d87700f5b7183ca894d337d273d54ccdd1755b763a64c6"
+    },
+    {
       "path": "gradients/small64_hop.bin",
       "bytes": 129984,
       "sha256": "86be1da55400d5f516588f76e4cd03788078b3253dbbf8a2cd5eab4726481bf3",
@@ -536,6 +553,22 @@
       "shuffle_word_bytes": 1,
       "compressed_bytes": 1088,
       "compressed_sha256": "e621cf10166f5dc91a14f3e0652088529a5ae70eea1a0960a1fc72640f7ce4c1"
+    },
+    {
+      "path": "gradients/small64_lop.bin",
+      "bytes": 56744,
+      "sha256": "251bcea1caafbc637b3357c4e0a37d182b0c71fcc0cfc1a7287de76012e3d5bb",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 35719,
+      "compressed_sha256": "2905944b78e56ac8ef7502dc93661a0d0b14cfa7ee356abf207ffca942187c60"
+    },
+    {
+      "path": "gradients/small64_lop.json",
+      "bytes": 9292,
+      "sha256": "08988d35069a462490fcff440c4c0e81a3d0da5a2527daa03c3dd5822fc3cf89",
+      "shuffle_word_bytes": 1,
+      "compressed_bytes": 998,
+      "compressed_sha256": "53156835471517453c5afe30d7a631bc9a91c26f18e468f62f6584849f0ef495"
     },
     {
       "path": "gradients/small64_miniwass.bin",
@@ -570,6 +603,22 @@
       "compressed_sha256": "3921735f470b62c3089a861c516b17d41f3fd7a13701ed4280bf811b2ef92a43"
     },
     {
+      "path": "gradients/small64_yuv420.bin",
+      "bytes": 93992,
+      "sha256": "a0ca36a69d90403c287b69456a491e4b20e075b124461bf07ff6c6500b5edb1b",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 76577,
+      "compressed_sha256": "1899705e17a07f81a86f8f06e9331f00c20e6ff09ba5c9b27a7b52e5ed6179b7"
+    },
+    {
+      "path": "gradients/small64_yuv420.json",
+      "bytes": 10431,
+      "sha256": "520a8a451128b24c3783ad07068c3da2fd2b48602971881f21047d1c0be2815e",
+      "shuffle_word_bytes": 1,
+      "compressed_bytes": 1053,
+      "compressed_sha256": "71b7d865bc65a9a1292a9490a29225fd041a10805cc22261c8c1ba028a16bbf1"
+    },
+    {
       "path": "soap/soap.bin",
       "bytes": 76788,
       "sha256": "f1e638e5519a878eb1ecd175d084ebf1527614e2628b112815a1424a92f87ae5",
@@ -586,6 +635,54 @@
       "compressed_sha256": "bc60c691ad57f761fd39b47e0e59c6b923523dac0adf954e559e1610652c22b3"
     },
     {
+      "path": "video/multi_i.0.planes.u16",
+      "bytes": 24576,
+      "sha256": "5a5caaee80568a4c7bd88710adf8d7ffef40b2b91f21ed058a76519c2c90f18e",
+      "shuffle_word_bytes": 2,
+      "compressed_bytes": 10998,
+      "compressed_sha256": "a24ceb7348014ef4de1d194aa7ddd695fce642d0201230adeee3600dceec53ed"
+    },
+    {
+      "path": "video/multi_i.0.residue.f32",
+      "bytes": 49152,
+      "sha256": "d177cfc9e41adae970a23be6cd36fcc2f01c6edad7c4a3e4c3593584183f5fba",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 37487,
+      "compressed_sha256": "7e8b216a80f5afa5c65315cecda005ec40a89ec52ff62538af6c5d1b86a4e86b"
+    },
+    {
+      "path": "video/multi_i.1.planes.u16",
+      "bytes": 4608,
+      "sha256": "a265771dd17528107f8f447df7ecf3afb0a6f6ba04b86b7eb508fcbb95045c1f",
+      "shuffle_word_bytes": 2,
+      "compressed_bytes": 1175,
+      "compressed_sha256": "11655c3a56d8938f81b3edf9519b4cc06298c6593bb3414cb04f8f89cd3591ca"
+    },
+    {
+      "path": "video/multi_i.1.residue.f32",
+      "bytes": 18432,
+      "sha256": "9115bc13609f493e61197b084df3e89c5bf787ac8464db629ade355f09194cd6",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 4549,
+      "compressed_sha256": "b62bb370c7e2c823f29b71748e62a89045d64877a7278990d120f5cc5c20cd05"
+    },
+    {
+      "path": "video/multi_i.2.planes.u16",
+      "bytes": 24576,
+      "sha256": "42ac6b7f98e48e4a94bd93a791e959efbb749dc3afd0b5fa8a280d18c866c6be",
+      "shuffle_word_bytes": 2,
+      "compressed_bytes": 11347,
+      "compressed_sha256": "98bb7d6452931905e26fbc61273e5da27fc83415fe4e71983c6699d43a2dc47b"
+    },
+    {
+      "path": "video/multi_i.2.residue.f32",
+      "bytes": 49152,
+      "sha256": "11a3bea9ec7dea76b412082f0484126cb8dded1a5bc01d89a687f743ba80ab33",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 38117,
+      "compressed_sha256": "66ea4d559a07331315ba2c6d2f9a032d9495dccd401e9a455dd0fca639f73e98"
+    },
+    {
       "path": "video/multi_i.cool",
       "bytes": 3456,
       "sha256": "e5e5fbdb97fed8d76abd0e40a7feade873a9c2e86c63e5a7ee009b8a69be2783",
@@ -600,54 +697,6 @@
       "shuffle_word_bytes": 1,
       "compressed_bytes": 256,
       "compressed_sha256": "3bc5f3981f0660721740fb7eea68f1d9183fd2f7aa6680186179dbd940891771"
-    },
-    {
-      "path": "video/multi_i.0.planes.u16",
-      "bytes": 24576,
-      "sha256": "5a5caaee80568a4c7bd88710adf8d7ffef40b2b91f21ed058a76519c2c90f18e",
-      "shuffle_word_bytes": 2,
-      "compressed_bytes": 10998,
-      "compressed_sha256": "a24ceb7348014ef4de1d194aa7ddd695fce642d0201230adeee3600dceec53ed"
-    },
-    {
-      "path": "video/multi_i.1.planes.u16",
-      "bytes": 4608,
-      "sha256": "a265771dd17528107f8f447df7ecf3afb0a6f6ba04b86b7eb508fcbb95045c1f",
-      "shuffle_word_bytes": 2,
-      "compressed_bytes": 1175,
-      "compressed_sha256": "11655c3a56d8938f81b3edf9519b4cc06298c6593bb3414cb04f8f89cd3591ca"
-    },
-    {
-      "path": "video/multi_i.2.planes.u16",
-      "bytes": 24576,
-      "sha256": "42ac6b7f98e48e4a94bd93a791e959efbb749dc3afd0b5fa8a280d18c866c6be",
-      "shuffle_word_bytes": 2,
-      "compressed_bytes": 11347,
-      "compressed_sha256": "98bb7d6452931905e26fbc61273e5da27fc83415fe4e71983c6699d43a2dc47b"
-    },
-    {
-      "path": "video/multi_i.0.residue.f32",
-      "bytes": 49152,
-      "sha256": "d177cfc9e41adae970a23be6cd36fcc2f01c6edad7c4a3e4c3593584183f5fba",
-      "shuffle_word_bytes": 4,
-      "compressed_bytes": 37487,
-      "compressed_sha256": "7e8b216a80f5afa5c65315cecda005ec40a89ec52ff62538af6c5d1b86a4e86b"
-    },
-    {
-      "path": "video/multi_i.1.residue.f32",
-      "bytes": 18432,
-      "sha256": "9115bc13609f493e61197b084df3e89c5bf787ac8464db629ade355f09194cd6",
-      "shuffle_word_bytes": 4,
-      "compressed_bytes": 4549,
-      "compressed_sha256": "b62bb370c7e2c823f29b71748e62a89045d64877a7278990d120f5cc5c20cd05"
-    },
-    {
-      "path": "video/multi_i.2.residue.f32",
-      "bytes": 49152,
-      "sha256": "11a3bea9ec7dea76b412082f0484126cb8dded1a5bc01d89a687f743ba80ab33",
-      "shuffle_word_bytes": 4,
-      "compressed_bytes": 38117,
-      "compressed_sha256": "66ea4d559a07331315ba2c6d2f9a032d9495dccd401e9a455dd0fca639f73e98"
     },
     {
       "path": "video/pb_128.0.planes.u16",
@@ -754,6 +803,46 @@
       "compressed_sha256": "88800d41f55fe0b77ca1b8abb7499e8629164744facf132f7a4ec898d5b2f987"
     },
     {
+      "path": "warp/vec.dflow12.f32",
+      "bytes": 3840,
+      "sha256": "86e81e93dc828a54d19e608ba86a3579d36ea970d6b99176209507cb10d64e55",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 3460,
+      "compressed_sha256": "6e2d808bab020b975ee0bdc8375f06c02c48253a51bb92227243dab18d3180ad"
+    },
+    {
+      "path": "warp/vec.dflow2.f32",
+      "bytes": 3840,
+      "sha256": "2de01787398d3f906b6043ae3dca7a62a80fff92a23d6b93a20ec8b384082bd0",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 3402,
+      "compressed_sha256": "5d25d6436bfede1979d2e8fb18a448f3b77c0121e5144e861126933233aeda8b"
+    },
+    {
+      "path": "warp/vec.dflow4.f32",
+      "bytes": 3840,
+      "sha256": "5793b2711e94d2d6af1024238ed44e7b37b1888dd7175e9c0a0812a828fc45bc",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 3490,
+      "compressed_sha256": "669e6617b0c1c65f20cbffeddcbaf9f9cfebe8a985a8973426eb2fb533306a84"
+    },
+    {
+      "path": "warp/vec.dflow8.f32",
+      "bytes": 3840,
+      "sha256": "53b6a1fa50c7fd8ce2b74efc72a47112aab21a7ec7dbbdb4be0dbda4ef4f4967",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 3459,
+      "compressed_sha256": "935b52be083af289c85e7866e0ed3b482d0c97ad57eb4a8469eab725d8285d1a"
+    },
+    {
+      "path": "warp/vec.dout.f32",
+      "bytes": 5760,
+      "sha256": "7c994597496b20548f99cc21063b8b3b1126a77abb8bbc3e79bd6f8198f4a688",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 5019,
+      "compressed_sha256": "2593bbce97057022a727bbd7af39f5e9220eb2556376eb8ddbb0e915f2391adb"
+    },
+    {
       "path": "warp/vec.flow.f32",
       "bytes": 3840,
       "sha256": "8fb2fb4587de0847bd8c11fe815300aba50217d3c9dd0457ee8f68ed1c4be273",
@@ -763,11 +852,11 @@
     },
     {
       "path": "warp/vec.json",
-      "bytes": 26,
-      "sha256": "9665e3eda8aa544ab6ebcdd2488d95712403e78c79254e0dae27f9a51a0ad387",
+      "bytes": 95,
+      "sha256": "ad5fa23184084c849ef5002a000a3ec5e3f4c3faae9740fe072ccda5091598bd",
       "shuffle_word_bytes": 1,
-      "compressed_bytes": 39,
-      "compressed_sha256": "cbc84d2f8024a740eaa57b05548234f233412100aa32174df904194efe65aca7"
+      "compressed_bytes": 84,
+      "compressed_sha256": "15c43db08d5c42cd40dde55a2dc065ad3ceff7d0a9e0d25131aea27512a52155"
     },
     {
       "path": "warp/vec.out12.f32",
@@ -810,6 +899,22 @@
       "compressed_sha256": "2240e4fb319293a069a0c1dd7e7e29a7e0df4ad0277bcadb2abaa968796f2ca1"
     },
     {
+      "path": "warp/vec.target.f32",
+      "bytes": 5760,
+      "sha256": "dff019e5421c4ff19593dac5e59cb42409910cb079ac21105f97888bf8136a1b",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 4644,
+      "compressed_sha256": "27e27f3227886e9a4d8da3e1eb183c896ebec4417baaebd205db6855b04d95a7"
+    },
+    {
+      "path": "warp/vec.target2.f32",
+      "bytes": 5760,
+      "sha256": "e566e4643969cd12ebc2b45a18217b038e3b3349b25a9f6a41c06de9ab25645d",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 527,
+      "compressed_sha256": "a22c47f3a754a0951ec6a1750cfabd87d9358cc3a6c39f804b51be47be817f04"
+    },
+    {
       "path": "warp/vec.x.f32",
       "bytes": 5760,
       "sha256": "fc8ca8187b7a52a5d83a4aaad4f3112bf13576dc8393c9764d6f233cf4c34dd9",
@@ -818,36 +923,12 @@
       "compressed_sha256": "da521c9d386957fd9a35775cdebf1e22ad08ac473562fe2bfc0a5c433bcd3c5b"
     },
     {
-      "path": "gradients/small64_yuv420.bin",
-      "bytes": 93992,
-      "sha256": "a0ca36a69d90403c287b69456a491e4b20e075b124461bf07ff6c6500b5edb1b",
+      "path": "warp/vec.x2.f32",
+      "bytes": 5760,
+      "sha256": "de9d0f5c3358ba99702438d32a8e4ebe0dcfafef86e3a4ae0fd6ab540651efad",
       "shuffle_word_bytes": 4,
-      "compressed_bytes": 76577,
-      "compressed_sha256": "1899705e17a07f81a86f8f06e9331f00c20e6ff09ba5c9b27a7b52e5ed6179b7"
-    },
-    {
-      "path": "gradients/small64_yuv420.json",
-      "bytes": 10431,
-      "sha256": "520a8a451128b24c3783ad07068c3da2fd2b48602971881f21047d1c0be2815e",
-      "shuffle_word_bytes": 1,
-      "compressed_bytes": 1053,
-      "compressed_sha256": "71b7d865bc65a9a1292a9490a29225fd041a10805cc22261c8c1ba028a16bbf1"
-    },
-    {
-      "path": "gradients/small64_lop.bin",
-      "bytes": 56744,
-      "sha256": "251bcea1caafbc637b3357c4e0a37d182b0c71fcc0cfc1a7287de76012e3d5bb",
-      "shuffle_word_bytes": 4,
-      "compressed_bytes": 35719,
-      "compressed_sha256": "2905944b78e56ac8ef7502dc93661a0d0b14cfa7ee356abf207ffca942187c60"
-    },
-    {
-      "path": "gradients/small64_lop.json",
-      "bytes": 9292,
-      "sha256": "08988d35069a462490fcff440c4c0e81a3d0da5a2527daa03c3dd5822fc3cf89",
-      "shuffle_word_bytes": 1,
-      "compressed_bytes": 998,
-      "compressed_sha256": "53156835471517453c5afe30d7a631bc9a91c26f18e468f62f6584849f0ef495"
+      "compressed_bytes": 931,
+      "compressed_sha256": "24c39cc1c84dd251a5df41d74c504f6a15e3ac828f82a405327ee08cc261dc2e"
     }
   ],
   "schema_version": 1,
@@ -889,13 +970,21 @@
     {
       "name": "vec",
       "raw": [
+        "x",
+        "x2",
         "flow",
+        "dout",
+        "dflow2",
+        "dflow4",
+        "dflow8",
+        "dflow12",
         "out2",
         "out4",
         "out8",
         "out12",
         "shift",
-        "x"
+        "target",
+        "target2"
       ]
     }
   ]

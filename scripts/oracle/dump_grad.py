@@ -51,8 +51,14 @@ if config == "hop":
     hyper = (4, 6)
     lat = (0, 6)
 else:
-    # "small", "wass", "miniwass" and "lop" share the tiny networks.
+    # "small", "wass", "miniwass", "flow" and "lop" share the tiny networks.
     layers = ["8-1-linear-relu", "3-1-linear-none", "3-3-residual-none"]
+    if config == "flow":
+        # Two-channel dense output (upstream motion cc emits one flow field
+        # per reference: channels = 2 for P). The "flow" frame data type skips
+        # the output clamp and the loss is a flat unclamped MSE. Both X slots
+        # become 2 (the residual tail needs in == out channels).
+        layers = ["8-1-linear-relu", "2-1-linear-none", "2-3-residual-none"]
     arm = dict(spatial_context_arm=6, n_hidden_layers_arm=1, output_feature_ifce=2)
     hyper = (3, 4)
     # "lop" starts latents below full resolution (upstream --latent_residue):
@@ -164,7 +170,11 @@ out = cc.forward(
     noise_parameter=torch.tensor(noise_parameter, dtype=dtype),
 )
 decoded = torch.clamp(out["raw_out"], 0.0, 1.0)
-mse = ((decoded - img) ** 2).mean()
+mse = (
+    torch.zeros((), dtype=dtype)
+    if config == "flow"
+    else ((decoded - img) ** 2).mean()
+)
 wd = torch.zeros((), dtype=dtype)
 wass_taps = None
 if "wasserstein" in dist_weight:
@@ -208,6 +218,13 @@ if config == "yuv420":
     flat_target = torch.cat(
         [tgt_d["y"].reshape(-1), tgt_d["u"].reshape(-1), tgt_d["v"].reshape(-1)]
     )
+elif config == "flow":
+    # Upstream "flow" frame data: the raw output is the frame data (no clamp),
+    # the target is a dense 2-channel flow field.
+    flow_target = 2.5 * torch.randn(1, 2, h, w, dtype=dtype)
+    dec_d = out["raw_out"]
+    mse = ((dec_d - flow_target) ** 2).mean().reshape(())
+    flat_target = flow_target.reshape(-1)
 else:
     flat_target = img.reshape(-1)
 dist = dist_weight["mse"] * mse + dist_weight.get("wasserstein", 0.0) * wd
@@ -258,7 +275,7 @@ json.dump(
         "softround_temperature": 0.3,
         "noise_parameter": noise_parameter,
         "flag_common_randomness": flag_cr,
-        "frame_data_type": "yuv420" if config == "yuv420" else "rgb",
+        "frame_data_type": {"yuv420": "yuv420", "flow": "flow"}.get(config, "rgb"),
         "dist_weight": dist_weight,
         "vgg_dims": MINI_VGG_DIMS if config == "miniwass" else None,
         "loss": loss.item(),
