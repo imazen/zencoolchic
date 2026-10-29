@@ -3,9 +3,13 @@
 //! # Design mismatch
 //!
 //! Encoding trains a network for each image: even minimum effort is 2000 iterations.
-//! Quality is **uncalibrated**: `lambda = 10^(-1 - 4*q/100)`, clamping `q` to 0–100;
-//! higher quality decreases the rate penalty. There is no measured mapping to SSIM2 or
-//! zensim. Resource estimates remain unknown; one image's benchmark is not a cost model.
+//! `lambda = 10^(-1 - 4*q/100)`, clamping `q` to 0–100; higher quality decreases
+//! the rate penalty. Measured calibration (6 CID22-512 validation images at
+//! 256x256, hop, 10000 iterations, seed 0; REMAINING-WORK.md has the table):
+//! q10 ~24 dB at ~0.23 bpp, q30 ~28 dB / 0.41, q50 ~33 dB / 0.89, q70 ~38 dB /
+//! 1.80, q90 ~41 dB / 2.90, mean butteraugli 15.8/8.3/4.0/2.1/1.6. A second seed
+//! moved results ~0.05-0.4 dB. It is a codec-specific dial, not a perceptual
+//! target; content spread within one q is +-2-3 dB.
 //!
 //! Cool-chic has **no magic number**. Registration detects the eight-byte single-image
 //! video header, a heuristic which can collide with unrelated data. Always validate headers.

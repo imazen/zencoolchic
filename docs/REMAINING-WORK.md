@@ -89,12 +89,25 @@ headers.
   (71 oracle/zencodec tests, fuzz replay, upstream oracle) also passes on
   aarch64 (Hetzner Neoverse-N1), confirming the integer decode path is
   bit-exact off x86.
-- A multi-image rate-distortion sweep is in progress (6 CID22-512 validation
-  images at 256², q ∈ {10,30,50,70,90} → λ = 10^(−1−4q/100), upstream
-  defaults n_itr=10000/arch=hop, run-heavy on the 7900X). Until it lands the
-  generic quality mapping remains explicitly uncalibrated: historical
-  one-image/one-seed benchmarks do not establish a general ranking, and
-  multi-seed variance is still unmeasured.
+- The generic quality mapping is now measured (not a perceptual target):
+  6 CID22-512 validation images at 256², hop, n_itr=10000, seed 0, on the
+  7900X (`run-heavy`, ~285 s per encode). Decoded PSNR / rate / butteraugli:
+
+  | q | λ | mean PSNR | range | mean bpp | mean baug |
+  |---|---|-----------|-------|----------|-----------|
+  | 10 | 4.0e-2 | 24.1 dB | 21.5–25.9 | 0.230 | 15.8 |
+  | 30 | 6.3e-3 | 28.1 dB | 26.0–30.4 | 0.412 | 8.3 |
+  | 50 | 1.0e-3 | 33.2 dB | 31.0–35.7 | 0.885 | 4.0 |
+  | 70 | 1.6e-4 | 38.4 dB | 35.0–41.1 | 1.798 | 2.1 |
+  | 90 | 2.5e-5 | 41.5 dB | 35.9–45.4 | 2.901 | 1.6 |
+
+  A second seed on two images moved PSNR ~0.05–0.4 dB and bpp ~0.02–0.06, so
+  one-seed numbers are representative within ±0.4 dB; the spread within a q
+  across content is ±2–3 dB. 512² and other archs/latent sizes are
+  unmeasured; historical one-image benchmarks still do not rank speed.
+- Deeper fuzz runs happened (i265, 80 min): 312,958 `decode_still` and
+  161,983 `decode_video` executions, zero crashes; the grown corpus (1178
+  entries) is synced to `/mnt/v/fuzzes/zencoolchic/corpus/`.
 - Two libFuzzer targets cover the public decode entry points
   ([fuzz/fuzz_targets](../fuzz/fuzz_targets/)), with real-stream seeds under
   [fuzz/seeds](../fuzz/seeds/), a minimized crash corpus under
