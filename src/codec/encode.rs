@@ -1,5 +1,7 @@
 use super::*;
-use zencodec::encode::{EncodeCapabilities, EncodeJob, EncodeOutput, Encoder, EncoderConfig};
+use zencodec::encode::{
+    AnimationFrameEncoder, EncodeCapabilities, EncodeJob, EncodeOutput, Encoder, EncoderConfig,
+};
 use zenpixels::{Cicp, PixelSlice};
 
 /// Upstream intra decoder architecture, ordered from most to least compute.
@@ -101,6 +103,7 @@ impl CoolChicEncoderConfig {
 static ENCODE_CAPS: EncodeCapabilities = EncodeCapabilities::new()
     .with_lossy(true)
     .with_stop(true)
+    .with_animation(true)
     .with_enforces_max_pixels(true)
     .with_quality_range(0.0, 100.0)
     .with_effort_range(0, 10);
@@ -162,7 +165,7 @@ pub struct CoolChicEncodeJob {
 impl EncodeJob for CoolChicEncodeJob {
     type Error = At<CodecError>;
     type Enc = CoolChicEncoder;
-    type AnimationFrameEnc = ();
+    type AnimationFrameEnc = CoolChicAnimationEncoder;
     fn with_stop(mut self, stop: zencodec::StopToken) -> Self {
         self.stop = Some(stop);
         self
@@ -181,8 +184,16 @@ impl EncodeJob for CoolChicEncodeJob {
         check_budget_support(&self.limits)?;
         Ok(CoolChicEncoder { job: self })
     }
-    fn animation_frame_encoder(self) -> Result<(), Self::Error> {
-        Err(unsupported(UnsupportedOperation::AnimationEncode))
+    fn animation_frame_encoder(self) -> Result<Self::AnimationFrameEnc, Self::Error> {
+        self.config.validate()?;
+        self.stop.check().map_err(Error::from)?;
+        check_budget_support(&self.limits)?;
+        Ok(CoolChicAnimationEncoder {
+            job: self,
+            frames: Vec::new(),
+            dims: None,
+            input_bytes: 0,
+        })
     }
 }
 
@@ -257,6 +268,153 @@ impl Encoder for CoolChicEncoder {
             stop,
         )?;
         l.check_output_size(report.bitstream.len() as u64)
+            .map_err(limit)?;
+        stop.check().map_err(Error::from)?;
+        Ok(EncodeOutput::new(report.bitstream, coolchic_format()))
+    }
+}
+
+/// Combines the job-level stop token with `push_frame`/`finish`'s per-call one.
+struct Or<'a>(&'a dyn Stop, &'a dyn Stop);
+impl Stop for Or<'_> {
+    fn check(&self) -> Result<(), enough::StopReason> {
+        self.0.check().and_then(|()| self.1.check())
+    }
+    fn may_stop(&self) -> bool {
+        self.0.may_stop() || self.1.may_stop()
+    }
+}
+
+/// Full-canvas RGB8 animation encoder: frames are unpacked as they arrive and
+/// the whole video trains on `finish` — Cool-chic is a whole-video codec, so
+/// there is no incremental streaming. The coding structure is upstream's
+/// `intra_pos 0`, `p_pos <last>` GOP (one intra frame plus B frames, closed by
+/// a P frame; a single frame is all-intra). The stream carries no timing:
+/// per-frame durations are accepted and dropped.
+pub struct CoolChicAnimationEncoder {
+    job: CoolChicEncodeJob,
+    frames: Vec<Vec<Vec<u16>>>,
+    dims: Option<(u32, u32)>,
+    input_bytes: u64,
+}
+
+impl AnimationFrameEncoder for CoolChicAnimationEncoder {
+    type Error = At<CodecError>;
+    fn reject(op: UnsupportedOperation) -> Self::Error {
+        unsupported(op)
+    }
+    fn push_frame(
+        &mut self,
+        pixels: PixelSlice<'_>,
+        _duration_ms: u32,
+        stop: Option<&dyn Stop>,
+    ) -> Result<(), Self::Error> {
+        self.job.stop.check().map_err(Error::from)?;
+        if let Some(s) = stop {
+            s.check().map_err(Error::from)?;
+        }
+        if pixels.descriptor() != PixelDescriptor::RGB8_SRGB
+            || pixels.color_context().is_some_and(|c| {
+                c.icc.is_some()
+                    || c.cicp.is_some_and(|v| v != Cicp::SRGB)
+                    || c.diffuse_white.is_some()
+            })
+        {
+            return Err(unsupported(UnsupportedOperation::PixelFormat));
+        }
+        let (width, height) = self
+            .job
+            .orientation
+            .output_dimensions(pixels.width(), pixels.rows());
+        if width == 0 || height == 0 || width > 16383 || height > 16383 {
+            return Err(Error::InvalidArgument("dimensions must be 1..=16383").into());
+        }
+        match self.dims {
+            Some(dims) if dims != (width, height) => {
+                return Err(
+                    Error::InvalidArgument("animation frames must share dimensions").into(),
+                );
+            }
+            Some(_) => {}
+            None => self.dims = Some((width, height)),
+        }
+        let l = &self.job.limits;
+        l.check_dimensions(width, height).map_err(limit)?;
+        l.check_frames(self.frames.len() as u32 + 1)
+            .map_err(limit)?;
+        l.check_total_pixels(u64::from(width) * u64::from(height) * (self.frames.len() as u64 + 1))
+            .map_err(limit)?;
+        self.input_bytes += pixels.as_strided_bytes().len() as u64;
+        l.check_input_size(self.input_bytes).map_err(limit)?;
+        let oriented;
+        let pixels = if self.job.orientation.is_identity() {
+            pixels
+        } else {
+            oriented = zenpixels_convert::orient::apply_orientation(pixels, self.job.orientation);
+            oriented.as_slice()
+        };
+        let rgb = pixels.contiguous_bytes();
+        let npix = width as usize * height as usize;
+        self.frames.push(
+            (0..3)
+                .map(|c| (0..npix).map(|i| rgb[3 * i + c] as u16).collect())
+                .collect(),
+        );
+        Ok(())
+    }
+    fn finish(self, stop: Option<&dyn Stop>) -> Result<EncodeOutput, Self::Error> {
+        let n = self.frames.len() as u32;
+        if n == 0 {
+            return Err(Error::InvalidArgument("animation encode needs at least one frame").into());
+        }
+        let job_stop = self
+            .job
+            .stop
+            .as_ref()
+            .map(|s| s as &dyn Stop)
+            .unwrap_or(&enough::Unstoppable);
+        let call_stop = stop.unwrap_or(&enough::Unstoppable);
+        let stop = Or(job_stop, call_stop);
+        // A sequential threading policy runs the encode on one thread: the
+        // scoped override makes every training pool single-threaded (output
+        // bytes are identical — decomposition is thread-count independent).
+        let _seq = if self.job.limits.threading.is_parallel() {
+            None
+        } else {
+            Some(crate::train::SequentialPool::install())
+        };
+        let (w, h) = self.dims.unwrap_or((0, 0));
+        let planes: Vec<Vec<crate::unstable::Plane>> = self
+            .frames
+            .iter()
+            .map(|f| {
+                f.iter()
+                    .map(|samples| crate::unstable::Plane {
+                        width: w,
+                        height: h,
+                        samples,
+                    })
+                    .collect()
+            })
+            .collect();
+        let views: Vec<&[crate::unstable::Plane]> = planes.iter().map(|f| f.as_slice()).collect();
+        // Upstream's default GOP: intra at 0, P at the last display index.
+        let intra_pos = [0u32];
+        let p_pos: &[u32] = if n > 1 { &[n - 1] } else { &[] };
+        let report = crate::unstable::encode_video_with_stop(
+            crate::FrameDataType::Rgb,
+            8,
+            &views,
+            &intra_pos,
+            p_pos,
+            &self.job.config.options,
+            &mut crate::unstable::VideoOptions::default(),
+            &mut |_| {},
+            &stop,
+        )?;
+        self.job
+            .limits
+            .check_output_size(report.bitstream.len() as u64)
             .map_err(limit)?;
         stop.check().map_err(Error::from)?;
         Ok(EncodeOutput::new(report.bitstream, coolchic_format()))

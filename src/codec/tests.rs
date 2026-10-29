@@ -2,7 +2,7 @@ use super::*;
 use alloc::{sync::Arc, vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use zencodec::decode::{AnimationFrameDecoder, StreamingDecode};
-use zencodec::encode::{EncodeJob, Encoder, EncoderConfig};
+use zencodec::encode::{AnimationFrameEncoder, EncodeJob, Encoder, EncoderConfig};
 use zenpixels::PixelSlice;
 
 fn fixture(kind: FrameDataType, depth: u32) -> Vec<u8> {
@@ -290,6 +290,74 @@ fn decode_memory_budget_is_pre_flight_estimate() {
         .err()
         .unwrap();
     assert_eq!(category(e), ResourceError::Limits(LimitKind::Memory).into());
+}
+
+#[test]
+fn animation_encode_round_trips_through_animation_decoder() {
+    let (w, h) = (16u32, 16u32);
+    let frame = |seed: u8| -> Vec<u8> {
+        (0..w * h)
+            .flat_map(|i| [seed ^ i as u8, seed.wrapping_add(i as u8 / 3), seed])
+            .collect()
+    };
+    let frames: Vec<Vec<u8>> = (0..3).map(|f| frame(40 * f + 7)).collect();
+    let mut enc = fast_config()
+        .job()
+        .with_limits(ResourceLimits::none().with_max_frames(3))
+        .animation_frame_encoder()
+        .unwrap();
+    for (i, f) in frames.iter().enumerate() {
+        let buf = PixelBuffer::from_vec(f.clone(), w, h, PixelDescriptor::RGB8_SRGB).unwrap();
+        enc.push_frame(buf.as_slice(), if i == 0 { 100 } else { 50 }, None)
+            .unwrap();
+    }
+    let out = enc.finish(None).unwrap();
+    let stream = out.data();
+    // The stream is a 3-frame video: intra at 0, B at 1, P at 2.
+    let mut dec = CoolChicDecoderConfig
+        .job()
+        .animation_frame_decoder(Cow::Borrowed(stream), &[])
+        .unwrap();
+    assert_eq!(dec.frame_count(), Some(3));
+    for i in 0..3 {
+        let f = dec.render_next_frame(None).unwrap().expect("frame");
+        assert_eq!(f.frame_index(), i as u32);
+        let got = f.pixels();
+        assert_eq!((got.width(), got.rows()), (w, h));
+    }
+    assert!(dec.render_next_frame(None).unwrap().is_none());
+}
+
+#[test]
+fn animation_encode_rejects_mismatched_dims_and_zero_frames() {
+    let (w, h) = (8u32, 8u32);
+    let rgb = vec![9u8; (3 * w * h) as usize];
+    let mut enc = fast_config().job().animation_frame_encoder().unwrap();
+    let buf = PixelBuffer::from_vec(rgb.clone(), w, h, PixelDescriptor::RGB8_SRGB).unwrap();
+    enc.push_frame(buf.as_slice(), 0, None).unwrap();
+    let other = PixelBuffer::from_vec(
+        {
+            let mut v = rgb;
+            v.resize(3 * w as usize * (h as usize + 2), 0);
+            v
+        },
+        w,
+        h + 2,
+        PixelDescriptor::RGB8_SRGB,
+    )
+    .unwrap();
+    assert!(enc.push_frame(other.as_slice(), 0, None).is_err());
+    let e = fast_config()
+        .job()
+        .animation_frame_encoder()
+        .unwrap()
+        .finish(None)
+        .err()
+        .unwrap();
+    assert_eq!(
+        category(e),
+        RequestError::Invalid(InvalidKind::Parameters).into()
+    );
 }
 
 #[derive(Clone)]

@@ -335,7 +335,33 @@ pub fn encode_video(
     vopt: &mut VideoOptions<'_>,
     log: &mut dyn FnMut(String),
 ) -> crate::Result<VideoReport> {
-    let stop = &enough::Unstoppable;
+    encode_video_with_stop(
+        frame_data_type,
+        bitdepth,
+        frames,
+        intra_pos,
+        p_pos,
+        opt,
+        vopt,
+        log,
+        &enough::Unstoppable,
+    )
+}
+
+/// [`encode_video`] with cooperative cancellation checked between training
+/// phases and frames.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_video_with_stop(
+    frame_data_type: crate::FrameDataType,
+    bitdepth: u8,
+    frames: &[&[Plane<'_>]],
+    intra_pos: &[u32],
+    p_pos: &[u32],
+    opt: &TrainOptions,
+    vopt: &mut VideoOptions<'_>,
+    log: &mut dyn FnMut(String),
+    stop: &dyn enough::Stop,
+) -> crate::Result<VideoReport> {
     let vh = crate::header::VideoHeader {
         n_frames: frames.len() as u32,
         intra_pos: intra_pos.into(),

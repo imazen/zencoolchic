@@ -18,7 +18,10 @@
 //! construction and yields row batches of the result, and push decode copies the one-shot
 //! output to the sink. Animation decode is lazy in coding order and yields display-order
 //! frames (only RGB — `PixelDescriptor` cannot carry subsampled YUV); decoded frames stay
-//! resident as P/B references, so long videos keep video-decoder memory. Metadata has no
+//! resident as P/B references, so long videos keep video-decoder memory.
+//! Animation encode buffers `push_frame` RGB8 planes and trains the whole
+//! video on `finish` with upstream's `intra_pos 0`, `p_pos <last>` GOP;
+//! durations are dropped (the stream has no timing field). Metadata has no
 //! carrier; the encoder bakes its orientation into pixels and drops the rest.
 //! Decode cancellation is checked between latent grids and network stages; an individual
 //! grid or convolution is not interruptible. Encode checks each training iteration,
