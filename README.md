@@ -4,10 +4,10 @@ A safe-Rust port of [Cool-chic](https://github.com/Orange-OpenSource/Cool-Chic) 
 overfitted neural image codec: each image carries its own tiny decoder (latent grids, an
 auto-regressive entropy model, upsampling and a small synthesis CNN, about 2000 MAC per pixel).
 
-**Status: still-image and all-intra video decoder, experimental encoder.** The decoder's
+**Status: still-image and video decoder (intra + inter), experimental encoder.** The decoder's
 integer latents match upstream on 12 oracle streams; floating-point reconstruction differs
-by at most one output step. `decode_video` returns every frame of an all-intra stream in
-display order. Inter (P/B) frames are not ported. See [`PORTING.md`](PORTING.md) for
+by at most one output step. `decode_video` returns every frame in display order,
+including P/B inter frames with motion-compensated references. See [`PORTING.md`](PORTING.md) for
 evidence. [Remaining work](docs/REMAINING-WORK.md) maps the unported features to source
 and tests.
 

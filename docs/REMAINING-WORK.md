@@ -3,11 +3,11 @@
 Target: upstream [Cool-chic v5.0.1 at a6fe38a414dd098b39c41636bd6e423626402f7e](https://github.com/Orange-OpenSource/Cool-Chic/tree/a6fe38a414dd098b39c41636bd6e423626402f7e).
 Audited against Rust and pinned upstream source on 2026-10-18.
 
-**Still missing:** inter-frame (P/B) decoding and video encoding; motion
-compensation and global translation; YUV/high-bit-depth encoding; training
-starting latents below full resolution. There are also untested decoder variants
+**Still missing:** video encoding (residue/motion objectives, RAFT-style
+initialization); YUV/high-bit-depth encoding; training starting latents below
+full resolution. There are also untested decoder variants
 and incomplete resource/streaming integrations. The current implementation is a
-multi-frame all-intra decoder plus experimental RGB8 encoder, not a complete
+still-image and video decoder (intra + P/B inter) plus experimental RGB8 encoder, not a complete
 port of every upstream workflow.
 
 ## Start here
@@ -30,7 +30,7 @@ Their Rust counterparts are linked directly.
 | Work | Current boundary and implementation entry points | Upstream reference and acceptance gate |
 |---|---|---|
 | Multiple I frames | done: [decode_video](../src/decode.rs) returns every frame in display order (`decode` stays the still-image API). [coding_structure](../src/header.rs) rebuilds coding order and references from the video header and cross-checks each frame header against it; malformed structures that upstream asserts on or silently misbuilds are rejected. Frozen `multi_i` oracle case decodes three upstream-generated frames (mixed RGB/YUV420, mixed sizes) bit-exactly. | `bitstream/decode.py::decode_video`, `utils/codingstructure.py`. |
-| P/B frame decoding | Inter frames are still refused with `Error::Unsupported`. [decode_coolchic](../src/decode.rs), [coding_structure](../src/header.rs) and the per-frame reference store supply the groundwork; the warper, global translation and residue/motion compositor are not ported. | `bitstream/decode.py::decode_frame`, `component/intercoding/globalmotion.py`, `component/intercoding/warp.py`. Decode residue and motion networks separately, preserve per-network exact latents, then match translation, flow sampling, alpha/beta masking, rounding and YUV handling. Test P and B frames with border/fractional motion and reference ordering. |
+| P/B frame decoding | done: [decode_inter](../src/decode.rs) decodes the residue and motion Cool-chic payloads separately, applies integer global translation, warps 4:2:0 references (converted to 4:4:4 by nearest 2× chroma replication) through [warp.rs](../src/warp.rs), blends P/B predictions with the residue alpha/beta channels, adds the RGB residue and finishes through the shared quantization tail. The warper quantizes flow to 1/64-pixel steps and implements upstream's bilinear, bicubic and sinc separable kernels (filter sizes 2/4/8/12). Frozen `pb_128` oracle case: upstream-encoded 4-frame 4:2:0 stream (I→P→B→B) with large global translations. I and P frames decode bit-exactly; B frames differ on ~1% of samples by at most one quantization step (float accumulation order). Per-frame residue/motion raw outputs match to 1e-6. | `bitstream/decode.py::decode_frame`, `component/intercoding/globalmotion.py`, `component/intercoding/warp.py`. |
 | Motion/video encoding | [trainer](../src/train/trainer.rs), [config](../src/train/config.rs) and [unstable entry](../src/unstable.rs) build one intra residue model. | `component/video.py::encode_one_frame` / `guided_motion_pretraining`, `component/frame.py`, `training/presets.py`, `bitstream/encode.py`. Port decode first; then residue/motion objectives, reference management, presets and serialization. Upstream's `component/intercoding/raft.py` uses pretrained torchvision RAFT for encoder initialization. RAFT weights are not needed by a video decoder; a future encoder must record their provenance. |
 | YUV and higher-depth encode input | Native decoding supports RGB/YUV; [RGB8 training entry](../src/unstable.rs) and [trait encode](../src/codec/encode.rs) accept RGB8 sRGB. [Problem/evaluate](../src/train/trainer.rs), [distortion](../src/train/eval.rs), [RDOQ scores](../src/train/rdoq.rs) carry bit-depth-sensitive behavior. | `training/loss.py`, `io/format/yuv.py`, `io/framedata.py`, `component/frame.py`. Add differential loss/gradient cases for 4:2:0, 4:4:4 and higher depth, including chroma geometry and both rounding stages. Preserve all supported sample bits. Public descriptors/configuration require review. |
 | Starting latents below full resolution | Native decoder handles the frozen half-resolution/bicubic case. [Shape::new](../src/train/mod.rs) rejects `latent_resolution[0] != 0`; [training step](../src/train/ops.rs) and [evaluation](../src/train/eval.rs) assume the supported full-resolution path. | `component/core/coolchic.py` and its final `F.interpolate`. Implement the necessary resize and its backward path with matching geometry, alignment and borders. Require a float64 gradient comparison and end-to-end reconstruction parity before removing the refusal. |
@@ -38,20 +38,22 @@ Their Rust counterparts are linked directly.
 
 For video, [dump_video.py](../scripts/oracle/dump_video.py) assembles
 multi-frame streams from single-frame payloads with upstream's own header
-classes and dumps each frame upstream-decoded. **Before** judging a P/B port,
-extend it to capture frame identity, residue/motion identity, integer latents,
-pre-round reconstruction and final planes separately. Add new frozen cases while
+classes (`--assemble`) or decodes an upstream-encoded inter stream
+(`--decode`), capturing per-frame planes plus the raw residue/motion
+synthesis outputs. Add new frozen cases while
 retaining the original still-image set. Do not infer video support from parsed
 headers.
 
 ## Coverage gaps and known limits
 
-- The frozen suite covers 12 still-image decoder/writer cases, one three-frame
-  all-intra video case, four float64 gradient cases and fixed-gradient SOAP
+- The frozen suite covers 12 still-image decoder/writer cases, a three-frame
+  all-intra video case and a four-frame upstream-encoded inter stream, four
+  float64 gradient cases and fixed-gradient SOAP
   behavior. It is not exhaustive format conformance. It includes odd RGB
   dimensions, narrow raster-order decoding, no-IFCE/no-hyperlatent, no
-  stabilisers, common randomness, half-resolution bicubic resize, YUV420 8-bit
-  and YUV444 10-bit. No inter-frame stream is covered yet.
+  stabilisers, common randomness, half-resolution bicubic resize, YUV420 8-bit,
+  YUV444 10-bit, and sinc-filter warping with global translation and B-frame
+  bidirectional references.
 - [nearest/bilinear resize](../src/nn.rs) exists but lacks an independent frozen
   upstream case. Add fixtures for these modes, higher-depth RGB and further YUV
   boundary combinations. The trait tests' synthetic 16-bit path is not an

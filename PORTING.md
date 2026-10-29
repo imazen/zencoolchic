@@ -22,7 +22,7 @@ missing codec features, validation gaps, performance work and integration limits
 | Common randomness | `component/core/noise.py` | done | `mid_wasserstein_debug` (`--tune wasserstein`): all samples identical |
 | YUV 4:2:0 / 4:4:4 output | `io/format/yuv.py` | done | `yuv420_8b_debug`, `yuv444_10b_debug` (10-bit) |
 | Multi-frame all-intra decode | `bitstream/decode.py::decode_video`, `utils/codingstructure.py` | done: `decode_video` returns frames in display order; coding structure rebuilt and cross-checked against each frame header | `multi_i` oracle case: three upstream-decoded frames (mixed RGB / 4:2:0, mixed sizes) bit-exact |
-| Inter frames (P/B), warper, global motion | `bitstream/decode.py::decode_frame`, `component/intercoding/` | not ported: `Error::Unsupported` | — |
+| Inter frames (P/B), warper, global motion | `bitstream/decode.py::decode_frame`, `component/intercoding/` | done: integer global translation, flow quantized to 1/64 px, bilinear/bicubic/sinc warper (filter sizes 2/4/8/12), alpha/beta compositing, 4:2:0→4:4:4 reference upsampling | `pb_128` oracle case (upstream-encoded I→P→B→B): I/P frames bit-exact, B frames ≤1 quantization step on ~1% of samples; raw residue/motion ≤ 1e-6 |
 
 ### Measured parity (2026-10-17, mac, torch 2.14.1 CPU)
 
