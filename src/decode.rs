@@ -623,51 +623,54 @@ fn quantize(v: f32, max: f32) -> f32 {
     libm::rintf(v * max) / max
 }
 
-/// Decodes the first frame of a Cool-chic bitstream (an image).
-pub fn decode(data: &[u8], limits: &Limits) -> Result<Picture> {
-    decode_inner(data, limits, &mut || Ok(())).map(|(p, _)| p)
+/// A decoded frame kept for output and later as a warping reference: float planes
+/// at their stored resolution, quantized to the bitdepth grid (upstream `FrameData`).
+struct DecodedFrame {
+    planes: Vec<Vec<f32>>,
+    plane_dims: Vec<(u32, u32)>,
+    bitdepth: u32,
+    data_type: FrameDataType,
 }
 
-/// Like [`decode`], also returning the decoded latents and the unquantized synthesis output.
-pub fn decode_with_details(data: &[u8], limits: &Limits) -> Result<(Picture, DecodeDetails)> {
-    decode_inner(data, limits, &mut || Ok(()))
+impl DecodedFrame {
+    /// Integer samples (`round(x · (2^b - 1))`), one plane per channel.
+    fn to_picture(&self) -> Picture {
+        let max = ((1u32 << self.bitdepth) - 1) as f32;
+        Picture {
+            width: self.plane_dims[0].0,
+            height: self.plane_dims[0].1,
+            bitdepth: self.bitdepth,
+            data_type: self.data_type,
+            planes: self
+                .planes
+                .iter()
+                .map(|p| p.iter().map(|&v| libm::rintf(v * max) as u16).collect())
+                .collect(),
+            plane_dims: self.plane_dims.clone(),
+        }
+    }
 }
 
-#[cfg(feature = "zencodec")]
-pub(crate) fn decode_checked(
-    data: &[u8],
-    limits: &Limits,
-    stop: &dyn enough::Stop,
-) -> Result<Picture> {
-    decode_inner(data, limits, &mut || stop.check().map_err(Error::from)).map(|(p, _)| p)
+/// Cool-chic internals of one frame, kept for oracle inspection (upstream drops them).
+struct FrameAux {
+    grids: Vec<Grid>,
+    is_hyperlatent: Vec<bool>,
+    /// Residue synthesis output before the reconstruction tail, `[c][h][w]`.
+    raw: Planes,
 }
 
-fn decode_inner(
-    data: &[u8],
-    limits: &Limits,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<(Picture, DecodeDetails)> {
-    check()?;
-    let (vh, rest) = VideoHeader::parse(data)?;
-    if vh.n_frames > limits.max_frames {
-        return Err(Error::LimitExceeded("frames"));
-    }
-    if vh.n_frames != 1 {
-        return Err(Error::Unsupported("video (more than one frame)"));
-    }
-    let (fh, rest) = FrameHeader::parse(rest)?;
-    if fh.frame_type != FrameType::I {
-        return Err(Error::Unsupported("inter frames"));
-    }
-    let (raw, grids, hyper, _rest) = decode_coolchic(rest, limits, check)?;
-    if raw.c < 3 {
+/// The shared reconstruction tail of upstream `decode_frame`: quantize the
+/// synthesized image to the bitdepth grid, downsample to 4:2:0 when asked,
+/// clamp, quantize once more — the stored `FrameData`.
+fn finish_frame(decoded: &Planes, fh: &FrameHeader) -> Result<DecodedFrame> {
+    if decoded.c < 3 {
         return Err(Error::Invalid("synthesis has fewer than 3 output channels"));
     }
     let max = ((1u32 << fh.bitdepth) - 1) as f32;
-    let (h, w) = (raw.h, raw.w);
+    let (h, w) = (decoded.h, decoded.w);
     let n = h * w;
     // round((2^b - 1) · x) / (2^b - 1) on the frame
-    let mut img: Vec<f32> = raw.data[..3 * n]
+    let mut img: Vec<f32> = decoded.data[..3 * n]
         .iter()
         .map(|&v| quantize(v, max))
         .collect();
@@ -711,28 +714,264 @@ fn decode_inner(
         }
         FrameDataType::Flow => return Err(Error::Unsupported("flow frames")),
     };
-    // Second quantization pass, then integer samples (`round(x · (2^b - 1))`).
-    let planes: Vec<Vec<u16>> = planes_f
+    // Second quantization pass onto the bitdepth grid.
+    let planes: Vec<Vec<f32>> = planes_f
         .into_iter()
-        .map(|p| {
-            p.into_iter()
-                .map(|v| libm::rintf(quantize(v, max) * max) as u16)
-                .collect()
-        })
+        .map(|p| p.into_iter().map(|v| quantize(v, max)).collect())
         .collect();
-    let picture = Picture {
-        width: w as u32,
-        height: h as u32,
-        bitdepth: fh.bitdepth,
-        data_type: fh.frame_data_type,
+    Ok(DecodedFrame {
         planes,
         plane_dims: dims,
-    };
+        bitdepth: fh.bitdepth,
+        data_type: fh.frame_data_type,
+    })
+}
+
+/// Decodes the first frame of a Cool-chic bitstream (an image).
+pub fn decode(data: &[u8], limits: &Limits) -> Result<Picture> {
+    decode_inner(data, limits, &mut || Ok(())).map(|(p, _)| p)
+}
+
+/// Decodes every frame of a Cool-chic bitstream, in display order (upstream
+/// `decode_video`). `limits.max_frames` caps the number of frames read.
+pub fn decode_video(data: &[u8], limits: &Limits) -> Result<Vec<Picture>> {
+    decode_video_inner(data, limits, false, &mut || Ok(()))
+        .map(|(frames, _)| frames.iter().map(DecodedFrame::to_picture).collect())
+}
+
+/// Like [`decode`], also returning the decoded latents and the unquantized synthesis output.
+pub fn decode_with_details(data: &[u8], limits: &Limits) -> Result<(Picture, DecodeDetails)> {
+    decode_inner(data, limits, &mut || Ok(()))
+}
+
+#[cfg(feature = "zencodec")]
+pub(crate) fn decode_checked(
+    data: &[u8],
+    limits: &Limits,
+    stop: &dyn enough::Stop,
+) -> Result<Picture> {
+    decode_inner(data, limits, &mut || stop.check().map_err(Error::from)).map(|(p, _)| p)
+}
+
+fn decode_inner(
+    data: &[u8],
+    limits: &Limits,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<(Picture, DecodeDetails)> {
+    let (frames, aux) = decode_video_inner(data, limits, true, check)?;
+    let aux = aux.ok_or(Error::Invalid("no frames"))?;
     let latents = DecodeDetails {
-        grids: grids.into_iter().map(|g| (g.h, g.w, g.data)).collect(),
-        is_hyperlatent: hyper,
-        raw_channels: raw.c,
-        raw: raw.data,
+        grids: aux.grids.into_iter().map(|g| (g.h, g.w, g.data)).collect(),
+        is_hyperlatent: aux.is_hyperlatent,
+        raw_channels: aux.raw.c,
+        raw: aux.raw.data,
     };
-    Ok((picture, latents))
+    Ok((frames[0].to_picture(), latents))
+}
+
+/// Decodes all frames in coding order (upstream `decode_video` + `decode_frame`),
+/// returning them in display order. `single_frame` selects the still-image API:
+/// streams with more than one frame are rejected, and the frame's internals are
+/// returned for [`decode_with_details`].
+fn decode_video_inner(
+    data: &[u8],
+    limits: &Limits,
+    single_frame: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<(Vec<DecodedFrame>, Option<FrameAux>)> {
+    check()?;
+    let (vh, rest) = VideoHeader::parse(data)?;
+    if vh.n_frames > limits.max_frames {
+        return Err(Error::LimitExceeded("frames"));
+    }
+    if single_frame && vh.n_frames != 1 {
+        return Err(Error::Unsupported("video (more than one frame)"));
+    }
+    let structure = vh.coding_structure()?;
+    let n = vh.n_frames as usize;
+    let mut frames: Vec<Option<DecodedFrame>> = Vec::new();
+    frames.resize_with(n, || None);
+    let mut aux = None;
+    let mut rest = rest;
+    for sf in &structure {
+        check()?;
+        let (fh, r) = FrameHeader::parse(rest)?;
+        rest = r;
+        // The frame header repeats what the coding structure already says;
+        // upstream uses the structure, so a mismatch means a corrupt stream.
+        let frame_type = match sf.index_references.len() {
+            0 => FrameType::I,
+            1 => FrameType::P,
+            _ => FrameType::B,
+        };
+        if fh.display_index != sf.display_order
+            || fh.frame_type != frame_type
+            || fh.index_references != sf.index_references
+        {
+            return Err(Error::Invalid(
+                "frame header does not match the coding structure",
+            ));
+        }
+        if fh.frame_type != FrameType::I {
+            return Err(Error::Unsupported("inter frames"));
+        }
+        let (raw, grids, hyper, r) = decode_coolchic(rest, limits, check)?;
+        rest = r;
+        let frame = finish_frame(&raw, &fh)?;
+        frames[sf.display_order as usize] = Some(frame);
+        if single_frame {
+            aux = Some(FrameAux {
+                grids,
+                is_hyperlatent: hyper,
+                raw,
+            });
+        }
+    }
+    // A valid structure covers every display position exactly once.
+    let frames = frames
+        .into_iter()
+        .map(|f| f.ok_or(Error::Invalid("uncoded display position")))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((frames, aux))
+}
+
+#[cfg(all(test, feature = "encoder"))]
+mod tests {
+    use super::*;
+    use crate::header::{FrameType, VideoHeader};
+    use alloc::vec;
+
+    /// Two independently encoded frames assembled into one all-intra stream.
+    fn two_frame_stream(display_a: u32, display_b: u32) -> (Vec<u8>, Picture, Picture) {
+        let opt = crate::unstable::TrainOptions {
+            arch: 3,
+            n_itr: 2000,
+            rdoq: false,
+            ..Default::default()
+        };
+        let rgb_a: Vec<u8> = (0..16 * 16)
+            .map(|i| (i % 256) as u8)
+            .flat_map(|v| [v, 255 - v, 128])
+            .collect();
+        let rgb_b: Vec<u8> = (0..16 * 16)
+            .map(|i| (i % 64) as u8)
+            .flat_map(|v| [200, v, v])
+            .collect();
+        let a = crate::unstable::encode_rgb8(&rgb_a, 16, 16, &opt, &mut |_| {}).unwrap();
+        let b = crate::unstable::encode_rgb8(&rgb_b, 16, 16, &opt, &mut |_| {}).unwrap();
+        let frame = |data: &[u8], display: u32| {
+            let (_vh, rest) = VideoHeader::parse(data).unwrap();
+            let (mut fh, payload) = FrameHeader::parse(rest).unwrap();
+            fh.display_index = display;
+            let mut out = fh.to_bytes();
+            out.extend_from_slice(payload);
+            out
+        };
+        let vh = VideoHeader {
+            n_frames: 2,
+            intra_pos: vec![0, 1],
+            p_pos: Vec::new(),
+        };
+        let mut stream = vh.to_bytes();
+        stream.extend_from_slice(&frame(&a.bitstream, display_a));
+        stream.extend_from_slice(&frame(&b.bitstream, display_b));
+        let pa = decode(&a.bitstream, &Limits::default()).unwrap();
+        let pb = decode(&b.bitstream, &Limits::default()).unwrap();
+        (stream, pa, pb)
+    }
+
+    #[test]
+    fn two_intra_frames_decode_in_display_order() {
+        let (stream, pa, pb) = two_frame_stream(0, 1);
+        let pics = decode_video(
+            &stream,
+            &Limits {
+                max_frames: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].planes, pa.planes);
+        assert_eq!(pics[1].planes, pb.planes);
+    }
+
+    #[test]
+    fn multi_frame_stream_is_rejected_by_decode() {
+        let (stream, _, _) = two_frame_stream(0, 1);
+        // `decode` is the still-image API: a video stream is not an image.
+        assert!(matches!(
+            decode(
+                &stream,
+                &Limits {
+                    max_frames: 8,
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        // And a frame cap below the stream's count is a limits error.
+        assert!(matches!(
+            decode_video(&stream, &Limits::default()),
+            Err(Error::LimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn frame_header_must_match_the_coding_structure() {
+        let (stream, _, _) = two_frame_stream(0, 7);
+        // Structure says the second frame has display index 1; the header says 7.
+        assert!(matches!(
+            decode_video(
+                &stream,
+                &Limits {
+                    max_frames: 8,
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn inter_frames_are_still_unsupported() {
+        let (stream, _, _) = two_frame_stream(0, 1);
+        // Take frame 0 from the real stream, then append a P-frame header.
+        let (_vh, rest) = VideoHeader::parse(&stream).unwrap();
+        let (_fh, r1) = FrameHeader::parse(rest).unwrap();
+        let (ch, r2) = CoolChicHeader::parse(r1).unwrap();
+        let payload = ch.nn_n_bytes as usize + ch.n_bytes_latent as usize;
+        // `r2` spans frame 0's payload plus the rest of the stream.
+        let frame0_end = stream.len() - (r2.len() - payload);
+        let frame0_start = stream.len() - rest.len();
+        let mut video = VideoHeader {
+            n_frames: 2,
+            intra_pos: vec![0],
+            p_pos: vec![1],
+        }
+        .to_bytes();
+        video.extend_from_slice(&stream[frame0_start..frame0_end]);
+        video.extend_from_slice(
+            &FrameHeader {
+                display_index: 1,
+                frame_type: FrameType::P,
+                frame_data_type: FrameDataType::Rgb,
+                bitdepth: 8,
+                index_references: vec![0],
+                global_flow: vec![0, 0],
+                warp_filter_size: Some(4),
+            }
+            .to_bytes(),
+        );
+        assert!(matches!(
+            decode_video(
+                &video,
+                &Limits {
+                    max_frames: 8,
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Unsupported(_))
+        ));
+    }
 }

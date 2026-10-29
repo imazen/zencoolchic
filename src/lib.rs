@@ -39,6 +39,6 @@ pub mod unstable;
 #[cfg(feature = "encoder")]
 mod write;
 
-pub use decode::{DecodeDetails, Limits, Picture, decode, decode_with_details};
+pub use decode::{DecodeDetails, Limits, Picture, decode, decode_video, decode_with_details};
 pub use error::{Error, Result};
 pub use header::FrameDataType;

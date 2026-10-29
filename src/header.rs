@@ -109,6 +109,100 @@ fn take<'a>(data: &'a [u8], n_bytes_header: u32, what: &'static str) -> Result<&
     Ok(&data[n..])
 }
 
+/// One frame of the coding structure, in coding order (upstream `Frame`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StructFrame {
+    /// Position in display order.
+    pub display_order: u32,
+    /// Reference display indices, sorted: none = I-frame, one = P, two = B.
+    pub index_references: Vec<u32>,
+}
+
+impl VideoHeader {
+    /// Rebuilds the frame order and references implied by `intra_pos` / `p_pos`
+    /// (upstream `CodingStructure.compute_coding_struct`): intra frames first in
+    /// list order, then P frames each referencing the closest frame before them,
+    /// then hierarchical B frames filling the gaps from smallest display index.
+    ///
+    /// Stricter than upstream on malformed headers (it asserts, or silently builds
+    /// a corrupt structure): positions must be unique, inside `0..n_frames`, and
+    /// disjoint across the two lists; the first and last display positions must be
+    /// intra or P so every B frame has both a past and a future reference.
+    pub(crate) fn coding_structure(&self) -> Result<Vec<StructFrame>> {
+        let n = self.n_frames as usize;
+        if n == 0 {
+            return Err(Error::Invalid("empty coding structure"));
+        }
+        // Upstream sorts the positions before building the structure.
+        let mut intra_pos = self.intra_pos.clone();
+        let mut p_pos = self.p_pos.clone();
+        intra_pos.sort_unstable();
+        p_pos.sort_unstable();
+        if intra_pos.first() != Some(&0) {
+            return Err(Error::Invalid("first frame must be intra"));
+        }
+        // Display positions already occupied, first by I/P frames then by B frames.
+        let mut covered = alloc::vec![false; n];
+        for &p in intra_pos.iter().chain(&p_pos) {
+            let i = p as usize;
+            if i >= n {
+                return Err(Error::Invalid("frame position out of range"));
+            }
+            if covered[i] {
+                return Err(Error::Invalid("frame position listed twice"));
+            }
+            covered[i] = true;
+        }
+        if !covered[n - 1] {
+            return Err(Error::Invalid("last frame must be intra or P"));
+        }
+        let past = |frames: &[StructFrame], i: u32| {
+            frames
+                .iter()
+                .filter(|f| f.display_order < i)
+                .map(|f| f.display_order)
+                .max()
+        };
+        let future = |frames: &[StructFrame], i: u32| {
+            frames
+                .iter()
+                .filter(|f| f.display_order > i)
+                .map(|f| f.display_order)
+                .min()
+        };
+        let mut frames = Vec::with_capacity(n);
+        for &d in &intra_pos {
+            frames.push(StructFrame {
+                display_order: d,
+                index_references: Vec::new(),
+            });
+        }
+        for &d in &p_pos {
+            let r = past(&frames, d).ok_or(Error::Invalid("P frame without a reference"))?;
+            frames.push(StructFrame {
+                display_order: d,
+                index_references: alloc::vec![r],
+            });
+        }
+        while frames.len() < n {
+            // Upstream scans display positions in order and closes the first gap it
+            // finds at its midpoint, then rescans from the start.
+            let i = (0..self.n_frames)
+                .find(|&i| !covered[i as usize])
+                .ok_or(Error::Invalid("coding structure does not fill"))?;
+            let p = past(&frames, i).ok_or(Error::Invalid("B frame without past reference"))?;
+            let f = future(&frames, i).ok_or(Error::Invalid("B frame without future reference"))?;
+            let mid = p + (f - p) / 2;
+            frames.push(StructFrame {
+                display_order: mid,
+                index_references: alloc::vec![p, f],
+            });
+            covered[mid as usize] = true;
+        }
+        Ok(frames)
+    }
+}
+
 impl VideoHeader {
     /// Parses the header and returns it with the remaining bytes.
     pub fn parse(data: &[u8]) -> Result<(Self, &[u8])> {
@@ -443,5 +537,110 @@ impl CoolChicHeader {
             v.bits(l.relu as u64, 1);
         }
         assemble(f, v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn structure(n_frames: u32, intra_pos: &[u32], p_pos: &[u32]) -> Result<Vec<StructFrame>> {
+        VideoHeader {
+            n_frames,
+            intra_pos: intra_pos.to_vec(),
+            p_pos: p_pos.to_vec(),
+        }
+        .coding_structure()
+    }
+
+    fn shape(frames: &[StructFrame]) -> Vec<(u32, Vec<u32>)> {
+        frames
+            .iter()
+            .map(|f| (f.display_order, f.index_references.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn coding_structure_matches_upstream_gops() {
+        // Coding orders and references checked against upstream
+        // `CodingStructure.compute_coding_struct`.
+        assert_eq!(shape(&structure(1, &[0], &[]).unwrap()), vec![(0, vec![])]);
+        assert_eq!(
+            shape(&structure(3, &[0, 1, 2], &[]).unwrap()),
+            vec![(0, vec![]), (1, vec![]), (2, vec![])]
+        );
+        // Closed GOP: I0, P8, then hierarchical B frames.
+        assert_eq!(
+            shape(&structure(9, &[0], &[8]).unwrap()),
+            vec![
+                (0, vec![]),
+                (8, vec![0]),
+                (4, vec![0, 8]),
+                (2, vec![0, 4]),
+                (1, vec![0, 2]),
+                (3, vec![2, 4]),
+                (6, vec![4, 8]),
+                (5, vec![4, 6]),
+                (7, vec![6, 8]),
+            ]
+        );
+        // Low-delay P.
+        assert_eq!(
+            shape(&structure(5, &[0], &[1, 2, 3, 4]).unwrap()),
+            vec![
+                (0, vec![]),
+                (1, vec![0]),
+                (2, vec![1]),
+                (3, vec![2]),
+                (4, vec![3]),
+            ]
+        );
+        // A less regular structure.
+        assert_eq!(
+            shape(&structure(8, &[0], &[4, 7]).unwrap()),
+            vec![
+                (0, vec![]),
+                (4, vec![0]),
+                (7, vec![4]),
+                (2, vec![0, 4]),
+                (1, vec![0, 2]),
+                (3, vec![2, 4]),
+                (5, vec![4, 7]),
+                (6, vec![5, 7]),
+            ]
+        );
+        assert_eq!(
+            shape(&structure(9, &[0], &[6, 8]).unwrap()),
+            vec![
+                (0, vec![]),
+                (6, vec![0]),
+                (8, vec![6]),
+                (3, vec![0, 6]),
+                (1, vec![0, 3]),
+                (2, vec![1, 3]),
+                (4, vec![3, 6]),
+                (5, vec![4, 6]),
+                (7, vec![6, 8]),
+            ]
+        );
+        // Positions are sorted first (upstream __post_init__).
+        assert_eq!(
+            shape(&structure(3, &[2, 0, 1], &[]).unwrap()),
+            vec![(0, vec![]), (1, vec![]), (2, vec![])]
+        );
+    }
+
+    #[test]
+    fn coding_structure_rejects_malformed_headers() {
+        // Upstream asserts or produces a corrupt structure on all of these.
+        assert!(structure(0, &[0], &[]).is_err());
+        assert!(structure(2, &[], &[0]).is_err()); // no intra frame at all
+        assert!(structure(2, &[1], &[]).is_err()); // first frame not intra
+        assert!(structure(4, &[0], &[]).is_err()); // last frame neither intra nor P
+        assert!(structure(4, &[0, 0, 3], &[]).is_err()); // duplicate intra
+        assert!(structure(4, &[0, 3], &[3]).is_err()); // intra ∩ p
+        assert!(structure(4, &[0, 3], &[7]).is_err()); // position out of range
+        assert!(structure(4, &[0, 3], &[5]).is_err()); // P position out of range
     }
 }
