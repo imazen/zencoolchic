@@ -207,7 +207,10 @@ impl Conv {
     pub(crate) fn forward(&self, x: &Planes) -> Planes {
         debug_assert_eq!(x.c, self.c_in);
         let (h, w, k) = (x.h, x.w, self.k);
-        let p = k / 2;
+        // Upstream `SynthesisConv2d` pads by `(k-1)//2`, so an even kernel shrinks
+        // the output by one pixel per spatial dimension.
+        let p = (k - 1) / 2;
+        let (oh, ow) = (h + 2 * p + 1 - k, w + 2 * p + 1 - k);
         let pw = w + 2 * p;
         // Replicate-padded inputs, once per layer (1×1 convs read the planes directly).
         let padded: Vec<Vec<f32>> = if k == 1 {
@@ -217,9 +220,9 @@ impl Conv {
                 .map(|i| pad_plane(x.plane(i), h, w, p, true))
                 .collect()
         };
-        let mut out = Planes::zeros(self.c_out, h, w);
+        let mut out = Planes::zeros(self.c_out, oh, ow);
         for o in 0..self.c_out {
-            let dst = &mut out.data[o * h * w..(o + 1) * h * w];
+            let dst = &mut out.data[o * oh * ow..(o + 1) * oh * ow];
             dst.fill(self.bias[o]);
             for i in 0..self.c_in {
                 let wk = &self.weight[(o * self.c_in + i) * k * k..(o * self.c_in + i + 1) * k * k];
@@ -228,17 +231,18 @@ impl Conv {
                     continue;
                 }
                 let src = &padded[i];
-                for y in 0..h {
-                    let drow = &mut dst[y * w..(y + 1) * w];
+                for y in 0..oh {
+                    let drow = &mut dst[y * ow..(y + 1) * ow];
                     for ky in 0..k {
                         let row = &src[(y + ky) * pw..(y + ky + 1) * pw];
                         for kx in 0..k {
-                            crate::simd::axpy(drow, wk[ky * k + kx], &row[kx..kx + w]);
+                            crate::simd::axpy(drow, wk[ky * k + kx], &row[kx..kx + ow]);
                         }
                     }
                 }
             }
             if self.residual {
+                debug_assert_eq!((oh, ow), (h, w));
                 for (d, s) in dst.iter_mut().zip(x.plane(o)) {
                     *d += *s;
                 }
@@ -273,6 +277,9 @@ impl Synthesis {
                 data: x.data[..n_in * x.h * x.w].to_vec(),
             };
             let s = st.forward(&sub);
+            // The 1×1 stabiliser keeps input size: it can only be added when no
+            // layer shrank the stack (even kernels are refused with a stabiliser).
+            debug_assert_eq!(s.data.len(), cur.data.len());
             for (d, v) in cur.data.iter_mut().zip(&s.data) {
                 *d += *v;
             }
@@ -605,5 +612,57 @@ impl CommonNoise {
             *v = self.grand() as f32;
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn conv_even_kernel_shrinks_by_one() {
+        // Upstream `SynthesisConv2d` uses pad=(k-1)//2: for k=2 that is no
+        // padding at all, i.e. a valid 2×2 convolution over the 3×3 input.
+        let c = Conv {
+            c_in: 1,
+            c_out: 1,
+            k: 2,
+            weight: vec![1.0; 4],
+            bias: vec![0.0],
+            residual: false,
+        };
+        let x = Planes {
+            c: 1,
+            h: 3,
+            w: 3,
+            data: (1..=9).map(|v| v as f32).collect(),
+        };
+        let out = c.forward(&x);
+        assert_eq!((out.h, out.w), (2, 2));
+        assert_eq!(out.data, vec![12.0, 16.0, 24.0, 28.0]);
+    }
+
+    #[test]
+    fn conv_even_kernel_replicate_pad() {
+        // k=4 pads one pixel and still shrinks by one: out = h+2·1-4+1 = h-1.
+        let c = Conv {
+            c_in: 1,
+            c_out: 1,
+            k: 4,
+            weight: vec![1.0; 16],
+            bias: vec![0.0],
+            residual: false,
+        };
+        let x = Planes {
+            c: 1,
+            h: 3,
+            w: 3,
+            data: (1..=9).map(|v| v as f32).collect(),
+        };
+        let out = c.forward(&x);
+        assert_eq!((out.h, out.w), (2, 2));
+        // Hand-computed sums of the 4×4 windows over the replicate-padded input.
+        assert_eq!(out.data, vec![64.0, 72.0, 88.0, 96.0]);
     }
 }

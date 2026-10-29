@@ -202,16 +202,20 @@ fn shapes(h: &CoolChicHeader, a: &Arch) -> Result<Shapes> {
         return Err(Error::Invalid("synthesis has no layers"));
     }
     let syn_layers = nn::layer_dims(a.input_feature_synthesis, &h.layers_synthesis);
-    for &(ci, co, k) in &syn_layers {
-        if k % 2 != 1 {
-            return Err(Error::Unsupported("even synthesis kernel"));
+    for (l, &(ci, co, k)) in h.layers_synthesis.iter().zip(&syn_layers) {
+        if k == 0 || (k % 2 == 0 && l.residual) {
+            // Upstream: pad=(k-1)//2 — k=0 underflows, and an even kernel shrinks
+            // the output by one so `y + x` broadcast-fails on a residual layer.
+            return Err(Error::Invalid("synthesis kernel size"));
         }
-        let _ = (ci, co);
-    }
-    for (l, &(ci, co, _)) in h.layers_synthesis.iter().zip(&syn_layers) {
         if l.residual && ci != co {
             return Err(Error::Invalid("residual synthesis layer changes width"));
         }
+    }
+    if h.linear_stabiliser_synth && syn_layers.iter().any(|&(.., k)| k % 2 == 0) {
+        // The 1×1 stabiliser output keeps input size; adding it to a shrunk
+        // stack fails upstream's broadcast too.
+        return Err(Error::Invalid("even synthesis kernel with stabiliser"));
     }
     let syn_out = h.layers_synthesis.last().unwrap().out_ft as usize;
     let syn_stab_in = h
@@ -550,7 +554,7 @@ fn code_latents_checked(
     Ok(grids.into_iter().map(|g| g.unwrap()).collect())
 }
 
-fn synthesize(h: &CoolChicHeader, a: &Arch, nets: &Networks, grids: &[Grid]) -> Planes {
+fn synthesize(h: &CoolChicHeader, a: &Arch, nets: &Networks, grids: &[Grid]) -> Result<Planes> {
     let latents: Vec<Planes> = grids
         .iter()
         .zip(&a.is_hyperlatent)
@@ -579,8 +583,21 @@ fn synthesize(h: &CoolChicHeader, a: &Arch, nets: &Networks, grids: &[Grid]) -> 
         cat.data[n0..].copy_from_slice(&ups.data);
         syn_in = cat;
     }
+    // Each even synthesis kernel removes one pixel per spatial dimension
+    // (upstream pad=(k-1)//2); below one pixel there is nothing left to decode.
+    let shrink = nets
+        .synthesis
+        .layers
+        .iter()
+        .filter(|(c, _)| c.k % 2 == 0)
+        .count();
+    if syn_in.h <= shrink || syn_in.w <= shrink {
+        return Err(Error::Invalid(
+            "even synthesis kernels shrink image below one pixel",
+        ));
+    }
     let out = nets.synthesis.forward(&syn_in);
-    nn::resize(&out, ih, iw, h.final_upsampling, Scale::Size)
+    Ok(nn::resize(&out, ih, iw, h.final_upsampling, Scale::Size))
 }
 
 /// Decodes one Cool-chic payload: returns the synthesis output (`[c][H][W]`, float, not
@@ -614,7 +631,7 @@ pub(crate) fn decode_coolchic<'a>(
     check()?;
     let grids = decode_latents(&h, &a, &nets, lat_bytes, check)?;
     check()?;
-    let out = synthesize(&h, &a, &nets, &grids);
+    let out = synthesize(&h, &a, &nets, &grids)?;
     check()?;
     Ok((out, grids, a.is_hyperlatent, rest))
 }
@@ -1030,6 +1047,87 @@ fn decode_video_inner(
         .map(|a| a.ok_or(Error::Invalid("uncoded display position")))
         .collect::<Result<Vec<_>>>()?;
     Ok((frames, aux))
+}
+
+#[cfg(test)]
+mod stream_variants {
+    use super::*;
+    use crate::header::VideoHeader;
+
+    /// Upstream-encoded stream with two even (k=2) synthesis kernels
+    /// (`--layers_synthesis_residue 8-2-linear-relu,3-2-linear-none` style arch);
+    /// upstream v5.0.1 decodes it bit-identically to us.
+    const EVENK: &[u8] = include_bytes!("../fuzz/seeds/evenk64_debug.cool");
+    /// Same stream with the 2-bit `final_upsampling` field flipped to bilinear —
+    /// a format variant upstream's encoder never emits but its decoder accepts.
+    const EVENK_BILINEAR: &[u8] = include_bytes!("../fuzz/seeds/evenk64_bilinear_debug.cool");
+
+    fn fnv_planes(p: &Picture) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for pl in &p.planes {
+            for &v in pl {
+                for b in v.to_le_bytes() {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        h
+    }
+
+    fn evenk_cc_header() -> CoolChicHeader {
+        let (_vh, r) = VideoHeader::parse(EVENK).unwrap();
+        let (_fh, r) = FrameHeader::parse(r).unwrap();
+        CoolChicHeader::parse(r).unwrap().0
+    }
+
+    #[test]
+    fn decodes_even_synthesis_kernels() {
+        let h = evenk_cc_header();
+        assert!(h.layers_synthesis.iter().all(|l| l.k_size % 2 == 0));
+        let p = decode(EVENK, &Limits::default()).unwrap();
+        assert_eq!((p.width, p.height, p.bitdepth), (64, 64, 8));
+        assert_eq!(p.planes.len(), 3);
+        // Upstream's decode of this stream is bit-identical (max|Δ|=0 over all
+        // samples, verified against v5.0.1); this checksum pins that output.
+        assert_eq!(fnv_planes(&p), 0x3e19_4aee_c1f8_32cf);
+    }
+
+    #[test]
+    fn rejects_bad_synthesis_kernels() {
+        let shp = |h: &CoolChicHeader| shapes(h, &arch(h).unwrap());
+        let mut h = evenk_cc_header();
+        h.layers_synthesis[0].k_size = 0;
+        assert!(matches!(
+            shp(&h),
+            Err(Error::Invalid("synthesis kernel size"))
+        ));
+        let mut h = evenk_cc_header();
+        h.layers_synthesis[0].residual = true;
+        // An even kernel shrinks the layer output by one pixel, so `y + x`
+        // broadcast-fails upstream too.
+        assert!(matches!(
+            shp(&h),
+            Err(Error::Invalid("synthesis kernel size"))
+        ));
+        let mut h = evenk_cc_header();
+        h.linear_stabiliser_synth = true;
+        // The 1×1 stabiliser keeps input size and can't be added to a shrunk stack.
+        assert!(matches!(
+            shp(&h),
+            Err(Error::Invalid("even synthesis kernel with stabiliser"))
+        ));
+    }
+
+    #[test]
+    fn decodes_bilinear_final_upsampling() {
+        let p = decode(EVENK_BILINEAR, &Limits::default()).unwrap();
+        assert_eq!((p.width, p.height, p.bitdepth), (64, 64, 8));
+        // Bit-identical to upstream's decode of the same mutated stream.
+        assert_eq!(fnv_planes(&p), 0x951c_b758_96d0_4955);
+        // The mode took effect: bilinear differs from the bicubic decode.
+        let bicubic = decode(EVENK, &Limits::default()).unwrap();
+        assert!(p.planes.iter().zip(&bicubic.planes).any(|(a, b)| a != b));
+    }
 }
 
 #[cfg(all(test, feature = "encoder"))]
