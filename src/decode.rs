@@ -708,7 +708,7 @@ pub(crate) fn planes_to_444(
 
 impl DecodedFrame {
     /// Integer samples (`round(x · (2^b - 1))`), one plane per channel.
-    fn to_picture(&self) -> Picture {
+    pub(crate) fn to_picture(&self) -> Picture {
         let max = ((1u32 << self.bitdepth) - 1) as f32;
         Picture {
             width: self.plane_dims[0].0,
@@ -930,7 +930,7 @@ pub fn decode(data: &[u8], limits: &Limits) -> Result<Picture> {
 /// Decodes every frame of a Cool-chic bitstream, in display order (upstream
 /// `decode_video`). `limits.max_frames` caps the number of frames read.
 pub fn decode_video(data: &[u8], limits: &Limits) -> Result<Vec<Picture>> {
-    decode_video_inner(data, limits, false, &mut || Ok(()))
+    decode_video_inner(data, limits, false, false, &mut || Ok(()))
         .map(|(frames, _)| frames.iter().map(DecodedFrame::to_picture).collect())
 }
 
@@ -953,7 +953,7 @@ fn decode_inner(
     limits: &Limits,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<(Picture, DecodeDetails)> {
-    let (frames, aux) = decode_video_inner(data, limits, true, check)?;
+    let (frames, aux) = decode_video_inner(data, limits, true, true, check)?;
     let aux = aux.into_iter().next().ok_or(Error::Invalid("no frames"))?;
     let latents = DecodeDetails {
         grids: aux
@@ -969,35 +969,88 @@ fn decode_inner(
     Ok((frames[0].to_picture(), latents))
 }
 
-/// Decodes all frames in coding order (upstream `decode_video` + `decode_frame`),
-/// returning them in display order. `single_frame` selects the still-image API:
-/// streams with more than one frame are rejected, and the frame's internals are
-/// returned for [`decode_with_details`].
-fn decode_video_inner(
-    data: &[u8],
-    limits: &Limits,
-    single_frame: bool,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<(Vec<DecodedFrame>, Vec<FrameAux>)> {
-    check()?;
-    let (vh, rest) = VideoHeader::parse(data)?;
-    if vh.n_frames > limits.max_frames {
-        return Err(Error::LimitExceeded("frames"));
+/// Incremental video decoder (upstream `decode_video` + `decode_frame`): the
+/// header and coding structure are parsed at construction and each [`step`]
+/// decodes one frame in coding order. Frames are stored display-indexed — they
+/// double as P/B references — so a caller may pull display-order frames as they
+/// become available via [`pull_display`]. `D` is the stream carrier: a slice for
+/// borrowed input, an owned `Vec<u8>` for a self-contained (e.g. `'static`)
+/// decoder.
+///
+/// [`step`]: Self::step
+/// [`pull_display`]: Self::pull_display
+pub(crate) struct VideoDecoder<D> {
+    data: D,
+    /// Offset into `data` of the next frame header.
+    rest: usize,
+    structure: Vec<crate::header::StructFrame>,
+    /// Next coding-order position to decode.
+    pos: usize,
+    frames: Vec<Option<DecodedFrame>>,
+    /// Per-frame internals for `decode_with_details`; kept empty when not collected.
+    aux: Vec<Option<FrameAux>>,
+    limits: Limits,
+}
+
+impl<D: AsRef<[u8]>> VideoDecoder<D> {
+    /// Parses the video header and builds the coding structure. `single_frame`
+    /// selects the still-image contract (a multi-frame stream is rejected).
+    /// `collect_aux` keeps per-frame internals for `decode_with_details`/oracle
+    /// tests; video decodes pass `false` so latents aren't kept after use.
+    pub(crate) fn new(
+        data: D,
+        limits: &Limits,
+        single_frame: bool,
+        collect_aux: bool,
+    ) -> Result<Self> {
+        let (vh, rest) = VideoHeader::parse(data.as_ref())?;
+        if vh.n_frames > limits.max_frames {
+            return Err(Error::LimitExceeded("frames"));
+        }
+        if single_frame && vh.n_frames != 1 {
+            return Err(Error::Unsupported("video (more than one frame)"));
+        }
+        let structure = vh.coding_structure()?;
+        let n = vh.n_frames as usize;
+        let rest = data.as_ref().len() - rest.len();
+        let mut frames = Vec::new();
+        frames.resize_with(n, || None);
+        let mut aux = Vec::new();
+        if collect_aux {
+            aux.resize_with(n, || None);
+        }
+        Ok(Self {
+            data,
+            rest,
+            structure,
+            pos: 0,
+            frames,
+            aux,
+            limits: *limits,
+        })
     }
-    if single_frame && vh.n_frames != 1 {
-        return Err(Error::Unsupported("video (more than one frame)"));
+
+    /// Total declared frames.
+    #[cfg(feature = "zencodec")]
+    pub(crate) fn n_frames(&self) -> usize {
+        self.frames.len()
     }
-    let structure = vh.coding_structure()?;
-    let n = vh.n_frames as usize;
-    let mut frames: Vec<Option<DecodedFrame>> = Vec::new();
-    frames.resize_with(n, || None);
-    let mut aux: Vec<Option<FrameAux>> = Vec::new();
-    aux.resize_with(n, || None);
-    let mut rest = rest;
-    for sf in &structure {
+
+    /// The decoded frame at a display index, once its coding pass has run.
+    #[cfg(feature = "zencodec")]
+    pub(crate) fn frame(&self, display: usize) -> Option<&DecodedFrame> {
+        self.frames.get(display).and_then(|f| f.as_ref())
+    }
+
+    /// Decodes the next frame in coding order; `false` once all are decoded.
+    pub(crate) fn step(&mut self, check: &mut dyn FnMut() -> Result<()>) -> Result<bool> {
+        let Some(sf) = self.structure.get(self.pos) else {
+            return Ok(false);
+        };
         check()?;
-        let (fh, r) = FrameHeader::parse(rest)?;
-        rest = r;
+        let data = self.data.as_ref();
+        let (fh, r) = FrameHeader::parse(&data[self.rest..])?;
+        self.rest = data.len() - r.len();
         // The frame header repeats what the coding structure already says;
         // upstream uses the structure, so a mismatch means a corrupt stream.
         let frame_type = match sf.index_references.len() {
@@ -1013,40 +1066,93 @@ fn decode_video_inner(
                 "frame header does not match the coding structure",
             ));
         }
+        let display = sf.display_order as usize;
         match fh.frame_type {
             FrameType::I => {
-                let (raw, grids, hyper, r) = decode_coolchic(rest, limits, check)?;
-                rest = r;
-                let frame = finish_frame(&raw, &fh)?;
-                frames[sf.display_order as usize] = Some(frame);
-                aux[sf.display_order as usize] = Some(FrameAux {
-                    residue: CcAux {
-                        grids,
-                        is_hyperlatent: hyper,
-                        raw,
-                    },
-                    motion: None,
-                });
+                let (raw, grids, hyper, r) =
+                    decode_coolchic(&data[self.rest..], &self.limits, check)?;
+                self.rest = data.len() - r.len();
+                self.frames[display] = Some(finish_frame(&raw, &fh)?);
+                if let Some(slot) = self.aux.get_mut(display) {
+                    *slot = Some(FrameAux {
+                        residue: CcAux {
+                            grids,
+                            is_hyperlatent: hyper,
+                            raw,
+                        },
+                        motion: None,
+                    });
+                }
             }
             FrameType::P | FrameType::B => {
-                let (frame, f_aux, r) =
-                    decode_inter(&fh, &sf.index_references, rest, &frames, limits, check)?;
-                rest = r;
-                frames[sf.display_order as usize] = Some(frame);
-                aux[sf.display_order as usize] = Some(f_aux);
+                let (frame, f_aux, r) = decode_inter(
+                    &fh,
+                    &sf.index_references,
+                    &data[self.rest..],
+                    &self.frames,
+                    &self.limits,
+                    check,
+                )?;
+                self.rest = data.len() - r.len();
+                self.frames[display] = Some(frame);
+                if let Some(slot) = self.aux.get_mut(display) {
+                    *slot = Some(f_aux);
+                }
             }
         }
+        self.pos += 1;
+        Ok(true)
     }
-    // A valid structure covers every display position exactly once.
-    let frames = frames
-        .into_iter()
-        .map(|f| f.ok_or(Error::Invalid("uncoded display position")))
-        .collect::<Result<Vec<_>>>()?;
-    let aux = aux
-        .into_iter()
-        .map(|a| a.ok_or(Error::Invalid("uncoded display position")))
-        .collect::<Result<Vec<_>>>()?;
-    Ok((frames, aux))
+
+    /// Decodes coding-order frames until the frame at display index `display`
+    /// is available; `false` when the stream ends with it uncoded.
+    #[cfg(feature = "zencodec")]
+    pub(crate) fn pull_display(
+        &mut self,
+        display: usize,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        while self.pos < self.structure.len()
+            && self.frames.get(display).is_some_and(|f| f.is_none())
+        {
+            self.step(check)?;
+        }
+        Ok(self.frame(display).is_some())
+    }
+
+    /// Consumes the decoder once fully stepped, returning display-order frames
+    /// and (when collected) per-frame internals.
+    fn finish(self) -> Result<(Vec<DecodedFrame>, Vec<FrameAux>)> {
+        // A valid structure covers every display position exactly once.
+        let frames = self
+            .frames
+            .into_iter()
+            .map(|f| f.ok_or(Error::Invalid("uncoded display position")))
+            .collect::<Result<Vec<_>>>()?;
+        let aux = self
+            .aux
+            .into_iter()
+            .map(|a| a.ok_or(Error::Invalid("uncoded display position")))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((frames, aux))
+    }
+}
+
+/// Decodes all frames in coding order (upstream `decode_video` + `decode_frame`),
+/// returning them in display order. `single_frame` selects the still-image API:
+/// streams with more than one frame are rejected, and the frame's internals are
+/// returned for [`decode_with_details`].
+fn decode_video_inner(
+    data: &[u8],
+    limits: &Limits,
+    single_frame: bool,
+    collect_aux: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<(Vec<DecodedFrame>, Vec<FrameAux>)> {
+    check()?;
+    let mut dec = VideoDecoder::new(data, limits, single_frame, collect_aux)?;
+    while dec.step(check)? {}
+    dec.finish()
 }
 
 #[cfg(test)]
@@ -1301,7 +1407,7 @@ mod oracle {
                 max_frames: n_frames as u32,
                 ..Default::default()
             };
-            let (_, aux) = decode_video_inner(&data, &limits, false, &mut || Ok(())).unwrap();
+            let (_, aux) = decode_video_inner(&data, &limits, false, true, &mut || Ok(())).unwrap();
             for (i, fmeta) in meta["frames"].as_array().unwrap().iter().enumerate() {
                 let frame_type = fmeta["frame_type"].as_str().unwrap_or("I");
                 let mut ccs = vec![("residue", &aux[i].residue.raw)];
