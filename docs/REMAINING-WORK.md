@@ -63,13 +63,18 @@ headers.
   stabilisers, common randomness, half-resolution bicubic resize, YUV420 8-bit,
   YUV444 10-bit, and sinc-filter warping with global translation and B-frame
   bidirectional references.
-- [nearest/bilinear resize](../src/nn.rs) exists but lacks an independent frozen
-  upstream case. Add fixtures for these modes, higher-depth RGB and further YUV
-  boundary combinations. The trait tests' synthetic 16-bit path is not an
-  upstream 16-bit golden reference.
-- [decode::arch](../src/decode.rs) explicitly refuses even synthesis kernels.
-  Establish a valid upstream stream and its shape/padding behavior before
-  deciding how to extend that architecture path.
+- ~~nearest/bilinear resize + even synthesis kernels~~ done: [nn::resize](../src/nn.rs)
+  bilinear matches `F.interpolate(mode="bilinear", align_corners=False)`;
+  nearest is exercised by every motion payload in the `pb_128` oracle case.
+  [Conv::forward](../src/nn.rs) implements upstream's `pad=(k-1)//2` shrink —
+  each even kernel removes one pixel per spatial dimension, and even kernels are
+  refused on residual layers or with the 1×1 stabiliser (upstream broadcast-fails
+  there too). `evenk64_debug` (upstream-encoded, two k=2 layers) and
+  `evenk64_bilinear_debug` (same stream with `final_upsampling` re-tagged to
+  bilinear — a variant upstream's encoder never emits but its decoder accepts)
+  both decode bit-identically to upstream v5.0.1; pinned as fuzz seeds plus
+  [stream_variants](../src/decode.rs) checksum tests. The trait tests' synthetic
+  16-bit path is still not an upstream 16-bit golden reference.
 - SOAP's [rank-deficient eigenspaces](../src/train/soap.rs) have arbitrary bases.
   Full-rank/Adam cases retain their asserted trajectory bound; non-square
   trajectories are diagnostic. Read the tracked [null-space probe](../scripts/oracle/soap_null_space_probe.py)

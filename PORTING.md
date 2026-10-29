@@ -18,7 +18,7 @@ missing codec features, validation gaps, performance work and integration limits
 | Range decoder + leaky quantized Laplace | constriction 0.4.2 `queue.rs`, `quantize.rs` | done | latents bit-exact on 12 streams; exhaustive `exp` audit below |
 | Upsampling (train-mode kron kernels) | `component/core/upsampling.py` | done; SIMD AXPY | raw output max abs error ≤ 9.3e-7 (9.24e-7) on 12 streams |
 | Synthesis | `component/core/synthesis.py` | done; SIMD AXPY | as above |
-| Final resize (bicubic; nearest / bilinear ported) | `F.interpolate` | bicubic tested (`mid_lat1_debug`, latents from 1/2 resolution); nearest/bilinear implementations lack independent frozen upstream cases | `mid_lat1_debug` |
+| Final resize (nearest / bilinear / bicubic) | `F.interpolate` | bicubic: `mid_lat1_debug`; nearest: `pb_128` motion payloads; bilinear: `evenk64_bilinear_debug` (header-retagged upstream stream) — all bit-identical to upstream decode | `mid_lat1_debug`, `pb_128`, `evenk64_bilinear_debug` |
 | Common randomness | `component/core/noise.py` | done | `mid_wasserstein_debug` (`--tune wasserstein`): all samples identical |
 | YUV 4:2:0 / 4:4:4 output | `io/format/yuv.py` | done | `yuv420_8b_debug`, `yuv444_10b_debug` (10-bit) |
 | Multi-frame all-intra decode | `bitstream/decode.py::decode_video`, `utils/codingstructure.py` | done: `decode_video` returns frames in display order; coding structure rebuilt and cross-checked against each frame header | `multi_i` oracle case: three upstream-decoded frames (mixed RGB / 4:2:0, mixed sizes) bit-exact |
