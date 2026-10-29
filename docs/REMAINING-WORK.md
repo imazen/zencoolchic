@@ -130,8 +130,12 @@ Decode-side `max_memory_bytes` is honored via a pre-flight working-set estimate
 contexts, upsample/synthesis conv buffers, stored reference frames, output canvas —
 padded above the true peak, so passing decodes fit while rejected ones may only
 have been near their budget).
-Still refused: YUV output (`PixelDescriptor` has no YCbCr layout or subsampling carrier),
-animation encode, and encode-side memory budgets (the trainer peak — SOAP
+Animation encode is served: `push_frame` buffers RGB8 planes and `finish` trains
+the whole video with upstream's `intra_pos 0`, `p_pos <last>` GOP — Cool-chic is
+a whole-video codec, so there is no incremental encoding, and durations are
+dropped (the stream has no timing field).
+Still refused: YUV output (`PixelDescriptor` has no YCbCr layout or subsampling carrier)
+and encode-side memory budgets (the trainer peak — SOAP
 preconditioners, gradients, activations — is not bounded yet). RGB streams have no
 color metadata carrier; the bridge assumes sRGB. Fallible allocation coverage and
 finer cancellation granularity remain engineering work. Current cancellation checks
