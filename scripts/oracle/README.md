@@ -22,7 +22,18 @@ same bytes across Python/torch versions, devices or random generators.
   when judging this port; a different upstream revision is a different oracle.
 - `dump_grad.py`: seed 1234, deterministic algorithms, float64 reference mode;
   initial tensors and serialized outputs are F32. The dump includes targets,
-  uniform noise, parameters and gradients.
+  uniform noise, parameters and gradients. Its `wass` config uses the real
+  ImageNet VGG16 (a ~528 MB torchvision download on first use); `miniwass`
+  substitutes a deterministic ten-convolution miniature (seed 4242) whose flat
+  weights are embedded in the dump as `vgg` with `vgg_dims`, so the frozen
+  gradient case needs no external weights. Wasserstein dumps also store the
+  clamped `decoded` image, `tap{i}` features, `gtap{i}` tap gradients,
+  `grad_dec` (`d wasserstein/d decoded`), `wasserstein_per_tap` and
+  `dist_weight`.
+- `dump_vgg.py`: writes the real VGG16 `features[:23]` weights and biases as one
+  flat little-endian F32 file for `Vgg16::from_le_bytes`. Point
+  `ZENCOOLCHIC_VGG16` at that file for real-VGG gradient dumps; `TrainOptions::vgg`
+  takes the same bytes for `Tune::Wasserstein` encoding.
 - `dump_soap.py`: seed 7, initial parameters, fixed gradient steps and final
   parameters. Rank-deficient trajectory differences are explained by
   [soap_null_space_probe.py](soap_null_space_probe.py) and [PORTING.md](../../PORTING.md).
@@ -73,7 +84,7 @@ just oracle-all
 ```
 
 The explicit environment variables make tests use those raw dumps. All 12 decoder
-and three gradient cases are still required, and any additional cases are checked.
+and four gradient cases are still required, and any additional cases are checked.
 The checked-in compressed payloads are always tested for integrity independently
 of overrides. Unset the three override variables to test frozen references again.
 
@@ -95,6 +106,8 @@ Both refuse to replace an existing directory and verify hashes. The original
 compressed files and all six source inputs were restored, checked and repacked
 successfully on 2026-10-18. Repacking reproduced all 68 compressed payloads exactly
 on that environment. Original SHA-256s remain the primary reference identity.
+`small64_miniwass` was added on 2026-10-29 (70 payloads) with its own provenance
+above; the 68 older payloads are byte-identical.
 
 Do not point the packer at newly generated data while retaining an old manifest:
 it will reject changed hashes. Accepting a new golden set requires an intentional

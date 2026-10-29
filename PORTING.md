@@ -75,8 +75,9 @@ Reuse plan (user, 2026-10-17: reuse owned code, relicensed): zensim-train-core /
 | Piece | Upstream | Status | Evidence |
 |---|---|---|---|
 | Bitstream writer: range encoder, exp-Golomb encoder, headers | `bitstream/encode.py`, constriction encoder | done (`encoder` feature) | all 12 oracle streams re-encode byte for byte (`write::tests`) |
-| Training forward: quantizer (softround ∘ noise ∘ softround, Kumaraswamy), float ARM + IFCE, Laplace rate, train-mode upsampling, synthesis, MSE + λ·rate | `component/core/*.py`, `training/loss.py` | done; SIMD/rayon, full-resolution latents only | loss within 3e-8 of torch (`just grad`) |
-| Backward of all of the above | torch autograd | done; SIMD/rayon | vs float64 torch: worst relative gradient error 3.7e-4 (mid130×97 hop), 7.3e-4 (64×64 hop), 5.8e-4 (64×64 small); torch's own float32 pass is off by up to 1.4e-2 on the same tensors |
+| Training forward: quantizer (softround ∘ noise ∘ softround, Kumaraswamy), float ARM + IFCE, Laplace rate, train-mode upsampling, synthesis, common-randomness synthesis inputs, weighted MSE + λ·rate | `component/core/*.py`, `training/loss.py` | done; SIMD/rayon, full-resolution latents only | loss within 3e-8 of torch (`just grad`) |
+| Wasserstein distortion (`--tune wasserstein`: VGG16 feature taps, multiscale mean/std statistics, `dist = 0.2·mse + 0.004·wass`) | `training/metrics/wasserstein.py` | done; `src/train/wasserstein.rs`, real VGG16 flat weights (`dump_vgg.py`) or arbitrary (c_in, c_out) stacks | `small64_miniwass` below; note upstream's `safe_clamp_min` returns a detached tensor, so the `(σ_a − σ_b)²` term adds to the distance but carries no gradient — only the mean terms backpropagate |
+| Backward of all of the above | torch autograd | done; SIMD/rayon | vs float64 torch: worst relative gradient error 3.7e-4 (mid130×97 hop), 7.3e-4 (64×64 hop), 5.8e-4 (64×64 small), 2.8e-4 (64×64 miniwass, common randomness + Wasserstein; d wasserstein/d decoded rel 1.8e-7); torch's own float32 pass is off by up to 1.4e-2 on the same tensors |
 | SOAP optimizer (Adam mode for latents and 1-D tensors) | `training/soap.py` | done, scalar | vs upstream after 25 steps on fixed gradients (`just soap`): 20×20 weight 2.1e-4 of the parameter movement, 1-D 6.6e-7, latents 1.3e-6. Rank-deficient factors (non-square weights) are not comparable: upstream against itself with a rotated null-space basis differs by 1.6% (`scripts/oracle/soap_null_space_probe.py`); this port differs by 2.2% |
 | Training loop: grad clip 0.1, cosine LR, softround / noise schedules, patience, best-model restore; initializers; intra preset; 5 → 2 → 1 warm-up; lambda-dependent encoder gain | `training/train.py`, `presets.py`, `warmup.py`, `initialize_parameters` | done; parallel deterministic noise; RNG is not torch's | small64 (64×64), 2000 itr, λ 1e-3, hop, one seed each: upstream 33.808 dB / 0.5983 bpp latent / loss 1.0143e-3 in 20.7 s (torch CPU); this port 34.094 dB / 0.5949 bpp / 0.984e-3 in 25.8 s (1 thread, scalar). Not yet compared over several seeds or images |
 | Network quantization search (per module, every weight/bias step; exp-Golomb orders from upstream's bit estimate) | `nnquant/quantizemodel.py` | done; shared SIMD/rayon evaluation | small64 end to end (below) |
@@ -107,7 +108,10 @@ not separate the encoders; a multi-seed, multi-image comparison needs the faster
 
 The gradient check compares against a float64 run of upstream (`dump_grad.py ... f64`): the
 rate term `F(q + ½) − F(q − ½)` cancels badly in float32, so torch's float32 gradients are not
-a usable reference at 1e-3.
+a usable reference at 1e-3. The `miniwass` dump additionally stores the clamped decoded
+image, its VGG tap features, per-tap distances and tap/decoded-image gradients, so the
+test can assert each Wasserstein stage separately; its miniature extractor weights are
+embedded in the dump (`vgg`, `vgg_dims`).
 
 ## Reference environment
 

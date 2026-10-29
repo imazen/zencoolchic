@@ -10,9 +10,9 @@ cargo run --release --example encode --features encoder -- input.ppm output.cool
 
 The current direct entry points live in the doc-hidden `unstable` module and are experimental.
 The encoder accepts interleaved RGB8; it does not convert color. Use full-range sRGB input.
-It does not encode YUV, higher bit depths, common randomness / Wasserstein tuning,
-sub-full-resolution starting latents, or video. The decoder supports more stream tools than
-the encoder creates; see [the porting table](../PORTING.md#decoder).
+It does not encode YUV, higher bit depths, sub-full-resolution starting latents, or video.
+The decoder supports more stream tools than the encoder creates; see
+[the porting table](../PORTING.md#decoder).
 
 ## Settings
 
@@ -24,6 +24,15 @@ the encoder creates; see [the porting table](../PORTING.md#decoder).
 | `arch` | 1 (`hop`) | 0 `vhop`, 1 `hop`, 2 `mop`, 3 `lop` |
 | `seed` | 0 | Initialization and quantization-noise seed; the RNG differs from torch |
 | `rdoq` | true | Greedy rate-distortion refinement after network quantization |
+| `tune` | `Mse` | `unstable::Tune`: `Mse` (`{"mse": 1.0}`) or `Wasserstein` (upstream `--tune wasserstein`) |
+| `vgg` | none | Flat VGG16 feature weights (`scripts/oracle/dump_vgg.py`), required by `Tune::Wasserstein` |
+
+`Tune::Wasserstein` sets the distortion weights of the main and hard-round phases to
+`{"mse": 0.2, "wasserstein": 0.004}` and turns on the decoder's common-randomness
+synthesis channels (upstream: RGB only, warm-up stays MSE). The Wasserstein term runs
+a frozen VGG16 feature extractor over the clamped decoded image and the target and
+compares multiscale mean/std statistics; see `train::wasserstein`. The feature weights
+are a 528 MB external input, not a checked-in fixture.
 
 Architectures follow upstream's intra configurations. ARM spatial contexts are 20, 14, 10,
 6 respectively; first synthesis widths are 64, 48, 16, 8. Latents start at full resolution;

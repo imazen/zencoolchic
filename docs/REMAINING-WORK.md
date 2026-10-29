@@ -4,11 +4,11 @@ Target: upstream [Cool-chic v5.0.1 at a6fe38a414dd098b39c41636bd6e423626402f7e](
 Audited against Rust and pinned upstream source on 2026-10-18.
 
 **Still missing:** multi-frame/video decoding and encoding; motion compensation
-and global translation; YUV/high-bit-depth encoding; training with common
-randomness/Wasserstein loss or starting latents below full resolution. There are
-also untested decoder variants and incomplete resource/streaming integrations.
-The current implementation is a still-image decoder plus experimental RGB8
-encoder, not a complete port of every upstream workflow.
+and global translation; YUV/high-bit-depth encoding; training starting latents
+below full resolution. There are also untested decoder variants and incomplete
+resource/streaming integrations. The current implementation is a still-image
+decoder plus experimental RGB8 encoder, not a complete port of every upstream
+workflow.
 
 ## Start here
 
@@ -33,9 +33,8 @@ Their Rust counterparts are linked directly.
 | P/B frame decoding | Native decode rejects inter frames and flow output. [decode_coolchic](../src/decode.rs) and [header.rs](../src/header.rs) supply entropy/network groundwork; there is no frame-reference store or compositor. | `bitstream/decode.py::decode_frame`, `component/intercoding/globalmotion.py`, `component/intercoding/warp.py`. Decode residue and motion networks separately, preserve per-network exact latents, then match translation, flow sampling, alpha/beta masking, rounding and YUV handling. Test P and B frames with border/fractional motion and reference ordering. |
 | Motion/video encoding | [trainer](../src/train/trainer.rs), [config](../src/train/config.rs) and [unstable entry](../src/unstable.rs) build one intra residue model. | `component/video.py::encode_one_frame` / `guided_motion_pretraining`, `component/frame.py`, `training/presets.py`, `bitstream/encode.py`. Port decode first; then residue/motion objectives, reference management, presets and serialization. Upstream's `component/intercoding/raft.py` uses pretrained torchvision RAFT for encoder initialization. RAFT weights are not needed by a video decoder; a future encoder must record their provenance. |
 | YUV and higher-depth encode input | Native decoding supports RGB/YUV; [RGB8 training entry](../src/unstable.rs) and [trait encode](../src/codec/encode.rs) accept RGB8 sRGB. [Problem/evaluate](../src/train/trainer.rs), [distortion](../src/train/eval.rs), [RDOQ scores](../src/train/rdoq.rs) carry bit-depth-sensitive behavior. | `training/loss.py`, `io/format/yuv.py`, `io/framedata.py`, `component/frame.py`. Add differential loss/gradient cases for 4:2:0, 4:4:4 and higher depth, including chroma geometry and both rounding stages. Preserve all supported sample bits. Public descriptors/configuration require review. |
-| Common-randomness training and Wasserstein objective | Decoder [CommonNoise](../src/nn.rs) exists and has a frozen stream. [Shape::new](../src/train/mod.rs) explicitly refuses common randomness. The training objective is MSE plus rate. | `component/core/noise.py`, `component/core/coolchic.py`, `training/loss.py`, `training/metrics/wasserstein.py`. Add forward/backward graph support and a separate float64 torch gradient oracle; then an upstream-decoded end-to-end stream. Decoder support does not establish encoder support. |
 | Starting latents below full resolution | Native decoder handles the frozen half-resolution/bicubic case. [Shape::new](../src/train/mod.rs) rejects `latent_resolution[0] != 0`; [training step](../src/train/ops.rs) and [evaluation](../src/train/eval.rs) assume the supported full-resolution path. | `component/core/coolchic.py` and its final `F.interpolate`. Implement the necessary resize and its backward path with matching geometry, alignment and borders. Require a float64 gradient comparison and end-to-end reconstruction parity before removing the refusal. |
-| Preset/configuration breadth | Public encode exposes four fixed intra architectures. Internal header/shape code handles more configurations than those presets expose; three gradient cases do not establish all of them. | `cfg/dec/`, `utils/parsecli.py`, `training/presets.py`. Validate alternative IFCE/hyperlatent/architecture choices individually before exposing new knobs. Motion/debug/custom training schedules are not a general Rust preset interface. |
+| Preset/configuration breadth | Public encode exposes four fixed intra architectures. Internal header/shape code handles more configurations than those presets expose; four gradient cases do not establish all of them. | `cfg/dec/`, `utils/parsecli.py`, `training/presets.py`. Validate alternative IFCE/hyperlatent/architecture choices individually before exposing new knobs. Motion/debug/custom training schedules are not a general Rust preset interface. |
 
 For video, extend [dump_decode.py](../scripts/oracle/dump_decode.py) **before**
 judging a port: it currently captures one still frame and overwrites a shared raw
@@ -45,7 +44,7 @@ the original still-image set. Do not infer video support from parsed headers.
 
 ## Coverage gaps and known limits
 
-- The frozen suite covers 12 still-image decoder/writer cases, three float64
+- The frozen suite covers 12 still-image decoder/writer cases, four float64
   gradient cases and fixed-gradient SOAP behavior. It is not exhaustive format
   conformance. It includes odd RGB dimensions, narrow raster-order decoding,
   no-IFCE/no-hyperlatent, no stabilisers, common randomness, half-resolution
