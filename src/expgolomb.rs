@@ -28,7 +28,7 @@ pub(crate) fn decode(data: &[u8], n_padding_bits: u32, orders: &[u32]) -> Result
             }
         }
         // The `1` just read is the top bit of the (zeros + 1)-bit quotient field.
-        let low = r.bits(zeros, W)? as u64;
+        let low = r.bits64(zeros, W)?;
         let quotient = ((1u64 << zeros) | low) - 1;
         let remainder = if k == 0 { 0 } else { r.bits(k, W)? as u64 };
         let value = (quotient << k) + remainder;
@@ -102,6 +102,18 @@ mod tests {
             .map(|c| c.iter().fold(0u8, |a, &b| (a << 1) | b))
             .collect();
         (bytes, pad)
+    }
+
+    /// Fuzz-found: a unary prefix of 33..=40 zeros asked `bits()` for more than
+    /// 32 bits and panicked in debug builds (silently truncated in release).
+    #[test]
+    fn decodes_prefix_up_to_forty_zeros() {
+        // 39 zero bits, a `1`, then 39 quotient bits: 79 bits total.
+        let data = [0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(decode(&data, 0, &[0]).is_ok());
+        // 41 zeros exceeds the prefix cap and is a clean error, not a panic.
+        let data = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0xff, 0xff];
+        assert!(decode(&data, 0, &[0]).is_err());
     }
 
     #[test]

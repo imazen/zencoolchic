@@ -23,11 +23,17 @@ impl<'a> BitReader<'a> {
     /// Reads `n` bits (n <= 32) as an unsigned big-endian integer.
     pub(crate) fn bits(&mut self, n: u32, what: &'static str) -> Result<u32> {
         debug_assert!(n <= 32);
+        Ok(self.bits64(n, what)? as u32)
+    }
+
+    /// Reads `n` bits (n <= 64) as an unsigned big-endian integer.
+    pub(crate) fn bits64(&mut self, n: u32, what: &'static str) -> Result<u64> {
+        debug_assert!(n <= 64);
         let mut v: u64 = 0;
         for _ in 0..n {
             v = (v << 1) | self.bit(what)? as u64;
         }
-        Ok(v as u32)
+        Ok(v)
     }
 
     /// Sign-magnitude value: one sign bit (1 = negative) then `n - 1` magnitude bits.
