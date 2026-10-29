@@ -3,21 +3,21 @@
 Target: upstream [Cool-chic v5.0.1 at a6fe38a414dd098b39c41636bd6e423626402f7e](https://github.com/Orange-OpenSource/Cool-Chic/tree/a6fe38a414dd098b39c41636bd6e423626402f7e).
 Audited against Rust and pinned upstream source on 2026-10-18.
 
-**Status:** the video encode driver is landed — [encode_video](../src/unstable.rs)
-walks `coding_structure()` in coding order, trains I frames on the intra
-preset and P/B frames as synchronous residue+motion pairs on the inter preset,
-computes per-reference global translations, pretrains motion on an optional
-external flow field, quantizes residue then motion (motion's partner raw comes
-from the decoded residue payload, matching the decoder-visible state), writes
-each frame header + payload(s), and decodes immediately to feed the reference
-store. Upstream's own decoder reproduces the reported PSNRs on a generated
-I/P/B stream. Remaining gaps: untested decoder variants, incomplete
-resource/streaming integrations, and validation of the less-common video
-configuration combinations (4:2:0 inter encode, custom warp filters, RDOQ on
-inter streams, external-flow end-to-end runs). The current implementation is a
-still-image and video decoder (intra + P/B inter) plus a planar RGB/YUV
-8–16-bit still-image and video encoder, not a complete port of every upstream
-workflow.
+**Status:** decoder and encoder are feature-complete against upstream v5.0.1's
+codec surface — still + I/P/B video decode, RGB/YUV 8–16-bit planar still and
+video encode (I/P/B, external flow, warp filters 2/4/8/12, RDOQ, below-
+full-resolution latents, Wasserstein), all four intra and both motion cfg
+presets plus the full per-module override surface (`ModuleArch`), the zencodec
+trait bridge (still/animation encode+decode, streaming, memory budgets,
+sequential threading), decode cancellation, and cross-architecture bit-exact
+integer decode (x86 + aarch64). Differential coverage: every header data type
+(RGB, yuv444, yuv420, flow) has upstream-encoded fixtures agreeing bit-exactly
+or within the documented float bound, custom non-preset cfgs decode upstream
+streams both directions, and upstream's own decoder round-trips our streams.
+Deliberate non-goals remain upstream's workflow surface — GPU/torch, checkpoint
+/resume, `.pt` import, `--coding_idx`/`--debug`/`--nobitstream` CLI conveniences
+— plus YUV through the zencodec bridge (inexpressible in `PixelDescriptor`)
+and >10-bit upstream goldens (upstream's encoder input caps at 8/10-bit).
 
 ## Start here
 
