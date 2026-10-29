@@ -1288,6 +1288,165 @@ mod tests {
         );
     }
 
+    /// A 4:2:0 I/P/B stream: references and the target are 4:4:4-converted
+    /// before global translation and warping; PSNR is evaluated on the stored
+    /// (half-resolution chroma) planes like upstream.
+    #[test]
+    fn video_yuv420_ibp_encodes_and_decodes() {
+        let (w, h) = (16usize, 16usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let data: Vec<Vec<u16>> = (0..3)
+            .map(|shift| {
+                let mut f = Vec::with_capacity(w * h + 2 * cw * ch);
+                f.extend((0..w * h).map(|i| ((i * 7 + shift * 29) % 256) as u16));
+                f.extend((0..cw * ch).map(|i| ((i * 3 + shift * 11) % 256) as u16));
+                f.extend((0..cw * ch).map(|i| ((i * 5 + shift * 17) % 256) as u16));
+                f
+            })
+            .collect();
+        let frames: Vec<Vec<Plane>> = data
+            .iter()
+            .map(|d| {
+                let luma = Plane {
+                    width: w as u32,
+                    height: h as u32,
+                    samples: &d[..w * h],
+                };
+                let u = Plane {
+                    width: cw as u32,
+                    height: ch as u32,
+                    samples: &d[w * h..w * h + cw * ch],
+                };
+                let v = Plane {
+                    width: cw as u32,
+                    height: ch as u32,
+                    samples: &d[w * h + cw * ch..],
+                };
+                alloc::vec![luma, u, v]
+            })
+            .collect();
+        let views: Vec<&[Plane]> = frames.iter().map(|f| f.as_slice()).collect();
+        let opt = TrainOptions {
+            arch: 3,
+            n_itr: 2000,
+            rdoq: false,
+            ..Default::default()
+        };
+        let report = encode_video(
+            crate::FrameDataType::Yuv420,
+            8,
+            &views,
+            &[0],
+            &[2],
+            &opt,
+            &mut VideoOptions::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(report.frames.iter().all(|f| f.psnr_db.is_finite()));
+        let decoded = crate::decode_video(
+            &report.bitstream,
+            &crate::Limits {
+                max_frames: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert!(
+            decoded
+                .iter()
+                .all(|f| f.data_type == crate::FrameDataType::Yuv420)
+        );
+        // Stored chroma at half resolution, like upstream's avg_pool2d.
+        assert_eq!(decoded[0].plane_dims[1], (cw as u32, ch as u32));
+    }
+
+    /// An external flow field is learned through the `flow` objective and
+    /// injected into odd warm-up candidates (upstream
+    /// `guided_motion_pretraining`); the callback sees each inter frame's
+    /// 4:4:4 target and globally shifted references in coding order. A
+    /// non-default warp filter and a higher bitdepth ride along.
+    #[test]
+    fn video_external_flow_and_warp_filter() {
+        let (w, h) = (16usize, 16usize);
+        let data: Vec<Vec<u16>> = (0..3)
+            .map(|shift| {
+                (0..3 * w * h)
+                    .map(|i| ((i * 5 + shift * 37) % 1024) as u16)
+                    .collect()
+            })
+            .collect();
+        let frames: Vec<Vec<Plane>> = data
+            .iter()
+            .map(|d| {
+                (0..3)
+                    .map(|c| Plane {
+                        width: w as u32,
+                        height: h as u32,
+                        samples: &d[c * w * h..(c + 1) * w * h],
+                    })
+                    .collect()
+            })
+            .collect();
+        let views: Vec<&[Plane]> = frames.iter().map(|f| f.as_slice()).collect();
+        let opt = TrainOptions {
+            arch: 3,
+            n_itr: 2000,
+            rdoq: false,
+            ..Default::default()
+        };
+        // The estimator records its invocations and returns a constant +1/+1
+        // pixel flow per reference.
+        let calls = core::cell::RefCell::new(Vec::new());
+        let mut estimator = |display: u32, target: &[f32], refs: &[&[f32]]| {
+            assert_eq!(target.len(), 3 * w * h);
+            assert!(refs.iter().all(|r| r.len() == 3 * w * h));
+            calls.borrow_mut().push((display, refs.len()));
+            Some(
+                refs.iter()
+                    .map(|_| alloc::vec![1.0f32; 2 * w * h])
+                    .collect::<Vec<Vec<f32>>>(),
+            )
+        };
+        let mut vopt = VideoOptions {
+            warp_filter_size: Some(4),
+            itr_motion_pretrain: 100,
+            flow: Some(&mut estimator),
+        };
+        let report = encode_video(
+            crate::FrameDataType::Rgb,
+            10,
+            &views,
+            &[0],
+            &[2],
+            &opt,
+            &mut vopt,
+            &mut |_| {},
+        )
+        .unwrap();
+        // The estimator ran once per inter frame, in coding order (P2 then B1),
+        // with one field per reference.
+        assert_eq!(*calls.borrow(), [(2, 1), (1, 2)]);
+        assert!(report.frames.iter().all(|f| f.psnr_db.is_finite()));
+        for f in &report.frames {
+            if f.frame_type == crate::header::FrameType::I {
+                continue;
+            }
+            assert_eq!(f.header.warp_filter_size, Some(4));
+        }
+        let decoded = crate::decode_video(
+            &report.bitstream,
+            &crate::Limits {
+                max_frames: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert!(decoded.iter().all(|f| f.bitdepth == 10));
+    }
+
     /// Plane layout, dimension and sample-range violations are argument errors.
     #[test]
     fn frame_input_validation() {
