@@ -20,6 +20,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::ops::StepAux;
+use super::wasserstein::Wasserstein;
+use super::{Params, Shape, StepCfg, StepOut, forward_backward};
 use crate::header::FrameType;
 use crate::nn::Planes;
 use crate::warp;
@@ -34,14 +37,8 @@ pub(crate) enum InterRole {
 }
 
 /// Shared per-frame inter context: the unshifted references, per-reference
-/// integer global translations, and the partner model's raw output (constant
-/// during one step).
-pub(crate) struct InterCtx {
-    /// Which model's raw output the current `step` call owns.
-    pub(crate) role: InterRole,
-    /// Partner model's raw output at image resolution — `[channels][h][w]`
-    /// concatenated planes (5n for a B residue partner, 4n for motion).
-    pub(crate) other_raw: Vec<f32>,
+/// integer global translations, and the warper parameters.
+pub(crate) struct SharedInter {
     /// References expanded to 4:4:4 at image resolution: one plane set for
     /// P, two for B — before the global translation.
     pub(crate) refs: Vec<Planes>,
@@ -52,6 +49,162 @@ pub(crate) struct InterCtx {
     pub(crate) warp_filter: u32,
     /// Frame type — only P and B take an inter context.
     pub(crate) frame_type: FrameType,
+}
+
+/// A single model's view of the frame context for one step: its role and
+/// the partner model's raw output (constant during that step).
+#[derive(Clone, Copy)]
+pub(crate) struct InterCtx<'a> {
+    /// Which model's raw output the current `step` call owns.
+    pub(crate) role: InterRole,
+    /// The frame's shared inter state.
+    pub(crate) shared: &'a SharedInter,
+    /// Partner model's raw output at image resolution — `[channels][h][w]`
+    /// concatenated planes (5n for a B residue partner, 4n for motion).
+    pub(crate) other_raw: &'a [f32],
+}
+
+/// One model's inputs of a joint P/B iteration.
+pub(crate) struct PairIn<'a> {
+    /// Model layout.
+    pub(crate) shape: &'a Shape,
+    /// Current parameters (not mutated by the step itself).
+    pub(crate) p: &'a Params,
+    /// The frame target (both models score the same composited picture).
+    pub(crate) target: &'a [f32],
+    /// Quantization noise for this iteration.
+    pub(crate) noise: &'a [f32],
+    /// Step configuration (quantizer, λ, distortion weights).
+    pub(crate) cfg: StepCfg,
+    /// Wasserstein weights — only meaningful on the residue model.
+    pub(crate) wass: Option<&'a Wasserstein>,
+    /// Scratch params for the partner-capture forward (zeroed, unused).
+    pub(crate) scratch: &'a mut Params,
+    /// Output gradient buffer, overwritten like `forward_backward`.
+    pub(crate) grads: &'a mut Params,
+}
+
+/// One joint iteration on a P/B frame — upstream's single
+/// `frame_encoder.forward` + `loss.backward()` over both Cool-chics.
+/// Both raw outputs come from the same parameter snapshot: a forward-only
+/// pass captures the motion raw first (upstream's `cc_enc_out` dict order
+/// computes both forwards before any backward), so each model's composite
+/// sees the same-iteration partner output as in the joint autograd graph;
+/// each backward then scatters the shared distortion gradient into its own
+/// parameters. The caller applies one optimizer update over both `grads`.
+pub(crate) fn pair_step(
+    inter: &SharedInter,
+    res: PairIn<'_>,
+    mot: PairIn<'_>,
+) -> (StepOut, StepOut) {
+    let PairIn {
+        shape: ms,
+        p: mp,
+        target: mt,
+        noise: mn,
+        cfg: mc,
+        wass: mw,
+        scratch: mscratch,
+        grads: mg,
+    } = mot;
+    // Forward-only capture with the noise the real step will reuse.
+    let fwd = StepCfg {
+        eval_bitdepth: Some(8),
+        ..mc
+    };
+    let raw_m = forward_backward(ms, mp, mt, mn, fwd, StepAux::default(), mscratch).raw;
+    let ctx_r = InterCtx {
+        role: InterRole::Residue,
+        shared: inter,
+        other_raw: &raw_m,
+    };
+    let out_r = forward_backward(
+        res.shape,
+        res.p,
+        res.target,
+        res.noise,
+        res.cfg,
+        StepAux {
+            wass: res.wass,
+            inter: Some(ctx_r),
+        },
+        res.grads,
+    );
+    let ctx_m = InterCtx {
+        role: InterRole::Motion,
+        shared: inter,
+        other_raw: &out_r.raw,
+    };
+    let out_m = forward_backward(
+        ms,
+        mp,
+        mt,
+        mn,
+        mc,
+        StepAux {
+            wass: mw,
+            inter: Some(ctx_m),
+        },
+        mg,
+    );
+    (out_r, out_m)
+}
+
+/// Joint evaluation of a P/B frame — upstream `test()` on
+/// `frame_encoder.forward`: both models' eval-mode raw outputs composite
+/// the decoded picture once; the joint loss adds both models' rate terms
+/// to the shared distortion.
+pub(crate) fn pair_eval(
+    shared: &SharedInter,
+    res: PairIn<'_>,
+    mot: PairIn<'_>,
+) -> (StepOut, StepOut) {
+    // Same capture order as `pair_step`; eval cfg already forward-only.
+    let raw_m = forward_backward(
+        mot.shape,
+        mot.p,
+        mot.target,
+        &[],
+        mot.cfg,
+        StepAux::default(),
+        mot.scratch,
+    )
+    .raw;
+    let ctx_r = InterCtx {
+        role: InterRole::Residue,
+        shared,
+        other_raw: &raw_m,
+    };
+    let out_r = forward_backward(
+        res.shape,
+        res.p,
+        res.target,
+        &[],
+        res.cfg,
+        StepAux {
+            wass: res.wass,
+            inter: Some(ctx_r),
+        },
+        res.grads,
+    );
+    let ctx_m = InterCtx {
+        role: InterRole::Motion,
+        shared,
+        other_raw: &out_r.raw,
+    };
+    let out_m = forward_backward(
+        mot.shape,
+        mot.p,
+        mot.target,
+        &[],
+        mot.cfg,
+        StepAux {
+            wass: mot.wass,
+            inter: Some(ctx_m),
+        },
+        mot.grads,
+    );
+    (out_r, out_m)
 }
 
 /// Forward intermediates the gradient scatter reuses.
@@ -89,32 +242,32 @@ fn reparam_gate(r: f32) -> f32 {
 /// the caller's `decoded_dict` applies the data-type tail) and the forward
 /// tape.
 pub(crate) fn composite(
-    ctx: &InterCtx,
+    ctx: &InterCtx<'_>,
     own_raw: &[f32],
     w: usize,
     h: usize,
     quant: bool,
 ) -> crate::error::Result<(Vec<f32>, InterTape)> {
     let n = w * h;
-    let b = ctx.frame_type == FrameType::B;
+    let b = ctx.shared.frame_type == FrameType::B;
     let (res_raw, mot_raw) = match ctx.role {
-        InterRole::Residue => (own_raw, ctx.other_raw.as_slice()),
-        InterRole::Motion => (ctx.other_raw.as_slice(), own_raw),
+        InterRole::Residue => (own_raw, ctx.other_raw),
+        InterRole::Motion => (ctx.other_raw, own_raw),
     };
-    let res_need = (3 + ctx.refs.len()) * n;
-    let mot_need = 2 * ctx.refs.len() * n;
+    let res_need = (3 + ctx.shared.refs.len()) * n;
+    let mot_need = 2 * ctx.shared.refs.len() * n;
     if res_raw.len() != res_need || mot_raw.len() != mot_need {
         return Err(crate::error::Error::Invalid("inter raw channel count"));
     }
     let alpha = reparam(&res_raw[3 * n..4 * n]);
     let beta = b.then(|| reparam(&res_raw[4 * n..5 * n]));
     let wf = |r: usize, fx: &[f32], fy: &[f32]| {
-        let (dx, dy) = ctx.global_flow.get(r).copied().unwrap_or((0, 0));
-        let shifted = warp::translate(&ctx.refs[r], dx, dy);
+        let (dx, dy) = ctx.shared.global_flow.get(r).copied().unwrap_or((0, 0));
+        let shifted = warp::translate(&ctx.shared.refs[r], dx, dy);
         if quant {
-            warp::warp(&shifted, fx, fy, ctx.warp_filter)
+            warp::warp(&shifted, fx, fy, ctx.shared.warp_filter)
         } else {
-            warp::warp_train(&shifted, fx, fy, ctx.warp_filter)
+            warp::warp_train(&shifted, fx, fy, ctx.shared.warp_filter)
         }
     };
     let (fx1, fy1) = (&mot_raw[..n], &mot_raw[n..2 * n]);
@@ -161,7 +314,7 @@ pub(crate) fn composite(
 /// Distributes `d_img` (gradient on the composited 3-channel picture) into
 /// this model's raw output — the transpose of [`composite`].
 pub(crate) fn scatter(
-    ctx: &InterCtx,
+    ctx: &InterCtx<'_>,
     tape: &InterTape,
     own_raw: &[f32],
     d_img: &[f32],
@@ -202,7 +355,7 @@ pub(crate) fn scatter(
             // dout for each warped reference is alpha·d_img scaled by the
             // blend weight; warp_flow_backward maps it to the flow channels.
             let mut draw = Vec::with_capacity(own_raw.len());
-            for r in 0..ctx.refs.len() {
+            for r in 0..ctx.shared.refs.len() {
                 let dout = Planes {
                     c: 3,
                     h,
@@ -221,10 +374,10 @@ pub(crate) fn scatter(
                 };
                 let fx = &own_raw[r * 2 * n..(r * 2 + 1) * n];
                 let fy = &own_raw[(r * 2 + 1) * n..(r + 1) * 2 * n];
-                let (dx, dy) = ctx.global_flow.get(r).copied().unwrap_or((0, 0));
-                let shifted = warp::translate(&ctx.refs[r], dx, dy);
+                let (dx, dy) = ctx.shared.global_flow.get(r).copied().unwrap_or((0, 0));
+                let shifted = warp::translate(&ctx.shared.refs[r], dx, dy);
                 let (dfx, dfy) =
-                    warp::warp_flow_backward(&dout, &shifted, fx, fy, ctx.warp_filter)?;
+                    warp::warp_flow_backward(&dout, &shifted, fx, fy, ctx.shared.warp_filter)?;
                 draw.extend(dfx);
                 draw.extend(dfy);
             }
@@ -283,13 +436,16 @@ mod tests {
             }
             let tgt = f32_file(&case, "tgt");
             let want_img = f32_file(&case, "img");
-            let ctx_r = InterCtx {
-                role: InterRole::Residue,
-                other_raw: mot.clone(),
-                global_flow: alloc::vec![(0, 0); refs.len()],
-                refs: refs.clone(),
+            let shared = SharedInter {
+                refs,
+                global_flow: alloc::vec![(0, 0); usize::from(ft == FrameType::B) + 1],
                 warp_filter: fs,
                 frame_type: ft,
+            };
+            let ctx_r = InterCtx {
+                role: InterRole::Residue,
+                shared: &shared,
+                other_raw: &mot,
             };
             let (img, tape) = composite(&ctx_r, &res, w, h, false).unwrap();
             let max = img
@@ -323,11 +479,8 @@ mod tests {
 
             let ctx_m = InterCtx {
                 role: InterRole::Motion,
-                other_raw: res,
-                global_flow: alloc::vec![(0, 0); refs.len()],
-                refs,
-                warp_filter: fs,
-                frame_type: ft,
+                shared: &shared,
+                other_raw: &res,
             };
             let (img2, tape2) = composite(&ctx_m, &mot, w, h, false).unwrap();
             assert_eq!(img, img2, "{case}: role-switched composite differs");

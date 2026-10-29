@@ -25,7 +25,7 @@ fn dist_quant(pb: &Problem<'_>, raw: &[f32]) -> f64 {
     let img;
     let raw = match pb.inter {
         Some(i) => {
-            img = super::inter::composite(i, raw, iw, ih, true)
+            img = super::inter::composite(&i, raw, iw, ih, true)
                 .expect("inter frame compositing")
                 .0;
             &img

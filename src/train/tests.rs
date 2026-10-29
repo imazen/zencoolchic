@@ -255,7 +255,8 @@ fn gradients_match_torch_autograd() {
                 inter: None,
             },
             &mut g,
-        );
+        )
+        .terms;
         let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-30);
         std::eprintln!(
             "{}: loss {:.7} vs {:.7} (rel {:.1e}); mse rel {:.1e}; rate {:.2} vs {:.2} (rel {:.1e})",

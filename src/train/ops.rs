@@ -450,7 +450,7 @@ pub(crate) struct StepAux<'a> {
     /// Wasserstein feature weights (intra `Tune::Wasserstein` only).
     pub(crate) wass: Option<&'a Wasserstein>,
     /// P/B inter-frame context (reference compositing + gradient scatter).
-    pub(crate) inter: Option<&'a super::inter::InterCtx>,
+    pub(crate) inter: Option<super::inter::InterCtx<'a>>,
 }
 
 pub(super) fn step(
@@ -460,6 +460,7 @@ pub(super) fn step(
     noise: &[f32],
     cfg: StepCfg,
     aux: StepAux<'_>,
+    out_raw: Option<&mut Vec<f32>>,
     grads: &mut Params,
 ) -> LossTerms {
     let (wass, inter) = (aux.wass, aux.inter);
@@ -634,7 +635,7 @@ pub(super) fn step(
         None => (None, None),
         Some(i) => {
             // Evaluation scores the decoder's picture: 1/64-quantized flow.
-            let (a, t) = super::inter::composite(i, &raw, iw, ih, !backward)
+            let (a, t) = super::inter::composite(&i, &raw, iw, ih, !backward)
                 .expect("inter frame compositing");
             (Some(a), Some(t))
         }
@@ -748,10 +749,15 @@ pub(super) fn step(
     // (motion model).
     let draw = match (inter, tape.as_ref()) {
         (Some(i), Some(t)) => {
-            super::inter::scatter(i, t, &raw, &d_img, iw, ih).expect("inter gradient scatter")
+            super::inter::scatter(&i, t, &raw, &d_img, iw, ih).expect("inter gradient scatter")
         }
         _ => d_img,
     };
+    // The raw output outlives this call: the partner model's inter context
+    // consumes it (upstream's single joint forward graph).
+    if let Some(o) = out_raw {
+        *o = raw;
+    }
     let dist = w_mse as f64 * mse + cfg.dist.wass as f64 * wass_dist;
     if !backward {
         return LossTerms {

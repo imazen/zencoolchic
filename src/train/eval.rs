@@ -256,6 +256,100 @@ mod tests {
         assert_eq!(mse, want.mse);
     }
 
+    /// A tiny B frame through `train_pair`: the joint objective, clip and
+    /// best-model bookkeeping run end to end on real models.
+    #[test]
+    fn pair_trains_b_frame_jointly() {
+        use super::super::trainer::{FramePair, Phase, train_pair};
+        let mk = |outs: u32| {
+            let mut hdr = config::header(config::Arch::Low, 24, 32);
+            let n = hdr.layers_synthesis.len();
+            for (i, l) in hdr.layers_synthesis.iter_mut().enumerate() {
+                if i + 2 >= n {
+                    l.out_ft = outs;
+                }
+            }
+            let a = crate::decode::arch(&hdr).unwrap();
+            (hdr, a)
+        };
+        let (h_r, a_r) = mk(5);
+        let (h_m, a_m) = mk(4);
+        let s_r = Shape::new(&h_r, &a_r).unwrap();
+        let s_m = Shape::new(&h_m, &a_m).unwrap();
+        let mut rng = Rng::new(7);
+        let (mut p_r, mut p_m) = (s_r.zero_params(&h_r, &a_r), s_m.zero_params(&h_m, &a_m));
+        initialize(&mut p_r, &s_r, &mut rng);
+        initialize(&mut p_m, &s_m, &mut rng);
+        let target: Vec<f32> = (0..3 * 24 * 32)
+            .map(|i| ((i * 31) % 256) as f32 / 255.0)
+            .collect();
+        let mkref = |seed: u32| crate::nn::Planes {
+            c: 3,
+            h: 24,
+            w: 32,
+            data: (0..3 * 24 * 32)
+                .map(|i| (((i * 17 + seed as usize) % 251) as f32) / 255.0)
+                .collect(),
+        };
+        let shared = crate::train::inter::SharedInter {
+            refs: alloc::vec::Vec::from([mkref(3), mkref(91)]),
+            global_flow: alloc::vec::Vec::from([(1, -1), (-2, 0)]),
+            warp_filter: 4,
+            frame_type: crate::header::FrameType::B,
+        };
+        fn pb<'a>(s: &'a Shape, target: &'a [f32]) -> Problem<'a> {
+            Problem {
+                shape: s,
+                target,
+                frame_data_type: crate::header::FrameDataType::Rgb,
+                bitdepth: 8,
+                lambda: 1e-3,
+                gain: 16.0,
+                dist: crate::train::Dist::MSE,
+                wass: None,
+                inter: None,
+            }
+        }
+        let (p_r2, p_m2, best) = train_pair(
+            FramePair {
+                res: pb(&s_r, &target),
+                mot: pb(&s_m, &target),
+                shared,
+                p_r,
+                p_m,
+            },
+            &Phase {
+                lr: 3e-3,
+                max_itr: 4,
+                freq_valid: 2,
+                patience: 100,
+                schedule_lr: false,
+                softround_temperature: (0.3, 0.3),
+                noise_parameter: (1.0, 1.0),
+                noise: super::super::trainer::Noise::Kumaraswamy,
+                hardround: false,
+                betas_model: (0.95, 0.95),
+                betas_latent: (0.9, 0.999),
+                precondition_frequency_model: 10,
+                dist: crate::train::Dist::MSE,
+            },
+            &mut rng,
+            &mut |_, _, _| {},
+            &enough::Unstoppable,
+        )
+        .unwrap();
+        assert!(best.loss.is_finite() && best.mse.is_finite());
+        assert!(
+            p_r2.tensors()
+                .iter()
+                .all(|t| t.iter().all(|v| v.is_finite()))
+                && p_m2
+                    .tensors()
+                    .iter()
+                    .all(|t| t.iter().all(|v| v.is_finite()))
+        );
+    }
+
     #[test]
     fn training_step_is_independent_of_thread_count() {
         use super::super::{Quantizer, StepCfg, forward_backward, ops::StepAux};
@@ -291,7 +385,8 @@ mod tests {
             pool.install(|| {
                 let mut g = p.zeros_like();
                 let t =
-                    forward_backward(&shape, &p, &target, &noise, cfg, StepAux::default(), &mut g);
+                    forward_backward(&shape, &p, &target, &noise, cfg, StepAux::default(), &mut g)
+                        .terms;
                 let bits: Vec<u32> = g
                     .tensors()
                     .iter()

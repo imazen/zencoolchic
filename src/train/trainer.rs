@@ -275,7 +275,7 @@ pub(crate) struct Problem<'a> {
     /// Feature extractor of the Wasserstein term; required when `dist.wass != 0`.
     pub(crate) wass: Option<&'a Wasserstein>,
     /// Reference/motion context for a P/B frame objective (`None` for intra).
-    pub(crate) inter: Option<&'a super::inter::InterCtx>,
+    pub(crate) inter: Option<super::inter::InterCtx<'a>>,
 }
 
 impl Problem<'_> {
@@ -304,7 +304,7 @@ pub(crate) fn evaluate_dist(
         dist,
         frame_data_type: pb.frame_data_type,
     };
-    forward_backward(pb.shape, p, pb.target, &[], cfg, pb.aux(), scratch)
+    forward_backward(pb.shape, p, pb.target, &[], cfg, pb.aux(), scratch).terms
 }
 
 /// The evaluation pass at the preset's distortion weights.
@@ -315,29 +315,103 @@ pub(crate) fn evaluate(pb: &Problem<'_>, p: &Params, scratch: &mut Params) -> Lo
 /// Progress callback: (iteration in phase, training loss, last validation).
 pub(crate) type Progress<'a> = &'a mut dyn FnMut(usize, &LossTerms, Option<&LossTerms>);
 
+/// One model's optimizer state inside `train`: parameters, gradient buffer,
+/// tensor layout and per-tensor SOAP state (upstream's single `optimizer`
+/// holding the joint parameter list, decomposed per model here).
+struct Opt {
+    p: Params,
+    grads: Params,
+    states: Vec<Option<SoapState>>,
+    layout: Vec<(Vec<usize>, Role)>,
+}
+
+impl Opt {
+    fn new(p: Params) -> Self {
+        let layout = p.layout();
+        let states = layout
+            .iter()
+            .map(|(shape, role)| match role {
+                Role::Latent => Some(SoapState::new(shape, 0)),
+                Role::Weight => Some(SoapState::new(shape, 256)),
+                Role::Frozen => None,
+            })
+            .collect();
+        let grads = p.zeros_like();
+        Opt {
+            p,
+            grads,
+            states,
+            layout,
+        }
+    }
+
+    /// Σ grads² over `Role::Weight` tensors — one term of the joint norm
+    /// `clip_grad_norm_` computes on upstream's combined parameter list.
+    fn weight_norm2(&self) -> f64 {
+        self.grads
+            .tensors()
+            .iter()
+            .zip(&self.layout)
+            .filter(|(_, (_, r))| *r == Role::Weight)
+            .flat_map(|(g, _)| g.iter())
+            .map(|&v| (v as f64) * (v as f64))
+            .sum()
+    }
+
+    /// SOAP update on every trainable tensor; weights receive the jointly
+    /// clipped gradient (`clip = min(1, 0.1 / total_norm)` upstream).
+    fn apply(&mut self, clip: f32, lr: f32, ph: &Phase) {
+        let mut idx = 0;
+        let gts = self.grads.tensors();
+        self.p.for_each_mut(|t| {
+            let (shape, role) = &self.layout[idx];
+            let g = gts[idx];
+            if let Some(st) = &mut self.states[idx] {
+                let cfg = match role {
+                    Role::Latent => SoapConfig {
+                        lr,
+                        betas: ph.betas_latent,
+                        eps: 1e-8,
+                        weight_decay: 0.0,
+                        precondition_frequency: 1,
+                        max_precond_dim: 0,
+                    },
+                    _ => SoapConfig {
+                        lr,
+                        betas: ph.betas_model,
+                        eps: 1e-8,
+                        weight_decay: 0.01,
+                        precondition_frequency: ph.precondition_frequency_model,
+                        max_precond_dim: 256,
+                    },
+                };
+                if *role == Role::Weight && clip < 1.0 {
+                    let gc: Vec<f32> = g.iter().map(|&v| v * clip).collect();
+                    st.step(&cfg, t, &gc);
+                } else {
+                    st.step(&cfg, t, g);
+                }
+            }
+            let _ = shape;
+            idx += 1;
+        });
+    }
+}
+
 /// Upstream `train()` for one phase; returns the best parameters seen at validation.
 pub(crate) fn train(
     pb: &Problem<'_>,
-    mut p: Params,
+    p: Params,
     ph: &Phase,
     rng: &mut Rng,
     progress: Progress<'_>,
     stop: &dyn enough::Stop,
 ) -> crate::Result<(Params, LossTerms)> {
     stop.check()?;
-    let mut grads = p.zeros_like();
-    let mut best = evaluate_dist(pb, &p, ph.dist, &mut grads);
-    let mut best_p = p.clone();
-    let layout = p.layout();
-    let n_lat: usize = p.latents.iter().map(|l| l.len()).sum();
-    let mut states: Vec<Option<SoapState>> = layout
-        .iter()
-        .map(|(shape, role)| match role {
-            Role::Latent => Some(SoapState::new(shape, 0)),
-            Role::Weight => Some(SoapState::new(shape, 256)),
-            Role::Frozen => None,
-        })
-        .collect();
+    let mut opt = Opt::new(p);
+    let mut best = evaluate_dist(pb, &opt.p, ph.dist, &mut opt.grads);
+    let mut best_p = opt.p.clone();
+    let n_lat: usize = opt.p.latents.iter().map(|l| l.len()).sum();
     let mut lr = ph.lr;
     let mut lr_steps = 0usize;
     let t_max = ph.max_itr as f32 / ph.freq_valid as f32;
@@ -350,7 +424,7 @@ pub(crate) fn train(
         stop.check()?;
         if cnt - cnt_record > ph.patience {
             if ph.schedule_lr {
-                p = best_p.clone();
+                opt.p = best_p.clone();
                 cnt_record = cnt;
             } else {
                 break;
@@ -390,68 +464,28 @@ pub(crate) fn train(
         };
         let terms = forward_backward(
             pb.shape,
-            &p,
+            &opt.p,
             pb.target,
             noise_slice,
             cfg,
             pb.aux(),
-            &mut grads,
-        );
+            &mut opt.grads,
+        )
+        .terms;
 
-        // clip_grad_norm_(weights, 0.1)
+        // clip_grad_norm_(weights, 0.1) on the (here single-model) weight list.
         {
-            let gts = grads.tensors();
-            let norm2: f64 = gts
-                .iter()
-                .zip(&layout)
-                .filter(|(_, (_, r))| *r == Role::Weight)
-                .flat_map(|(g, _)| g.iter())
-                .map(|&v| (v as f64) * (v as f64))
-                .sum();
-            let norm = libm::sqrt(norm2) as f32;
+            let norm = libm::sqrt(opt.weight_norm2()) as f32;
             let clip = (0.1 / (norm + 1e-6)).min(1.0);
-
-            let mut idx = 0;
-            p.for_each_mut(|t| {
-                let (shape, role) = &layout[idx];
-                let g = gts[idx];
-                if let Some(st) = &mut states[idx] {
-                    let cfg = match role {
-                        Role::Latent => SoapConfig {
-                            lr,
-                            betas: ph.betas_latent,
-                            eps: 1e-8,
-                            weight_decay: 0.0,
-                            precondition_frequency: 1,
-                            max_precond_dim: 0,
-                        },
-                        _ => SoapConfig {
-                            lr,
-                            betas: ph.betas_model,
-                            eps: 1e-8,
-                            weight_decay: 0.01,
-                            precondition_frequency: ph.precondition_frequency_model,
-                            max_precond_dim: 256,
-                        },
-                    };
-                    if *role == Role::Weight && clip < 1.0 {
-                        let gc: Vec<f32> = g.iter().map(|&v| v * clip).collect();
-                        st.step(&cfg, t, &gc);
-                    } else {
-                        st.step(&cfg, t, g);
-                    }
-                }
-                let _ = shape;
-                idx += 1;
-            });
+            opt.apply(clip, lr, ph);
         }
 
         let mut valid = None;
         if (cnt + 1) % ph.freq_valid == 0 || cnt + 1 == ph.max_itr {
-            let v = evaluate_dist(pb, &p, ph.dist, &mut grads);
+            let v = evaluate_dist(pb, &opt.p, ph.dist, &mut opt.grads);
             if v.loss < best.loss {
                 best = v;
-                best_p = p.clone();
+                best_p = opt.p.clone();
                 cnt_record = cnt;
             }
             temperature = linear_schedule(ph.softround_temperature, cnt, ph.max_itr);
@@ -468,6 +502,206 @@ pub(crate) fn train(
         progress(cnt, &terms, valid.as_ref());
     }
     Ok((best_p, best))
+}
+
+/// A P/B frame's joint training problem: both models, the shared inter
+/// context and their current parameters.
+pub(crate) struct FramePair<'a> {
+    /// Residue model's problem (4-channel output for P, 5 for B).
+    pub(crate) res: Problem<'a>,
+    /// Motion model's problem (2-channel output for P, 4 for B).
+    pub(crate) mot: Problem<'a>,
+    /// References + global translations + warper parameters.
+    pub(crate) shared: super::inter::SharedInter,
+    /// Current residue parameters.
+    pub(crate) p_r: Params,
+    /// Current motion parameters.
+    pub(crate) p_m: Params,
+}
+
+/// Upstream `train()` for a P/B frame: the residue and motion Cool-chics are
+/// one joint problem (upstream's single optimizer over both parameter
+/// lists). Validation and patience use the joint loss `dist + λ·(rate_r +
+/// rate_m)/pixels` — each model's eval reports `dist + λ·rate_own`, so the
+/// joint is their sum minus the shared distortion term.
+pub(crate) fn train_pair(
+    pair: FramePair<'_>,
+    ph: &Phase,
+    rng: &mut Rng,
+    progress: Progress<'_>,
+    stop: &dyn enough::Stop,
+) -> crate::Result<(Params, Params, LossTerms)> {
+    stop.check()?;
+    let FramePair {
+        res: pb_r,
+        mot: pb_m,
+        shared,
+        p_r,
+        p_m,
+    } = pair;
+    let pb_r = &pb_r;
+    let pb_m = &pb_m;
+    let shared = &shared;
+    let mut opt_r = Opt::new(p_r);
+    let mut opt_m = Opt::new(p_m);
+    // Joint eval loss: shared distortion + both models' rate terms.
+    let joint = |a: &LossTerms, b: &LossTerms| -> LossTerms {
+        LossTerms {
+            loss: a.loss + b.loss - a.dist,
+            ..*a
+        }
+    };
+    // Joint eval: `pair_eval` composites the shared picture from both
+    // models' eval-mode raws; the joint loss adds both rate terms to the
+    // shared distortion (upstream `test()` + `loss_function` on the pair).
+    let eval_pair = |o_r: &mut Opt, o_m: &mut Opt| -> LossTerms {
+        let cfg = |pb: &Problem<'_>| StepCfg {
+            quantizer: Quantizer::Hardround,
+            gain: pb.gain,
+            lambda: pb.lambda,
+            eval_bitdepth: Some(pb.bitdepth),
+            dist: ph.dist,
+            frame_data_type: pb.frame_data_type,
+        };
+        let mut scratch_r = o_r.p.zeros_like();
+        let mut scratch_m = o_m.p.zeros_like();
+        let (a, b) = super::inter::pair_eval(
+            shared,
+            super::inter::PairIn {
+                shape: pb_r.shape,
+                p: &o_r.p,
+                target: pb_r.target,
+                noise: &[],
+                cfg: cfg(pb_r),
+                wass: pb_r.wass,
+                scratch: &mut scratch_r,
+                grads: &mut o_r.grads,
+            },
+            super::inter::PairIn {
+                shape: pb_m.shape,
+                p: &o_m.p,
+                target: pb_m.target,
+                noise: &[],
+                cfg: cfg(pb_m),
+                wass: pb_m.wass,
+                scratch: &mut scratch_m,
+                grads: &mut o_m.grads,
+            },
+        );
+        joint(&a.terms, &b.terms)
+    };
+    let mut best = eval_pair(&mut opt_r, &mut opt_m);
+    let mut best_p = (opt_r.p.clone(), opt_m.p.clone());
+    let n_lat_r: usize = opt_r.p.latents.iter().map(|l| l.len()).sum();
+    let n_lat_m: usize = opt_m.p.latents.iter().map(|l| l.len()).sum();
+    let mut lr = ph.lr;
+    let mut lr_steps = 0usize;
+    let t_max = ph.max_itr as f32 / ph.freq_valid as f32;
+    let eta_min = 1e-5f32;
+    let mut temperature = linear_schedule(ph.softround_temperature, 0, ph.max_itr);
+    let mut noise_param = linear_schedule(ph.noise_parameter, 0, ph.max_itr);
+    let mut cnt_record = 0usize;
+    let mut noise_r = vec![0.0f32; n_lat_r];
+    let mut noise_m = vec![0.0f32; n_lat_m];
+    for cnt in 0..ph.max_itr {
+        stop.check()?;
+        if cnt - cnt_record > ph.patience {
+            if ph.schedule_lr {
+                (opt_r.p, opt_m.p) = best_p.clone();
+                cnt_record = cnt;
+            } else {
+                break;
+            }
+        }
+        // Per-model noise draws in upstream's forward order: residue then
+        // motion (each `generate_kumaraswamy_noise` inside its cc forward).
+        let mut fill = |noise: &mut [f32]| match (ph.hardround, ph.noise) {
+            (true, _) | (_, Noise::None) => {}
+            (false, kind) => {
+                use rayon::prelude::*;
+                let seed = rng.next_u64();
+                noise.par_chunks_mut(4096).enumerate().for_each(|(bi, ch)| {
+                    let mut r = Rng::new(seed ^ (bi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    for v in ch.iter_mut() {
+                        *v = match kind {
+                            Noise::Gaussian => r.normal() * noise_param,
+                            _ => super::ops::kumaraswamy(r.uniform(), noise_param),
+                        };
+                    }
+                });
+            }
+        };
+        fill(&mut noise_r);
+        fill(&mut noise_m);
+        let quantizer = if ph.hardround {
+            Quantizer::Hardround
+        } else {
+            Quantizer::Softround { temperature }
+        };
+        let cfg = |pb: &Problem<'_>| StepCfg {
+            quantizer,
+            gain: pb.gain,
+            lambda: pb.lambda,
+            eval_bitdepth: None,
+            dist: ph.dist,
+            frame_data_type: pb.frame_data_type,
+        };
+        let mut scratch_r = opt_r.p.zeros_like();
+        let mut scratch_m = opt_m.p.zeros_like();
+        let (out_r, out_m) = super::inter::pair_step(
+            shared,
+            super::inter::PairIn {
+                shape: pb_r.shape,
+                p: &opt_r.p,
+                target: pb_r.target,
+                noise: &noise_r,
+                cfg: cfg(pb_r),
+                wass: pb_r.wass,
+                scratch: &mut scratch_r,
+                grads: &mut opt_r.grads,
+            },
+            super::inter::PairIn {
+                shape: pb_m.shape,
+                p: &opt_m.p,
+                target: pb_m.target,
+                noise: &noise_m,
+                cfg: cfg(pb_m),
+                wass: pb_m.wass,
+                scratch: &mut scratch_m,
+                grads: &mut opt_m.grads,
+            },
+        );
+        let terms = joint(&out_r.terms, &out_m.terms);
+
+        // clip_grad_norm_ over the joint weight-parameter list (upstream's
+        // single optimizer sees both models).
+        let norm = libm::sqrt(opt_r.weight_norm2() + opt_m.weight_norm2()) as f32;
+        let clip = (0.1 / (norm + 1e-6)).min(1.0);
+        opt_r.apply(clip, lr, ph);
+        opt_m.apply(clip, lr, ph);
+
+        let mut valid = None;
+        if (cnt + 1) % ph.freq_valid == 0 || cnt + 1 == ph.max_itr {
+            let v = eval_pair(&mut opt_r, &mut opt_m);
+            if v.loss < best.loss {
+                best = v;
+                best_p = (opt_r.p.clone(), opt_m.p.clone());
+                cnt_record = cnt;
+            }
+            temperature = linear_schedule(ph.softround_temperature, cnt, ph.max_itr);
+            noise_param = linear_schedule(ph.noise_parameter, cnt, ph.max_itr);
+            if ph.schedule_lr {
+                lr_steps += 1;
+                lr = eta_min
+                    + (ph.lr - eta_min)
+                        * (1.0 + libm::cosf(core::f32::consts::PI * lr_steps as f32 / t_max))
+                        / 2.0;
+            }
+            valid = Some(v);
+        }
+        progress(cnt, &terms, valid.as_ref());
+    }
+    Ok((best_p.0, best_p.1, best))
 }
 
 /// Upstream `warmup()` followed by the preset's training phases.

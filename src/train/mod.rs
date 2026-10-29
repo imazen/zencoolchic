@@ -414,6 +414,16 @@ pub(crate) struct LossTerms {
     pub(crate) rate_bits: f64,
 }
 
+/// The step's result: loss terms plus the model's own raw synthesis output
+/// at image resolution (the `raw_out` upstream composes into the decoded
+/// frame; needed by a partner model's inter context).
+pub(crate) struct StepOut {
+    /// Loss decomposition (`loss = mse·w_mse + wass·w_wass + λ·rate/pix`).
+    pub(crate) terms: LossTerms,
+    /// The model's raw output, `[channels][h][w]` concatenated planes.
+    pub(crate) raw: Vec<f32>,
+}
+
 /// One forward pass, plus the backward pass unless `cfg.eval_bitdepth` is set. `noise` is
 /// the additive quantization noise, one value per latent (all grids concatenated, finest
 /// first); empty for no noise. `grads` is overwritten (left zero for an evaluation pass).
@@ -427,8 +437,10 @@ pub(crate) fn forward_backward(
     cfg: StepCfg,
     aux: ops::StepAux<'_>,
     grads: &mut Params,
-) -> LossTerms {
-    ops::step(shape, p, target, noise, cfg, aux, grads)
+) -> StepOut {
+    let mut raw = Vec::new();
+    let terms = ops::step(shape, p, target, noise, cfg, aux, Some(&mut raw), grads);
+    StepOut { terms, raw }
 }
 
 /// Kumaraswamy noise from uniform samples (upstream `generate_kumaraswamy_noise`).
