@@ -24,10 +24,12 @@
 //! grid or convolution is not interruptible. Encode checks each training iteration,
 //! quantization candidate and RDOQ candidate, on problem-sized rayon pools.
 //!
-//! Dimension, pixel, frame, input and output caps are enforced. A sequential threading
-//! policy runs encode on one thread (identical bytes; only speed changes). Working-memory
-//! accounting is unavailable: a finite `max_memory_bytes` is refused before work rather
-//! than ignored.
+//! Dimension, pixel, frame, input and output caps are enforced. Decode honors
+//! `max_memory_bytes` via a pre-flight working-set estimate (params, latents and
+//! contexts, conv buffers, stored reference frames, output). A sequential threading
+//! policy runs encode on one thread (identical bytes; only speed changes). Encode
+//! working-memory accounting is unavailable: a finite `max_memory_bytes` is refused
+//! there rather than ignored.
 
 use crate::Error;
 use crate::header::{CoolChicHeader, FrameDataType, FrameHeader, FrameType, VideoHeader};
@@ -135,7 +137,8 @@ static DECODE_CAPS: DecodeCapabilities = DecodeCapabilities::new()
     .with_animation(true)
     .with_streaming(true)
     .with_native_16bit(true)
-    .with_enforces_max_pixels(true);
+    .with_enforces_max_pixels(true)
+    .with_enforces_max_memory(true);
 
 impl DecoderConfig for CoolChicDecoderConfig {
     type Error = At<CodecError>;
@@ -155,11 +158,35 @@ impl DecoderConfig for CoolChicDecoderConfig {
     }
 }
 
+/// Decode paths support `max_memory_bytes` as a pre-flight working-set
+/// estimate (`estimate_decode_bytes`); encode refuses it — the trainer's
+/// peak (SOAP preconditioners, gradients, activations) is not bounded yet.
+#[cfg(feature = "encoder")]
 fn check_budget_support(limits: &ResourceLimits) -> Result<(), At<CodecError>> {
     if limits.max_memory_bytes.is_some() {
-        return Err(
-            Error::InvalidArgument("finite working-memory budgets are not supported").into(),
-        );
+        return Err(Error::InvalidArgument(
+            "finite working-memory budgets are not supported on encode",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn check_decode_budget(
+    limits: &ResourceLimits,
+    h: &CoolChicHeader,
+    inter: bool,
+    n_frames: u64,
+    descriptor: PixelDescriptor,
+) -> Result<(), At<CodecError>> {
+    if limits.max_memory_bytes.is_some() {
+        let bpp = if descriptor == PixelDescriptor::RGB16_SRGB {
+            6
+        } else {
+            3
+        };
+        let est = crate::decode::estimate_decode_bytes(h, inter, n_frames, bpp)?;
+        limits.check_memory(est).map_err(limit)?;
     }
     Ok(())
 }
@@ -240,7 +267,6 @@ impl<'a> DecodeJob<'a> for CoolChicDecodeJob {
         data: Cow<'a, [u8]>,
         preferred: &[PixelDescriptor],
     ) -> Result<Self::Dec, Self::Error> {
-        check_budget_support(&self.limits)?;
         let (f, h) = self.headers(&data)?;
         let native = native_descriptor(f.bitdepth);
         let available: &[PixelDescriptor] = if f.bitdepth == 8 {
@@ -250,6 +276,7 @@ impl<'a> DecodeJob<'a> for CoolChicDecodeJob {
         };
         let descriptor =
             zencodec::decode::negotiate_pixel_format(preferred, available).unwrap_or(native);
+        check_decode_budget(&self.limits, &h, false, 1, descriptor)?;
         let bytes = u64::from(h.img_size[0])
             * u64::from(h.img_size[1])
             * if descriptor == PixelDescriptor::RGB8_SRGB {
@@ -301,7 +328,6 @@ impl<'a> DecodeJob<'a> for CoolChicDecodeJob {
         data: Cow<'a, [u8]>,
         preferred: &[PixelDescriptor],
     ) -> Result<Self::AnimationFrameDec, Self::Error> {
-        check_budget_support(&self.limits)?;
         self.stop.check().map_err(Error::from)?;
         self.limits
             .check_input_size(data.len() as u64)
@@ -335,6 +361,11 @@ impl<'a> DecodeJob<'a> for CoolChicDecodeJob {
         };
         let descriptor =
             zencodec::decode::negotiate_pixel_format(preferred, available).unwrap_or(native);
+        let inter = v
+            .coding_structure()?
+            .iter()
+            .any(|sf| !sf.index_references.is_empty());
+        check_decode_budget(&self.limits, &h, inter, u64::from(v.n_frames), descriptor)?;
         let dec = crate::decode::VideoDecoder::new(
             data.into_owned(),
             &crate::Limits {

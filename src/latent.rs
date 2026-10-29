@@ -17,7 +17,7 @@ use crate::rangecoder::RangeEncoder;
 use crate::rangecoder::{N_MU, N_SCALE_IDX, RangeDecoder};
 
 pub(crate) const MASK_SIZE: usize = 9;
-const PAD: usize = (MASK_SIZE - 1) / 2;
+pub(crate) const PAD: usize = (MASK_SIZE - 1) / 2;
 
 /// Priority of each causal position of the 9×9 window (row-major, first 40 cells). The
 /// `n` spatial contexts are the positions with priority `0..n`.

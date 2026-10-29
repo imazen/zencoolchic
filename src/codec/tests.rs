@@ -237,13 +237,59 @@ fn decoder_caps_reject_before_pixel_work() {
         category(e),
         ResourceError::Limits(LimitKind::OutputSize).into()
     );
-    assert!(
+    let e = CoolChicDecoderConfig
+        .job()
+        .with_limits(ResourceLimits::none().with_max_memory(1))
+        .decoder(Cow::Borrowed(&bytes), &[])
+        .err()
+        .unwrap();
+    assert_eq!(category(e), ResourceError::Limits(LimitKind::Memory).into());
+}
+
+#[test]
+fn decode_memory_budget_is_pre_flight_estimate() {
+    let bytes = fixture(FrameDataType::Rgb, 8);
+    // A budget above the enumerated working set lets the decode proceed;
+    // below it the job fails with Memory before any pixel work.
+    let out = CoolChicDecoderConfig
+        .job()
+        .with_limits(ResourceLimits::none().with_max_memory(1 << 20))
+        .decoder(Cow::Borrowed(&bytes), &[])
+        .unwrap()
+        .decode()
+        .unwrap();
+    assert_eq!((out.width(), out.height()), (4, 3));
+    for executor in [
         CoolChicDecoderConfig
             .job()
             .with_limits(ResourceLimits::none().with_max_memory(1))
             .decoder(Cow::Borrowed(&bytes), &[])
-            .is_err()
-    );
+            .err(),
+        CoolChicDecoderConfig
+            .job()
+            .with_limits(ResourceLimits::none().with_max_memory(1))
+            .streaming_decoder(Cow::Borrowed(&bytes), &[])
+            .err(),
+    ] {
+        assert_eq!(
+            category(executor.unwrap()),
+            ResourceError::Limits(LimitKind::Memory).into()
+        );
+    }
+    let stream = video_fixture();
+    let mut dec = CoolChicDecoderConfig
+        .job()
+        .with_limits(ResourceLimits::none().with_max_memory(1 << 20))
+        .animation_frame_decoder(Cow::Borrowed(&stream[..]), &[])
+        .unwrap();
+    assert!(dec.render_next_frame(None).unwrap().is_some());
+    let e = CoolChicDecoderConfig
+        .job()
+        .with_limits(ResourceLimits::none().with_max_memory(1))
+        .animation_frame_decoder(Cow::Borrowed(&stream[..]), &[])
+        .err()
+        .unwrap();
+    assert_eq!(category(e), ResourceError::Limits(LimitKind::Memory).into());
 }
 
 #[derive(Clone)]

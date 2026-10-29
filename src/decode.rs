@@ -1138,6 +1138,75 @@ impl<D: AsRef<[u8]>> VideoDecoder<D> {
     }
 }
 
+/// Upper-bound working-set estimate (bytes) for decoding a stream whose first
+/// Cool-chic payload is `h` — the zencodec bridge's pre-flight
+/// `max_memory_bytes` check. Every decoder allocation is enumerated: quantized
+/// and float network parameters, i64 latent grids with their padded ARM/IFCE
+/// contexts, upsampling/synthesis conv buffers, the stored reconstruction,
+/// decoded references kept for later frames (`n_frames` worth of stored
+/// planes), the integer picture and the interleaved output canvas (`bpp`
+/// bytes per pixel). `inter` doubles the payload terms for the residue+motion
+/// pair and adds reference/compositing buffers. Transients are padded, so the
+/// estimate over-counts the true peak: a passing decode is known to fit, while
+/// a rejected one may merely have been near its budget — the safe direction.
+#[cfg(feature = "zencodec")]
+pub(crate) fn estimate_decode_bytes(
+    h: &CoolChicHeader,
+    inter: bool,
+    n_frames: u64,
+    bpp: u64,
+) -> Result<u64> {
+    let a = arch(h)?;
+    let s = shapes(h, &a)?;
+    let (ih, iw) = (h.img_size[0] as usize, h.img_size[1] as usize);
+    let px = ih as u64 * iw as u64;
+    // Quantized i64 + fixed-point + float parameters plus decode-order scratch.
+    let params: u64 = plan(&s).tensors.iter().map(|t| t.2 as u64).sum();
+    // Retained i64 latent grids; the largest per-grid padded ARM window plus
+    // its stacked/upsampled IFCE context.
+    let grids: u64 = a.size_per_latent.iter().map(|&(h, w)| (h * w) as u64).sum();
+    let ctx = a
+        .size_per_latent
+        .iter()
+        .enumerate()
+        .map(|(i, &(gh, gw))| {
+            let p = latent::PAD;
+            ((gh + 2 * p) * (gw + 2 * p) + 2 * gh * gw * (a.input_features_ifce[i].max(1))) as u64
+        })
+        .max()
+        .unwrap_or(0);
+    // f32 non-hyper grids and the full-resolution synthesis input (already
+    // includes the common-randomness doubling), with upsample intermediates.
+    let nonhyper: u64 = a
+        .size_per_latent
+        .iter()
+        .zip(&a.is_hyperlatent)
+        .filter(|(_, hyper)| !**hyper)
+        .map(|(&(h, w), _)| (h * w) as u64)
+        .sum();
+    let syn_in = a.input_feature_synthesis as u64 * px;
+    // Largest synthesis layer: replicate-padded inputs + output planes + the
+    // retained residual/clone source, plus stabiliser and output transform.
+    let conv = s
+        .syn_layers
+        .iter()
+        .map(|&(ci, co, k)| {
+            let p = (k - 1) / 2;
+            (ci * (ih + 2 * p + 4) * (iw + 2 * p + 4) + 2 * co * ih * iw) as u64
+        })
+        .max()
+        .unwrap_or(0)
+        + 3 * s.syn_out as u64 * px;
+    // One payload: network build, latent decode, synthesis, the raw float
+    // output, the stored frame planes and the integer picture.
+    let payload = 40 * params + 8 * (grids + ctx) + 4 * (nonhyper + 2 * syn_in + conv + 12 * px);
+    // A P/B frame decodes a second (motion) payload and holds 4:4:4 references
+    // while compositing; the bound assumes the motion net is payload-sized.
+    let inter_extra = if inter { payload + 4 * 8 * px } else { 0 };
+    // Stored frames stay resident as references (420 over-counted as 444).
+    Ok(payload + inter_extra + n_frames * 4 * 3 * px + 2 * 3 * px + bpp * px)
+}
+
 /// Decodes all frames in coding order (upstream `decode_video` + `decode_frame`),
 /// returning them in display order. `single_frame` selects the still-image API:
 /// streams with more than one frame are rejected, and the frame's internals are
