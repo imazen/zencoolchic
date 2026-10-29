@@ -82,7 +82,7 @@ struct Fixed {
 /// Flat `module_values_mut` index → (tensor, output channel) for the synthesis
 /// module, in `module_tensors_mut` order (output transform, optional
 /// stabiliser, then the layers).
-fn syn_flat_map(p: &Params, bias: bool) -> Vec<(SynSel, usize)> {
+pub(crate) fn syn_flat_map(p: &Params, bias: bool) -> Vec<(SynSel, usize)> {
     let mut convs: Vec<(&ConvLayer, SynSel)> = Vec::with_capacity(p.syn.len() + 2);
     convs.push((&p.out_transform, SynSel::OutTransform));
     if let Some(st) = &p.syn_stab {
@@ -127,8 +127,7 @@ pub(crate) fn rdoq(
         // parameter move touches one output channel of one tensor, so the
         // accepted prefix outputs and stabiliser are reused. Bit-identical to
         // the full `synthesize` (channel accumulation is independent).
-        let mut inc =
-            (m == Module::Synthesis).then(|| eval::SynInc::new(shape, p, &fixed.syn_in));
+        let mut inc = (m == Module::Synthesis).then(|| eval::SynInc::new(shape, p, &fixed.syn_in));
         for is_bias in [false, true] {
             let step = step_of(q, m, is_bias);
             let n = module_values_mut(p, m, is_bias).len();
@@ -154,17 +153,14 @@ pub(crate) fn rdoq(
                         *module_values_mut(p, m, is_bias)[idx] =
                             initial + sign * shift as f32 * step;
                         evals += 1;
-                        let s = super::pool(n_pix).install(|| {
-                            match (&syn_map, inc.as_mut()) {
-                                (Some(map), Some(inc)) => {
-                                    let (sel, chan) = map[idx];
-                                    let raw = inc.candidate(pb.shape, p, sel, chan);
-                                    dist_quant(pb, &raw)
-                                        + pb.lambda as f64 * nn_rate_of(p, q, m) as f64
-                                            / n_pix as f64
-                                }
-                                _ => score(pb, p, q, m, &fixed),
+                        let s = super::pool(n_pix).install(|| match (&syn_map, inc.as_mut()) {
+                            (Some(map), Some(inc)) => {
+                                let (sel, chan) = map[idx];
+                                let raw = inc.candidate(pb.shape, p, sel, chan);
+                                dist_quant(pb, &raw)
+                                    + pb.lambda as f64 * nn_rate_of(p, q, m) as f64 / n_pix as f64
                             }
+                            _ => score(pb, p, q, m, &fixed),
                         });
                         if s < best {
                             best = s;
@@ -175,10 +171,10 @@ pub(crate) fn rdoq(
                     }
                 }
                 *module_values_mut(p, m, is_bias)[idx] = best_value;
-                if best_value != initial {
-                    if let (Some(map), Some(inc)) = (&syn_map, inc.as_mut()) {
-                        inc.invalidate(map[idx].0);
-                    }
+                if best_value != initial
+                    && let (Some(map), Some(inc)) = (&syn_map, inc.as_mut())
+                {
+                    inc.invalidate(map[idx].0);
                 }
             }
             log(alloc::format!(

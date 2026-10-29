@@ -116,7 +116,7 @@ pub(crate) fn synthesize(shape: &Shape, p: &Params, up: &[f32]) -> Vec<f32> {
 /// Which synthesis-module tensor a flat `module_values_mut` index mutates.
 /// Order matches `module_tensors_mut` for [`Module::Synthesis`](super::quantize::Module):
 /// output transform, optional stabiliser, then the layers.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum SynSel {
     OutTransform,
     Stabiliser,
@@ -150,8 +150,7 @@ pub(crate) struct SynInc {
 impl SynInc {
     pub(crate) fn new(shape: &Shape, p: &Params, up: &[f32]) -> Self {
         let (sh, sw) = shape.syn_size;
-        let mut syn_in =
-            Vec::with_capacity(up.len() + shape.cr.as_ref().map_or(0, Vec::len));
+        let mut syn_in = Vec::with_capacity(up.len() + shape.cr.as_ref().map_or(0, Vec::len));
         syn_in.extend_from_slice(up);
         if let Some(cr) = &shape.cr {
             syn_in.extend_from_slice(cr);
@@ -235,7 +234,11 @@ impl SynInc {
         self.ensure_outs(shape, p, p.syn.len());
         self.ensure_stab(shape, p);
         if !self.cur_fresh {
-            self.cur = self.outs.last().cloned().unwrap_or_else(|| self.syn_in.clone());
+            self.cur = self
+                .outs
+                .last()
+                .cloned()
+                .unwrap_or_else(|| self.syn_in.clone());
             if let Some(s) = &self.stab {
                 for (a, b) in self.cur.iter_mut().zip(s) {
                     *a += *b;
@@ -247,7 +250,13 @@ impl SynInc {
 
     /// The [`synthesize`] output at the current `p`, where the only parameter
     /// that may differ from the accepted state is channel `o` of `sel`.
-    pub(crate) fn candidate(&mut self, shape: &Shape, p: &Params, sel: SynSel, o: usize) -> Vec<f32> {
+    pub(crate) fn candidate(
+        &mut self,
+        shape: &Shape,
+        p: &Params,
+        sel: SynSel,
+        o: usize,
+    ) -> Vec<f32> {
         let (sh, sw) = shape.syn_size;
         let n = sh * sw;
         let mut cur = match sel {
@@ -303,10 +312,9 @@ impl SynInc {
                 c
             }
         };
-        if p.syn_stab.is_some() {
+        if let Some(st) = &p.syn_stab {
             match sel {
                 SynSel::Stabiliser => {
-                    let st = p.syn_stab.as_ref().expect("checked is_some");
                     let s_in = &self.syn_in[..st.c_in * n];
                     let s = if self.stab_fresh {
                         // Only channel `o` differs from the accepted output.
@@ -489,6 +497,47 @@ mod tests {
         );
         assert_eq!(rate, want.rate_bits);
         assert_eq!(mse, want.mse);
+    }
+
+    /// The incremental scoring forward: every synthesis parameter candidate
+    /// produces the same picture as a full `synthesize` on the mutated params,
+    /// across accepted-move cache invalidations.
+    #[test]
+    fn syninc_matches_full_synthesize_per_parameter() {
+        use super::super::quantize::{Module, module_values_mut};
+        use super::super::rdoq::syn_flat_map;
+        let hdr = config::header(config::Arch::Medium, 37, 53);
+        let a = crate::decode::arch(&hdr).unwrap();
+        let shape = Shape::new(&hdr, &a).unwrap();
+        let mut p = shape.zero_params(&hdr, &a);
+        let mut rng = Rng::new(7);
+        initialize(&mut p, &shape, &mut rng);
+        p.for_each_mut(|t| {
+            for v in t.iter_mut() {
+                *v += rng.normal() * 0.1;
+            }
+        });
+        let q = quantize_hard(&p, 16.0);
+        let up = upsample(&shape, &p, &q);
+        let mut inc = SynInc::new(&shape, &p, &up);
+        for bias in [false, true] {
+            let map = syn_flat_map(&p, bias);
+            let n = module_values_mut(&mut p, Module::Synthesis, bias).len();
+            assert_eq!(map.len(), n);
+            for idx in 0..n {
+                let mut pc = p.clone();
+                *module_values_mut(&mut pc, Module::Synthesis, bias)[idx] += 0.37;
+                let (sel, chan) = map[idx];
+                let want = synthesize(&shape, &pc, &up);
+                let got = inc.candidate(&shape, &pc, sel, chan);
+                assert_eq!(want, got, "bias={bias} idx={idx} sel={sel:?} chan={chan}");
+                // Keep every 7th move: accepted moves invalidate the caches.
+                if idx % 7 == 0 {
+                    *module_values_mut(&mut p, Module::Synthesis, bias)[idx] += 0.37;
+                    inc.invalidate(sel);
+                }
+            }
+        }
     }
 
     /// A tiny B frame through `train_pair`: the joint objective, clip and
