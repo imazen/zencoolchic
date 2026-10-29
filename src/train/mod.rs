@@ -425,12 +425,19 @@ pub(crate) struct StepOut {
 }
 
 /// Worker pool for the training and quantization kernels, sized to the
-/// problem. Measured per-step cost (`examples/bench_train.rs`, hop, Ryzen
-/// 9950X3D, 2026-10-29): the ambient pool loses to a small cap at every tested
-/// size — 64² best at 4 threads (+46% over 32), 128² at 8 (+38%), 256² flat
-/// from 4–16, 512² back to 4 (working set exceeds L3; more threads only add
-/// fork-join and bandwidth contention). The decomposition of every parallel
-/// op is thread-count independent, so results are unchanged.
+/// problem. Measured per-step cost (`examples/bench_train.rs`, hop, 30 steps,
+/// ms/step): on the Ryzen 9950X3D (2026-10-29) 64² wanted 4 threads (+46%
+/// over the 32-thread ambient pool), 128² wanted 8 (+38%), 256² was flat from
+/// 4–16 and 512² wanted 4 again (asymmetric L3; more threads only added
+/// fork-join and bandwidth contention). Re-measured on the Ryzen 7900X (24T)
+/// and Core Ultra 265K (20T) under `run-heavy` (2026-10-30): 64² again flat
+/// around 4, 128² best at 6–8, and the *large* sizes want ~12 — the >128k→4
+/// rule cost 30–38% on both non-X3D hosts (512²: 120.5 ms at 4 vs 92.5 at 16
+/// on Zen 4; i265 118.8→94.9). The bands below pick 4 / 8 / min(12, ncpu);
+/// the 12-thread cap keeps within ~3% of each measured optimum while staying
+/// well short of the ambient-pool contention the X3D showed. The
+/// decomposition of every parallel op is thread-count independent, so
+/// results are unchanged on every host.
 pub(crate) fn pool(n_pix: usize) -> &'static rayon::ThreadPool {
     fn get(
         n: usize,
@@ -448,10 +455,11 @@ pub(crate) fn pool(n_pix: usize) -> &'static rayon::ThreadPool {
     }
     static P4: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     static P8: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    static P12: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     match n_pix {
-        ..=32_768 => get(4, &P4),
-        32_769..=131_072 => get(8, &P8),
-        _ => get(4, &P4),
+        ..=8_192 => get(4, &P4),
+        8_193..=131_072 => get(8, &P8),
+        _ => get(12, &P12),
     }
 }
 
