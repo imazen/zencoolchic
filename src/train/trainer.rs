@@ -260,7 +260,11 @@ fn linear_schedule(r: (f32, f32), cur: usize, max: usize) -> f32 {
 /// Everything the training loop needs about the picture.
 pub(crate) struct Problem<'a> {
     pub(crate) shape: &'a Shape,
+    /// Normalized frame data in `frame_data_type` layout: `[c][h][w]` planes for
+    /// RGB/YUV444, `[y | u | v]` with half-resolution chroma for YUV420.
     pub(crate) target: &'a [f32],
+    /// Plane layout of `target` and of the scored frame data.
+    pub(crate) frame_data_type: crate::header::FrameDataType,
     pub(crate) bitdepth: u32,
     pub(crate) lambda: f32,
     pub(crate) gain: f32,
@@ -286,6 +290,7 @@ pub(crate) fn evaluate_dist(
         lambda: pb.lambda,
         eval_bitdepth: Some(pb.bitdepth),
         dist,
+        frame_data_type: pb.frame_data_type,
     };
     forward_backward(pb.shape, p, pb.target, &[], cfg, pb.wass, scratch)
 }
@@ -369,6 +374,7 @@ pub(crate) fn train(
             lambda: pb.lambda,
             eval_bitdepth: None,
             dist: ph.dist,
+            frame_data_type: pb.frame_data_type,
         };
         let terms = forward_backward(
             pb.shape,

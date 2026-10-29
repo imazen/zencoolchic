@@ -17,13 +17,19 @@ use super::quantize::{Module, NnQuant, module_values_mut, network_rate, nn_rate_
 use super::trainer::{Problem, Rng};
 use super::{Params, Shape};
 
-/// Weighted distortion of the bitdepth-quantized synthesis output, like upstream's
+/// Weighted distortion of the bitdepth-quantized frame data, like upstream's
 /// `loss_function` on the eval image (`score_syn_image`).
 fn dist_quant(pb: &Problem<'_>, raw: &[f32]) -> f64 {
-    let dec = eval::quantized(raw, pb.bitdepth);
+    let (ih, iw) = pb.shape.img;
+    let dec = eval::decoded_dict(
+        raw,
+        iw,
+        ih,
+        pb.frame_data_type,
+        Some(((1u32 << pb.bitdepth) - 1) as f32),
+    );
     let mut d = pb.dist.mse as f64 * eval::distortion_of(&dec, pb.target);
     if pb.dist.wass != 0.0 {
-        let (ih, iw) = pb.shape.img;
         let w = pb.wass.expect("wasserstein weight without feature weights");
         d += pb.dist.wass as f64 * w.eval(&dec, ih, iw);
     }

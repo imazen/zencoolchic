@@ -7,6 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::arm_batch::{ArmBackward, MlpGrad as ArmGrad, arm_pass};
+use super::eval;
 use super::wasserstein::Wasserstein;
 use super::{ConvLayer, LossTerms, Params, Quantizer, Shape, StepCfg, WINDOW, full_kernel};
 use crate::simd::{axpy, dot};
@@ -610,48 +611,84 @@ pub(super) fn step(
     let raw = conv_forward(&p.out_transform, &pre_out, ih, iw);
 
     // 5. Loss: `w_mse · mse + w_wass · wasserstein + lambda · rate / n_pixels`.
-    let n_el = raw.len();
-    let mut draw = vec![0.0f32; n_el];
     let out_max = cfg.eval_bitdepth.map(|b| ((1u32 << b) - 1) as f32);
+    // The scored frame data (upstream `decoded_image`): the clamped (and, for the
+    // evaluation pass, bit-quantized) picture, downsampled to 4:2:0 for `Yuv420`.
+    let dec = eval::decoded_dict(&raw, iw, ih, cfg.frame_data_type, out_max);
+    let n_el = dec.len();
+    // `d mse / d dec`, mapped back to `draw` through the clamp/downsample below.
+    let mut d_dec = vec![0.0f32; n_el];
     // Fixed-size chunks: partial sums are added in chunk order (thread-count independent).
     const CH: usize = 1 << 14;
     let w_mse = cfg.dist.mse;
-    let partial: Vec<f64> = draw
+    let partial: Vec<f64> = d_dec
         .par_chunks_mut(CH)
-        .zip(raw.par_chunks(CH))
+        .zip(dec.par_chunks(CH))
         .zip(target.par_chunks(CH))
-        .map(|((dr, rw), tg)| {
+        .map(|((dd, dc), tg)| {
             let mut m = 0.0f64;
-            for ((d, &r), &t) in dr.iter_mut().zip(rw).zip(tg) {
-                let mut c = r.clamp(0.0, 1.0);
-                if let Some(mx) = out_max {
-                    c = libm::rintf(c * mx) / mx;
-                }
+            for ((d, &c), &t) in dd.iter_mut().zip(dc).zip(tg) {
                 let e = c - t;
                 m += (e * e) as f64;
-                if (0.0..=1.0).contains(&r) {
-                    *d = w_mse * 2.0 * e / n_el as f32;
-                }
+                *d = w_mse * 2.0 * e / n_el as f32;
             }
             m
         })
         .collect();
     let mse = partial.iter().sum::<f64>() / n_el as f64;
-    // The Wasserstein term sees the same clamped (and, for the evaluation pass,
-    // bit-quantized) picture as the MSE.
+    let mut draw = vec![0.0f32; raw.len()];
+    match cfg.frame_data_type {
+        crate::header::FrameDataType::Yuv420 => {
+            // Luma is clamped sample-wise; each chroma dict sample receives
+            // 1/4 of its gradient at every source position of its 2×2 block.
+            let n = ih * iw;
+            let nc = (ih / 2) * (iw / 2);
+            for (d, (&r, &g)) in draw[..n].iter_mut().zip(raw[..n].iter().zip(&d_dec)) {
+                if (0.0..=1.0).contains(&r) {
+                    *d = g;
+                }
+            }
+            for c in 1..3 {
+                let src = &raw[c * n..(c + 1) * n];
+                let dst = &mut draw[c * n..(c + 1) * n];
+                let dg = &d_dec[n + (c - 1) * nc..n + c * nc];
+                for by in 0..ih / 2 {
+                    for bx in 0..iw / 2 {
+                        let p = [
+                            (2 * by) * iw + 2 * bx,
+                            (2 * by) * iw + 2 * bx + 1,
+                            (2 * by + 1) * iw + 2 * bx,
+                            (2 * by + 1) * iw + 2 * bx + 1,
+                        ];
+                        let avg = (src[p[0]] + src[p[1]] + src[p[2]] + src[p[3]]) / 4.0;
+                        if (0.0..=1.0).contains(&avg) {
+                            let g = dg[by * (iw / 2) + bx] / 4.0;
+                            for &s in &p {
+                                dst[s] += g;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            for (d, (&r, &g)) in draw.iter_mut().zip(raw.iter().zip(&d_dec)) {
+                if (0.0..=1.0).contains(&r) {
+                    *d = g;
+                }
+            }
+        }
+    }
+    // The Wasserstein term sees the same scored picture as the MSE; upstream's
+    // per-channel VGG path does not support 4:2:0 frame data.
     let mut wass_dist = 0.0f64;
     if cfg.dist.wass != 0.0 {
+        assert_ne!(
+            cfg.frame_data_type,
+            crate::header::FrameDataType::Yuv420,
+            "wasserstein on 4:2:0 frame data is not supported"
+        );
         let w = wass.expect("wasserstein weight without feature weights");
-        let dec: Vec<f32> = raw
-            .iter()
-            .map(|&r| {
-                let mut c = r.clamp(0.0, 1.0);
-                if let Some(mx) = out_max {
-                    c = libm::rintf(c * mx) / mx;
-                }
-                c
-            })
-            .collect();
         if backward {
             let (wd, tape) = w.forward(&dec, ih, iw);
             wass_dist = wd;

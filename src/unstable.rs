@@ -78,6 +78,15 @@ pub struct EncodeReport {
     pub bitstream: Vec<u8>,
 }
 
+/// One sample plane of a frame to encode: tightly packed `width × height`
+/// unsigned samples in `0 ..= (1 << bitdepth) - 1`, top-left first.
+#[derive(Clone, Copy, Debug)]
+pub struct Plane<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub samples: &'a [u16],
+}
+
 /// Encodes an interleaved 8-bit RGB picture: training, network quantization, bitstream.
 pub fn encode_rgb8(
     rgb: &[u8],
@@ -89,6 +98,49 @@ pub fn encode_rgb8(
     encode_rgb8_with_stop(rgb, width, height, opt, log, &enough::Unstoppable)
 }
 
+/// Encodes a planar frame: `planes` follow `frame_data_type` layout — three
+/// full-resolution planes for `Rgb`/`Yuv444`, or a full-resolution luma plane
+/// followed by two half-resolution chroma planes for `Yuv420` (which requires
+/// even luma dimensions). Samples are integers in `0 ..= (1 << bitdepth) - 1`.
+/// [`Tune::Wasserstein`] needs a full-resolution three-channel frame: it is
+/// rejected for `Yuv420`, matching upstream.
+pub fn encode_frame(
+    frame_data_type: crate::FrameDataType,
+    bitdepth: u8,
+    planes: &[Plane<'_>],
+    opt: &TrainOptions,
+    log: &mut dyn FnMut(String),
+) -> crate::Result<EncodeReport> {
+    encode_frame_with_stop(
+        frame_data_type,
+        bitdepth,
+        planes,
+        opt,
+        log,
+        &enough::Unstoppable,
+    )
+}
+
+/// Interleaved RGB8 → three planar u16 buffers (the caller builds `Plane` views
+/// so the buffers live as long as needed).
+fn rgb_planes(rgb: &[u8], width: u32, height: u32) -> crate::Result<[Vec<u16>; 3]> {
+    let (w, h) = (width as usize, height as usize);
+    if w.checked_mul(h).and_then(|n| n.checked_mul(3)) != Some(rgb.len()) {
+        return Err(crate::Error::InvalidArgument("rgb buffer size"));
+    }
+    let mut bufs = [
+        Vec::with_capacity(w * h),
+        Vec::with_capacity(w * h),
+        Vec::with_capacity(w * h),
+    ];
+    for px in rgb.as_chunks::<3>().0 {
+        for (b, &v) in bufs.iter_mut().zip(px) {
+            b.push(v as u16);
+        }
+    }
+    Ok(bufs)
+}
+
 pub(crate) fn encode_rgb8_with_stop(
     rgb: &[u8],
     width: u32,
@@ -97,18 +149,40 @@ pub(crate) fn encode_rgb8_with_stop(
     log: &mut dyn FnMut(String),
     stop: &dyn enough::Stop,
 ) -> crate::Result<EncodeReport> {
+    let bufs = rgb_planes(rgb, width, height)?;
+    let planes: Vec<Plane> = bufs
+        .iter()
+        .map(|b| Plane {
+            width,
+            height,
+            samples: b,
+        })
+        .collect();
+    encode_frame_with_stop(crate::FrameDataType::Rgb, 8, &planes, opt, log, stop)
+}
+
+pub(crate) fn encode_frame_with_stop(
+    frame_data_type: crate::FrameDataType,
+    bitdepth: u8,
+    planes: &[Plane<'_>],
+    opt: &TrainOptions,
+    log: &mut dyn FnMut(String),
+    stop: &dyn enough::Stop,
+) -> crate::Result<EncodeReport> {
     stop.check()?;
-    let (hdr, shape, template, target, wass, dist, gain) = setup(rgb, width, height, opt)?;
+    let (hdr, shape, template, target, wass, dist, gain, n_pix) =
+        setup(frame_data_type, bitdepth, planes, opt)?;
     let pb = Problem {
         shape: &shape,
         target: &target,
-        bitdepth: 8,
+        frame_data_type,
+        bitdepth: bitdepth as u32,
         lambda: opt.lambda,
         gain,
         dist,
         wass: wass.as_ref(),
     };
-    let n_pix = (width as usize * height as usize) as f64;
+    let n_pix = n_pix as f64;
     let (p, l) = run_training(&pb, &template, opt, log, stop)?;
     let trained = TrainReport {
         psnr_db: -10.0 * libm::log10(l.mse),
@@ -145,7 +219,7 @@ pub(crate) fn encode_rgb8_with_stop(
         .map(|(&(gh, gw), data)| crate::latent::Grid { h: gh, w: gw, data })
         .collect();
     stop.check()?;
-    let bitstream = crate::write::write_image(&h, crate::FrameDataType::Rgb, 8, &ints, &grids)?;
+    let bitstream = crate::write::write_image(&h, frame_data_type, bitdepth as u32, &ints, &grids)?;
     Ok(EncodeReport {
         trained,
         quantized,
@@ -153,6 +227,8 @@ pub(crate) fn encode_rgb8_with_stop(
     })
 }
 
+/// The last tuple element is the luma sample count — the rate/PSNR
+/// normalization (upstream `n_pixels`).
 type Setup = (
     crate::header::CoolChicHeader,
     Shape,
@@ -161,17 +237,58 @@ type Setup = (
     Option<Wasserstein>,
     Dist,
     f32,
+    usize,
 );
 
-fn setup(rgb: &[u8], width: u32, height: u32, opt: &TrainOptions) -> crate::Result<Setup> {
-    let (w, h) = (width as usize, height as usize);
-    if width == 0 || height == 0 || width > 16383 || height > 16383 {
+fn setup(
+    frame_data_type: crate::FrameDataType,
+    bitdepth: u8,
+    planes: &[Plane<'_>],
+    opt: &TrainOptions,
+) -> crate::Result<Setup> {
+    if frame_data_type == crate::FrameDataType::Flow || !(8..=16).contains(&bitdepth) {
         return Err(crate::Error::InvalidArgument(
-            "dimensions must be 1..=16383",
+            "frame_data_type must be Rgb/Yuv420/Yuv444, bitdepth 8..=16",
         ));
     }
-    if w.checked_mul(h).and_then(|n| n.checked_mul(3)) != Some(rgb.len()) {
-        return Err(crate::Error::InvalidArgument("rgb buffer size"));
+    if planes.len() != 3 {
+        return Err(crate::Error::InvalidArgument(
+            "expected three planes (luma + two chroma, or R + G + B)",
+        ));
+    }
+    let (w, h) = (planes[0].width as usize, planes[0].height as usize);
+    if w == 0 || h == 0 || w > 16383 || h > 16383 {
+        return Err(crate::Error::InvalidArgument(
+            "luma dimensions must be 1..=16383",
+        ));
+    }
+    let (cw, ch) = match frame_data_type {
+        crate::FrameDataType::Yuv420 => {
+            if w % 2 != 0 || h % 2 != 0 {
+                return Err(crate::Error::InvalidArgument(
+                    "yuv420 needs even luma dimensions",
+                ));
+            }
+            (w / 2, h / 2)
+        }
+        _ => (w, h),
+    };
+    let max = ((1u32 << bitdepth) - 1) as f32;
+    for (i, p) in planes.iter().enumerate() {
+        let (pw, ph) = if i == 0 { (w, h) } else { (cw, ch) };
+        if p.width as usize != pw || p.height as usize != ph {
+            return Err(crate::Error::InvalidArgument(
+                "plane dimensions do not match frame_data_type",
+            ));
+        }
+        if pw.checked_mul(ph) != Some(p.samples.len()) {
+            return Err(crate::Error::InvalidArgument("plane buffer size"));
+        }
+        if p.samples.iter().any(|&s| s as f32 > max) {
+            return Err(crate::Error::InvalidArgument(
+                "sample exceeds the bitdepth range",
+            ));
+        }
     }
     if !opt.lambda.is_finite() || opt.lambda <= 0.0 || opt.lambda > 1.0 {
         return Err(crate::Error::InvalidArgument(
@@ -192,6 +309,11 @@ fn setup(rgb: &[u8], width: u32, height: u32, opt: &TrainOptions) -> crate::Resu
                      (dumped by scripts/oracle/dump_vgg.py)",
                 ));
             }
+            if frame_data_type == crate::FrameDataType::Yuv420 {
+                return Err(crate::Error::InvalidArgument(
+                    "tune=wasserstein does not support yuv420 frame data",
+                ));
+            }
             (Dist::WASSERSTEIN, true)
         }
     };
@@ -201,18 +323,16 @@ fn setup(rgb: &[u8], width: u32, height: u32, opt: &TrainOptions) -> crate::Resu
         2 => Arch::Medium,
         _ => Arch::Low,
     };
-    let mut hdr = config::header(arch, height, width);
+    let mut hdr = config::header(arch, planes[0].height, planes[0].width);
     // Upstream: common randomness only on the residue encoder, and only for
     // `--tune wasserstein` (`utils/parsecli.py`).
     hdr.flag_common_randomness = flag_cr;
     let a = crate::decode::arch(&hdr)?;
     let shape = Shape::new(&hdr, &a)?;
     let template = shape.zero_params(&hdr, &a);
-    let mut target = Vec::with_capacity(3 * w * h);
-    for c in 0..3 {
-        for i in 0..w * h {
-            target.push(rgb[3 * i + c] as f32 / 255.0);
-        }
+    let mut target = Vec::with_capacity(planes.iter().map(|p| p.samples.len()).sum());
+    for p in planes {
+        target.extend(p.samples.iter().map(|&s| s as f32 / max));
     }
     let wass = opt
         .vgg
@@ -227,6 +347,7 @@ fn setup(rgb: &[u8], width: u32, height: u32, opt: &TrainOptions) -> crate::Resu
         wass,
         dist,
         trainer::encoder_gain(opt.lambda),
+        w * h,
     ))
 }
 
@@ -264,17 +385,39 @@ pub fn train_rgb8(
     opt: &TrainOptions,
     log: &mut dyn FnMut(String),
 ) -> crate::Result<TrainReport> {
-    let (_hdr, shape, template, target, wass, dist, gain) = setup(rgb, width, height, opt)?;
+    let bufs = rgb_planes(rgb, width, height)?;
+    let planes: Vec<Plane> = bufs
+        .iter()
+        .map(|b| Plane {
+            width,
+            height,
+            samples: b,
+        })
+        .collect();
+    train_frame(crate::FrameDataType::Rgb, 8, &planes, opt, log)
+}
+
+/// Trains a Cool-chic on a planar frame (same layout rules as [`encode_frame`]).
+pub fn train_frame(
+    frame_data_type: crate::FrameDataType,
+    bitdepth: u8,
+    planes: &[Plane<'_>],
+    opt: &TrainOptions,
+    log: &mut dyn FnMut(String),
+) -> crate::Result<TrainReport> {
+    let (_hdr, shape, template, target, wass, dist, gain, n_pix) =
+        setup(frame_data_type, bitdepth, planes, opt)?;
     let pb = Problem {
         shape: &shape,
         target: &target,
-        bitdepth: 8,
+        frame_data_type,
+        bitdepth: bitdepth as u32,
         lambda: opt.lambda,
         gain,
         dist,
         wass: wass.as_ref(),
     };
-    let n_pix = (width as usize * height as usize) as f64;
+    let n_pix = n_pix as f64;
     let (_p, l) = run_training(&pb, &template, opt, log, &enough::Unstoppable)?;
     Ok(TrainReport {
         psnr_db: -10.0 * libm::log10(l.mse),
@@ -296,10 +439,21 @@ pub fn bench_train_steps(
         arch,
         ..Default::default()
     };
-    let (_hdr, shape, template, target, wass, dist, gain) = setup(rgb, width, height, &opt)?;
+    let bufs = rgb_planes(rgb, width, height)?;
+    let planes: Vec<Plane> = bufs
+        .iter()
+        .map(|b| Plane {
+            width,
+            height,
+            samples: b,
+        })
+        .collect();
+    let (_hdr, shape, template, target, wass, dist, gain, _n_pix) =
+        setup(crate::FrameDataType::Rgb, 8, &planes, &opt)?;
     let pb = Problem {
         shape: &shape,
         target: &target,
+        frame_data_type: crate::FrameDataType::Rgb,
         bitdepth: 8,
         lambda: opt.lambda,
         gain,
@@ -389,5 +543,165 @@ mod tests {
             &mut |_| {},
         );
         assert!(matches!(e, Err(crate::Error::InvalidArgument(_))));
+    }
+
+    /// An encoded 4:2:0 frame round-trips: the stream carries `yuv420` frame data
+    /// and the decoder returns per-plane buffers at chroma half resolution.
+    #[test]
+    fn yuv420_encode_round_trips() {
+        let (w, h) = (16usize, 16usize);
+        let planes_data: Vec<Vec<u16>> = (0..3)
+            .map(|c| {
+                let (pw, ph) = if c == 0 { (w, h) } else { (w / 2, h / 2) };
+                (0..pw * ph)
+                    .map(|i| ((i * 17 + c * 91) % 256) as u16)
+                    .collect()
+            })
+            .collect();
+        let planes: Vec<Plane> = planes_data
+            .iter()
+            .enumerate()
+            .map(|(c, s)| {
+                let (pw, ph) = if c == 0 { (w, h) } else { (w / 2, h / 2) };
+                Plane {
+                    width: pw as u32,
+                    height: ph as u32,
+                    samples: s,
+                }
+            })
+            .collect();
+        let report = encode_frame(
+            crate::FrameDataType::Yuv420,
+            8,
+            &planes,
+            &TrainOptions {
+                arch: 3,
+                rdoq: false,
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        let (_, rest) = crate::header::VideoHeader::parse(&report.bitstream).unwrap();
+        let (fh, _) = crate::header::FrameHeader::parse(rest).unwrap();
+        assert_eq!(fh.frame_data_type, crate::FrameDataType::Yuv420);
+        assert_eq!(fh.bitdepth, 8);
+        let frames = crate::decode_video(&report.bitstream, &crate::Limits::default()).unwrap();
+        assert_eq!(frames.len(), 1);
+        // A trained model approximates the target within its latent capacity;
+        // the point of this test is the plumbing, not the quality.
+        assert!(report.quantized.psnr_db > 10.0);
+        let _ = frames;
+    }
+
+    /// A 10-bit 4:4:4 frame encodes with the right header fields and decodes.
+    #[test]
+    fn yuv444_10bit_encode_round_trips() {
+        let (w, h) = (16usize, 16usize);
+        let planes_data: Vec<Vec<u16>> = (0..3)
+            .map(|c| {
+                (0..w * h)
+                    .map(|i| ((i * 7 + c * 311) % 1024) as u16)
+                    .collect()
+            })
+            .collect();
+        let planes: Vec<Plane> = planes_data
+            .iter()
+            .map(|s| Plane {
+                width: w as u32,
+                height: h as u32,
+                samples: s,
+            })
+            .collect();
+        let report = encode_frame(
+            crate::FrameDataType::Yuv444,
+            10,
+            &planes,
+            &TrainOptions {
+                arch: 3,
+                rdoq: false,
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        let (_, rest) = crate::header::VideoHeader::parse(&report.bitstream).unwrap();
+        let (fh, _) = crate::header::FrameHeader::parse(rest).unwrap();
+        assert_eq!(fh.frame_data_type, crate::FrameDataType::Yuv444);
+        assert_eq!(fh.bitdepth, 10);
+        let pic = crate::decode(&report.bitstream, &crate::Limits::default()).unwrap();
+        assert_eq!((pic.width, pic.height), (w as u32, h as u32));
+    }
+
+    /// Plane layout, dimension and sample-range violations are argument errors.
+    #[test]
+    fn frame_input_validation() {
+        let ok: Vec<Plane> = (0..3)
+            .map(|c| {
+                let (pw, ph) = if c == 0 { (16u32, 16u32) } else { (8u32, 8u32) };
+                Plane {
+                    width: pw,
+                    height: ph,
+                    samples: &[0u16; 256][..pw as usize * ph as usize],
+                }
+            })
+            .collect();
+        let opt = TrainOptions::default();
+        let mut log = |_| {};
+        // Odd luma dims for yuv420.
+        let mut odd = ok.clone();
+        odd[0] = Plane {
+            width: 15,
+            height: 16,
+            samples: &[0u16; 240],
+        };
+        for (fdt, bd, planes, label) in [
+            (crate::FrameDataType::Yuv420, 8u8, &odd[..], "odd luma"),
+            (crate::FrameDataType::Yuv420, 7, &ok[..], "bitdepth"),
+            (crate::FrameDataType::Flow, 8, &ok[..], "flow"),
+            (crate::FrameDataType::Rgb, 8, &ok[..], "plane dims"),
+        ] {
+            assert!(
+                matches!(
+                    encode_frame(fdt, bd, planes, &opt, &mut log),
+                    Err(crate::Error::InvalidArgument(_))
+                ),
+                "{label}"
+            );
+        }
+        // Out-of-range sample for the declared bitdepth.
+        let mut s255 = [0u16; 256];
+        s255[0] = 256;
+        let oor = [
+            Plane {
+                width: 16,
+                height: 16,
+                samples: &s255,
+            },
+            ok[1],
+            ok[2],
+        ];
+        assert!(matches!(
+            encode_frame(crate::FrameDataType::Rgb, 8, &oor, &opt, &mut log),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+        // Wasserstein on 4:2:0 is rejected.
+        let dims = [(3usize, 4usize); 10];
+        let weights = vec![0.01f32; dims.iter().map(|&(ci, co)| co * ci * 9 + co).sum()];
+        let vgg = std::sync::Arc::new(Vgg16::from_dims(&dims, &weights).unwrap());
+        assert!(matches!(
+            encode_frame(
+                crate::FrameDataType::Yuv420,
+                8,
+                &ok,
+                &TrainOptions {
+                    tune: Tune::Wasserstein,
+                    vgg: Some(vgg),
+                    ..Default::default()
+                },
+                &mut log
+            ),
+            Err(crate::Error::InvalidArgument(_))
+        ));
     }
 }

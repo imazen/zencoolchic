@@ -118,6 +118,53 @@ pub(crate) fn quantized(raw: &[f32], bitdepth: u32) -> Vec<f32> {
         .collect()
 }
 
+/// The frame data the distortion sees (upstream `frame.forward`'s tail):
+/// `clamp(raw)` for RGB/YUV444; `clamp(convert_444_to_420(raw))` for YUV420 —
+/// chroma planes are 2×2 averages at half resolution. `out_max` additionally
+/// quantizes each sample to `round(v · max) / max` (upstream `test()` mode).
+/// Returns `[y | u | v]`/`[r | g | b]` concatenated planes.
+pub(crate) fn decoded_dict(
+    raw: &[f32],
+    w: usize,
+    h: usize,
+    frame_data_type: crate::header::FrameDataType,
+    out_max: Option<f32>,
+) -> Vec<f32> {
+    let n = w * h;
+    let mut dec: Vec<f32> = Vec::with_capacity(match frame_data_type {
+        crate::header::FrameDataType::Yuv420 => 3 * n / 2,
+        _ => 3 * n,
+    });
+    match frame_data_type {
+        crate::header::FrameDataType::Yuv420 => {
+            debug_assert!(
+                h.is_multiple_of(2) && w.is_multiple_of(2),
+                "yuv420 needs even dims"
+            );
+            dec.extend(raw[..n].iter().map(|&r| r.clamp(0.0, 1.0)));
+            for c in 1..3 {
+                let src = &raw[c * n..(c + 1) * n];
+                for by in 0..h / 2 {
+                    for bx in 0..w / 2 {
+                        let s = src[2 * by * w + 2 * bx]
+                            + src[2 * by * w + 2 * bx + 1]
+                            + src[(2 * by + 1) * w + 2 * bx]
+                            + src[(2 * by + 1) * w + 2 * bx + 1];
+                        dec.push((s / 4.0).clamp(0.0, 1.0));
+                    }
+                }
+            }
+        }
+        _ => dec.extend(raw.iter().map(|&r| r.clamp(0.0, 1.0))),
+    }
+    if let Some(m) = out_max {
+        for v in &mut dec {
+            *v = libm::rintf(*v * m) / m;
+        }
+    }
+    dec
+}
+
 /// MSE of two same-length planes (e.g. the [`quantized`] picture against the target).
 pub(crate) fn distortion_of(a: &[f32], target: &[f32]) -> f64 {
     a.iter()
@@ -158,6 +205,7 @@ mod tests {
         let pb = Problem {
             shape: &shape,
             target: &target,
+            frame_data_type: crate::header::FrameDataType::Rgb,
             bitdepth: 8,
             lambda: 1e-3,
             gain: 16.0,
@@ -203,6 +251,7 @@ mod tests {
             lambda: 1e-3,
             eval_bitdepth: None,
             dist: crate::train::Dist::MSE,
+            frame_data_type: crate::header::FrameDataType::Rgb,
         };
         let run = |threads: usize| {
             let pool = rayon::ThreadPoolBuilder::new()

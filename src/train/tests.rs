@@ -200,6 +200,12 @@ fn gradients_match_torch_autograd() {
             } else {
                 Dist::MSE
             },
+            frame_data_type: match cfg["frame_data_type"].as_str() {
+                None | Some("rgb") => crate::header::FrameDataType::Rgb,
+                Some("yuv420") => crate::header::FrameDataType::Yuv420,
+                Some("yuv444") => crate::header::FrameDataType::Yuv444,
+                Some(other) => panic!("{name}: unknown frame_data_type {other}"),
+            },
         };
         // Wasserstein dumps need the feature weights: `miniwass` dumps embed a tiny
         // stack as the "vgg" tensor with dims in `vgg_dims`; real-VGG dumps point at

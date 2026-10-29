@@ -375,6 +375,9 @@ pub(crate) struct StepCfg {
     pub(crate) eval_bitdepth: Option<u32>,
     /// Distortion weights of the phase (upstream `training_phase.dist_weight`).
     pub(crate) dist: Dist,
+    /// Layout of the frame data the distortion sees (upstream `frame_data_type`):
+    /// the synthesis output is downsampled to 4:2:0 before scoring for `Yuv420`.
+    pub(crate) frame_data_type: crate::header::FrameDataType,
 }
 
 /// Loss terms of one forward pass.
