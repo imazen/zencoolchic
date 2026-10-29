@@ -121,10 +121,13 @@ The [shared-NN assessment](zennn-assessment.md) identifies owned kernels to reus
 their source revisions, consumers and bit-order/performance risks. No `zennn`
 crate was created. Read it before replacing kernels or creating a new framework.
 
-The trait bridge currently refuses YUV output, finite working-memory budgets,
-sequential encode job policy, row streaming and animation. RGB streams have no
-color metadata carrier; the bridge assumes sRGB. A YUV extension needs explicit
-color interpretation or native planar semantics. Memory estimates/accounting,
+The trait bridge now decodes video through `AnimationFrameDecoder` (lazy coding-order
+decode via `decode::VideoDecoder`, display-order RGB frames, references retained),
+serves pull streaming as one-shot decode plus ≤64-row batches, and honors a sequential
+encode threading policy with a scoped single-thread pool (identical stream bytes).
+Still refused: YUV output (`PixelDescriptor` has no YCbCr layout or subsampling carrier),
+finite working-memory budgets (no estimate yet) and animation encode. RGB streams have no
+color metadata carrier; the bridge assumes sRGB. Memory estimates/accounting,
 fallible allocation coverage and finer cancellation granularity remain engineering
 work. Current cancellation checks are per grid/stage or training/quantization/RDOQ
 iteration; an entire convolution is not interruptible.

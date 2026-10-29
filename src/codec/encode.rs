@@ -179,12 +179,6 @@ impl EncodeJob for CoolChicEncodeJob {
         self.config.validate()?;
         self.stop.check().map_err(Error::from)?;
         check_budget_support(&self.limits)?;
-        if !self.limits.threading.is_parallel() {
-            return Err(Error::InvalidArgument(
-                "sequential policy unsupported: supply an ambient single-thread rayon pool",
-            )
-            .into());
-        }
         Ok(CoolChicEncoder { job: self })
     }
     fn animation_frame_encoder(self) -> Result<(), Self::Error> {
@@ -246,6 +240,14 @@ impl Encoder for CoolChicEncoder {
             .as_ref()
             .map(|s| s as &dyn Stop)
             .unwrap_or(&enough::Unstoppable);
+        // A sequential threading policy runs the encode on one thread: the
+        // scoped override makes every training pool single-threaded (output
+        // bytes are identical — decomposition is thread-count independent).
+        let _seq = if self.job.limits.threading.is_parallel() {
+            None
+        } else {
+            Some(crate::train::SequentialPool::install())
+        };
         let report = crate::unstable::encode_rgb8_with_stop(
             &rgb,
             width,

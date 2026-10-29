@@ -1,11 +1,16 @@
 use super::*;
 use alloc::{sync::Arc, vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
+use zencodec::decode::{AnimationFrameDecoder, StreamingDecode};
 use zencodec::encode::{EncodeJob, Encoder, EncoderConfig};
 use zenpixels::PixelSlice;
 
 fn fixture(kind: FrameDataType, depth: u32) -> Vec<u8> {
-    let mut h = crate::train::config::header(crate::train::config::Arch::Low, 3, 4);
+    fixture_at(kind, depth, 3, 4)
+}
+
+fn fixture_at(kind: FrameDataType, depth: u32, h: u32, w: u32) -> Vec<u8> {
+    let mut h = crate::train::config::header(crate::train::config::Arch::Low, h, w);
     let a = crate::decode::arch(&h).unwrap();
     let shape = crate::train::Shape::new(&h, &a).unwrap();
     let mut p = shape.zero_params(&h, &a);
@@ -24,6 +29,51 @@ fn fixture(kind: FrameDataType, depth: u32) -> Vec<u8> {
         .map(|(&(h, w), data)| crate::latent::Grid { h, w, data })
         .collect::<Vec<_>>();
     crate::write::write_image(&h, kind, depth, &values, &grids).unwrap()
+}
+
+/// A three-frame RGB video (I0, B1, P2 — coding order I,P,B) through
+/// `encode_video`, so the animation path exercises coding ≠ display order.
+fn video_fixture() -> Vec<u8> {
+    use crate::unstable::{Plane, TrainOptions, VideoOptions, encode_video};
+    let (w, h) = (16usize, 16usize);
+    let data: Vec<Vec<u16>> = (0..3)
+        .map(|shift| {
+            (0..3 * w * h)
+                .map(|i| ((i * 5 + shift * 41) % 256) as u16)
+                .collect()
+        })
+        .collect();
+    let frames: Vec<Vec<Plane>> = data
+        .iter()
+        .map(|d| {
+            (0..3)
+                .map(|c| Plane {
+                    width: w as u32,
+                    height: h as u32,
+                    samples: &d[c * w * h..(c + 1) * w * h],
+                })
+                .collect()
+        })
+        .collect();
+    let views: Vec<&[Plane]> = frames.iter().map(|f| f.as_slice()).collect();
+    let opt = TrainOptions {
+        arch: 3,
+        n_itr: 2000,
+        rdoq: false,
+        ..Default::default()
+    };
+    encode_video(
+        FrameDataType::Rgb,
+        8,
+        &views,
+        &[0],
+        &[2],
+        &opt,
+        &mut VideoOptions::default(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .bitstream
 }
 
 fn fast_config() -> CoolChicEncoderConfig {
@@ -444,6 +494,120 @@ fn push_sink_preserves_pixels_with_strided_destination() {
         assert_eq!(&sink.bytes[y * 15..y * 15 + 12], one.pixels().row(y as u32));
         assert_eq!(&sink.bytes[y * 15 + 12..(y + 1) * 15], &[0xaa; 3]);
     }
+}
+
+#[test]
+fn animation_decoder_yields_display_order_frames() {
+    let stream = video_fixture();
+    let native = crate::decode_video(
+        &stream,
+        &crate::Limits {
+            max_frames: 8,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(native.len(), 3);
+    let mut dec = CoolChicDecoderConfig
+        .job()
+        .animation_frame_decoder(Cow::Borrowed(&stream[..]), &[])
+        .unwrap();
+    assert_eq!(dec.frame_count(), Some(3));
+    assert_eq!(dec.loop_count(), None);
+    assert_eq!((dec.info().width, dec.info().height), (16, 16));
+    for (i, want) in native.iter().enumerate() {
+        let f = dec.render_next_frame(None).unwrap().unwrap();
+        assert_eq!(f.frame_index(), i as u32);
+        assert_eq!(f.duration_ms(), 0);
+        let got = f.pixels();
+        assert_eq!((got.width(), got.rows()), (16, 16));
+        assert_eq!(got.descriptor(), PixelDescriptor::RGB8_SRGB);
+        assert_eq!(
+            got.contiguous_bytes().as_ref(),
+            want.to_rgb8().unwrap().as_slice()
+        );
+    }
+    assert!(dec.render_next_frame(None).unwrap().is_none());
+}
+
+#[test]
+fn animation_decoder_rejects_yuv_and_honors_limits() {
+    // A single-frame still is a degenerate animation: it yields once.
+    let still = fixture(FrameDataType::Rgb, 8);
+    let mut dec = CoolChicDecoderConfig
+        .job()
+        .animation_frame_decoder(Cow::Borrowed(&still[..]), &[])
+        .unwrap();
+    assert_eq!(dec.frame_count(), Some(1));
+    let f = dec.render_next_frame(None).unwrap().unwrap();
+    assert_eq!((f.pixels().width(), f.pixels().rows()), (4, 3));
+    assert!(dec.render_next_frame(None).unwrap().is_none());
+    for kind in [FrameDataType::Yuv420, FrameDataType::Yuv444] {
+        let bytes = fixture(kind, 8);
+        let e = CoolChicDecoderConfig
+            .job()
+            .animation_frame_decoder(Cow::Borrowed(&bytes[..]), &[])
+            .err()
+            .unwrap();
+        assert_eq!(
+            category(e),
+            ImageError::Unsupported(UnsupportedImageKind::Feature).into()
+        );
+    }
+    let stream = video_fixture();
+    let e = CoolChicDecoderConfig
+        .job()
+        .with_limits(ResourceLimits::none().with_max_frames(2))
+        .animation_frame_decoder(Cow::Borrowed(&stream[..]), &[])
+        .err()
+        .unwrap();
+    assert_eq!(category(e), ResourceError::Limits(LimitKind::Frames).into());
+}
+
+#[test]
+fn streaming_batches_cover_the_one_shot_decode() {
+    // 70 rows → two batches (64 + 6), exercising the strip boundary.
+    let bytes = fixture_at(FrameDataType::Rgb, 8, 70, 4);
+    let mut s = CoolChicDecoderConfig
+        .job()
+        .streaming_decoder(Cow::Borrowed(&bytes[..]), &[])
+        .unwrap();
+    assert_eq!((s.info().width, s.info().height), (4, 70));
+    let mut buf = Vec::new();
+    let mut y = 0u32;
+    while let Some((off, slice)) = s.next_batch().unwrap() {
+        assert_eq!(off, y);
+        y += slice.rows();
+        buf.extend_from_slice(slice.contiguous_bytes().as_ref());
+    }
+    assert_eq!(y, 70);
+    let one = CoolChicDecoderConfig
+        .job()
+        .decoder(Cow::Borrowed(&bytes[..]), &[])
+        .unwrap()
+        .decode()
+        .unwrap();
+    assert_eq!(buf, one.pixels().contiguous_bytes().as_ref());
+}
+
+#[test]
+fn sequential_threading_encodes_identical_bytes() {
+    let packed: Vec<u8> = (0..36).map(|i| (i * 7) as u8).collect();
+    let pixels = || PixelSlice::new(&packed, 4, 3, 12, PixelDescriptor::RGB8_SRGB).unwrap();
+    let parallel = fast_config()
+        .job()
+        .encoder()
+        .unwrap()
+        .encode(pixels())
+        .unwrap();
+    let sequential = fast_config()
+        .job()
+        .with_limits(ResourceLimits::none().with_threading(zencodec::ThreadingPolicy::Sequential))
+        .encoder()
+        .unwrap()
+        .encode(pixels())
+        .unwrap();
+    assert_eq!(sequential.data(), parallel.data());
 }
 
 #[test]

@@ -443,12 +443,53 @@ pub(crate) fn pool(n_pix: usize) -> &'static rayon::ThreadPool {
                 .expect("rayon pool")
         })
     }
+    if let Some(p) = POOL_OVERRIDE.with(|c| c.get()) {
+        return p;
+    }
     static P4: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     static P8: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     match n_pix {
         ..=32_768 => get(4, &P4),
         32_769..=131_072 => get(8, &P8),
         _ => get(4, &P4),
+    }
+}
+
+std::thread_local! {
+    /// When set, `pool()` yields this pool — the scoped sequential-encode
+    /// override below. Thread-local, so concurrent encodes on other threads are
+    /// unaffected; `pool()` is always evaluated on the calling thread before
+    /// `install`, never inside installed work.
+    static POOL_OVERRIDE: core::cell::Cell<Option<&'static rayon::ThreadPool>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// While the guard lives, [`pool`] on this thread yields a shared single-thread
+/// pool: the zencodec `Sequential`/`SingleThread` threading policy, honored as
+/// rayon-with-one-thread (identical bytes; decomposition is thread-count
+/// independent). Dropping restores the problem-sized pools.
+#[cfg(feature = "zencodec")]
+pub(crate) struct SequentialPool(());
+
+#[cfg(feature = "zencodec")]
+impl SequentialPool {
+    pub(crate) fn install() -> Self {
+        static P1: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+        let p = P1.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("rayon pool")
+        });
+        POOL_OVERRIDE.with(|c| c.set(Some(p)));
+        Self(())
+    }
+}
+
+#[cfg(feature = "zencodec")]
+impl Drop for SequentialPool {
+    fn drop(&mut self) {
+        POOL_OVERRIDE.with(|c| c.set(None));
     }
 }
 

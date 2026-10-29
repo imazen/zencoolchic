@@ -14,15 +14,20 @@
 //! requires. RGB 9–16-bit samples are scaled to full-range RGB16 with nearest integer
 //! rounding (source precision is recorded in `ImageInfo`). No HDR transfer is inferred.
 //!
-//! The codec needs the whole image. Pull/row/animation executors are unsupported; push
-//! decode copies the one-shot output to the sink. Metadata has no carrier; the encoder bakes its orientation into pixels and drops the rest.
+//! The codec needs the whole image at once: the pull/streaming executor decodes fully at
+//! construction and yields row batches of the result, and push decode copies the one-shot
+//! output to the sink. Animation decode is lazy in coding order and yields display-order
+//! frames (only RGB — `PixelDescriptor` cannot carry subsampled YUV); decoded frames stay
+//! resident as P/B references, so long videos keep video-decoder memory. Metadata has no
+//! carrier; the encoder bakes its orientation into pixels and drops the rest.
 //! Decode cancellation is checked between latent grids and network stages; an individual
 //! grid or convolution is not interruptible. Encode checks each training iteration,
-//! quantization candidate and RDOQ candidate. It uses the ambient rayon pool.
+//! quantization candidate and RDOQ candidate, on problem-sized rayon pools.
 //!
-//! Dimension, pixel, frame, input and output caps are enforced. Working-memory accounting
-//! is unavailable: a finite `max_memory_bytes` is refused before work rather than ignored.
-//! Likewise sequential encode requests are refused: use an ambient single-thread pool.
+//! Dimension, pixel, frame, input and output caps are enforced. A sequential threading
+//! policy runs encode on one thread (identical bytes; only speed changes). Working-memory
+//! accounting is unavailable: a finite `max_memory_bytes` is refused before work rather
+//! than ignored.
 
 use crate::Error;
 use crate::header::{CoolChicHeader, FrameDataType, FrameHeader, FrameType, VideoHeader};
@@ -30,15 +35,17 @@ use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use enough::Stop;
 use whereat::{At, ErrorAtExt};
+#[cfg(feature = "encoder")]
+use zencodec::UnsupportedOperation;
 use zencodec::decode::{
     Decode, DecodeCapabilities, DecodeJob, DecodeOutput, DecodeRowSink, DecoderConfig, OutputInfo,
 };
 use zencodec::{
     CategorizedError, CodecError, ErrorCategory, ImageError, ImageFormat, ImageFormatDefinition,
-    ImageInfo, InvalidKind, LimitKind, RequestError, ResourceError, ResourceLimits, Unsupported,
-    UnsupportedImageKind, UnsupportedOperation,
+    ImageInfo, InvalidKind, LimitKind, RequestError, ResourceError, ResourceLimits,
+    UnsupportedImageKind,
 };
-use zenpixels::{PixelBuffer, PixelDescriptor};
+use zenpixels::{PixelBuffer, PixelDescriptor, PixelSlice};
 
 impl CategorizedError for Error {
     fn codec_name(&self) -> Option<&'static str> {
@@ -68,6 +75,7 @@ impl From<Error> for At<CodecError> {
     }
 }
 
+#[cfg(feature = "encoder")]
 fn unsupported(op: UnsupportedOperation) -> At<CodecError> {
     CodecError::from_parts(
         Some("zencoolchic"),
@@ -124,6 +132,8 @@ static DECODE_DESCRIPTORS: &[PixelDescriptor] =
 static DECODE_CAPS: DecodeCapabilities = DecodeCapabilities::new()
     .with_cheap_probe(true)
     .with_stop(true)
+    .with_animation(true)
+    .with_streaming(true)
     .with_native_16bit(true)
     .with_enforces_max_pixels(true);
 
@@ -203,8 +213,8 @@ fn native_descriptor(bitdepth: u32) -> PixelDescriptor {
 impl<'a> DecodeJob<'a> for CoolChicDecodeJob {
     type Error = At<CodecError>;
     type Dec = CoolChicDecoder<'a>;
-    type StreamDec = Unsupported<At<CodecError>>;
-    type AnimationFrameDec = Unsupported<At<CodecError>>;
+    type StreamDec = CoolChicStreamDecoder;
+    type AnimationFrameDec = CoolChicAnimationDecoder;
     fn with_stop(mut self, stop: zencodec::StopToken) -> Self {
         self.stop = Some(stop);
         self
@@ -272,17 +282,80 @@ impl<'a> DecodeJob<'a> for CoolChicDecodeJob {
     }
     fn streaming_decoder(
         self,
-        _: Cow<'a, [u8]>,
-        _: &[PixelDescriptor],
+        data: Cow<'a, [u8]>,
+        preferred: &[PixelDescriptor],
     ) -> Result<Self::StreamDec, Self::Error> {
-        Err(unsupported(UnsupportedOperation::RowLevelDecode))
+        // Cool-chic decodes whole pictures; the pull API is served by decoding
+        // once at construction and yielding row batches of the result.
+        let decoder = self.decoder(data, preferred)?;
+        let output = decoder.decode()?;
+        let info = output.info().clone();
+        Ok(CoolChicStreamDecoder {
+            buf: output.into_buffer(),
+            info,
+            next_row: 0,
+        })
     }
     fn animation_frame_decoder(
         self,
-        _: Cow<'a, [u8]>,
-        _: &[PixelDescriptor],
+        data: Cow<'a, [u8]>,
+        preferred: &[PixelDescriptor],
     ) -> Result<Self::AnimationFrameDec, Self::Error> {
-        Err(unsupported(UnsupportedOperation::AnimationDecode))
+        check_budget_support(&self.limits)?;
+        self.stop.check().map_err(Error::from)?;
+        self.limits
+            .check_input_size(data.len() as u64)
+            .map_err(limit)?;
+        let (v, rest) = VideoHeader::parse(&data)?;
+        self.limits.check_frames(v.n_frames).map_err(limit)?;
+        if v.n_frames == 0 {
+            return Err(Error::Invalid("no frames").into());
+        }
+        let (f, rest) = FrameHeader::parse(rest)?;
+        if f.frame_data_type != FrameDataType::Rgb {
+            return Err(Error::Unsupported("only RGB frames are supported by zencodec").into());
+        }
+        let (h, _) = CoolChicHeader::parse(rest)?;
+        let [height, width] = h.img_size;
+        if width == 0 || height == 0 {
+            return Err(Error::Invalid("empty picture").into());
+        }
+        self.limits.check_dimensions(width, height).map_err(limit)?;
+        self.limits
+            .check_total_pixels(u64::from(width) * u64::from(height))
+            .map_err(limit)?;
+        if u64::from(width) * u64::from(height) > crate::Limits::default().max_pixels {
+            return Err(Error::LimitExceeded("pixels").into());
+        }
+        let native = native_descriptor(f.bitdepth);
+        let available: &[PixelDescriptor] = if f.bitdepth == 8 {
+            DECODE_DESCRIPTORS
+        } else {
+            &[native]
+        };
+        let descriptor =
+            zencodec::decode::negotiate_pixel_format(preferred, available).unwrap_or(native);
+        let dec = crate::decode::VideoDecoder::new(
+            data.into_owned(),
+            &crate::Limits {
+                max_pixels: self
+                    .limits
+                    .max_pixels
+                    .unwrap_or(crate::Limits::default().max_pixels)
+                    .min(crate::Limits::default().max_pixels),
+                max_frames: v.n_frames,
+            },
+            false,
+            false,
+        )?;
+        Ok(CoolChicAnimationDecoder {
+            dec,
+            job: self,
+            canvas: Vec::new(),
+            yield_pos: 0,
+            descriptor,
+            info: info(&f, &h),
+        })
     }
 }
 
@@ -316,26 +389,8 @@ impl Decode for CoolChicDecoder<'_> {
             },
             stop,
         )?;
-        let n = picture.width as usize * picture.height as usize;
         let wide = self.descriptor == PixelDescriptor::RGB16_SRGB;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(n * if wide { 6 } else { 3 })
-            .map_err(|_| {
-                CodecError::new(Some("zencoolchic"), ResourceError::OutOfMemory.into()).start_at()
-            })?;
-        let max = (1u32 << picture.bitdepth) - 1;
-        for i in 0..n {
-            for plane in &picture.planes {
-                if wide {
-                    let sample = ((u64::from(plane[i]) * 65535 + u64::from(max) / 2)
-                        / u64::from(max)) as u16;
-                    bytes.extend_from_slice(&sample.to_ne_bytes());
-                } else {
-                    bytes.push(plane[i] as u8);
-                }
-            }
-        }
+        let bytes = rgb_bytes(&picture, wide)?;
         stop.check().map_err(Error::from)?;
         let buf = PixelBuffer::from_vec(bytes, picture.width, picture.height, self.descriptor)
             .map_err(|e| {
@@ -347,6 +402,148 @@ impl Decode for CoolChicDecoder<'_> {
                 .start_at()
             })?;
         Ok(DecodeOutput::new(buf, self.info))
+    }
+}
+
+/// Interleaved RGB8 (`wide = false`) or full-range RGB16 native-endian bytes of
+/// an RGB picture's planes, scaling sub-16-bit samples with nearest integer
+/// rounding.
+fn rgb_bytes(picture: &crate::decode::Picture, wide: bool) -> Result<Vec<u8>, At<CodecError>> {
+    let n = picture.width as usize * picture.height as usize;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(n * if wide { 6 } else { 3 })
+        .map_err(|_| {
+            CodecError::new(Some("zencoolchic"), ResourceError::OutOfMemory.into()).start_at()
+        })?;
+    let max = (1u32 << picture.bitdepth) - 1;
+    for i in 0..n {
+        for plane in &picture.planes {
+            if wide {
+                let sample =
+                    ((u64::from(plane[i]) * 65535 + u64::from(max) / 2) / u64::from(max)) as u16;
+                bytes.extend_from_slice(&sample.to_ne_bytes());
+            } else {
+                bytes.push(plane[i] as u8);
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn sink_error(e: zencodec::decode::SinkError) -> At<CodecError> {
+    CodecError::from_parts(
+        Some("zencoolchic"),
+        ErrorCategory::Io(zencodec::CodecIoKind::opaque()),
+        e,
+    )
+    .start_at()
+}
+
+/// Pull-decoder yielding row batches of a one-shot decode: Cool-chic pictures
+/// are only defined whole, so construction decodes fully and `next_batch`
+/// hands out ≤64-row strips of the result.
+pub struct CoolChicStreamDecoder {
+    buf: PixelBuffer,
+    info: ImageInfo,
+    next_row: u32,
+}
+
+impl zencodec::decode::StreamingDecode for CoolChicStreamDecoder {
+    type Error = At<CodecError>;
+    fn next_batch(&mut self) -> Result<Option<(u32, PixelSlice<'_>)>, Self::Error> {
+        if self.next_row >= self.buf.height() {
+            return Ok(None);
+        }
+        let y = self.next_row;
+        let rows = (self.buf.height() - y).min(64);
+        self.next_row = y + rows;
+        Ok(Some((y, self.buf.rows(y, rows).erase())))
+    }
+    fn info(&self) -> &ImageInfo {
+        &self.info
+    }
+}
+
+/// Animation decoder over a Cool-chic video stream. Frames are decoded lazily
+/// in coding order and yielded in display order; decoded frames stay resident
+/// as P/B references. YUV frames are refused when reached — `PixelDescriptor`
+/// has no subsampled-YUV carrier — and frame sizes may differ.
+pub struct CoolChicAnimationDecoder {
+    dec: crate::decode::VideoDecoder<Vec<u8>>,
+    job: CoolChicDecodeJob,
+    canvas: Vec<u8>,
+    yield_pos: usize,
+    descriptor: PixelDescriptor,
+    info: ImageInfo,
+}
+
+impl zencodec::decode::AnimationFrameDecoder for CoolChicAnimationDecoder {
+    type Error = At<CodecError>;
+    fn wrap_sink_error(err: zencodec::decode::SinkError) -> Self::Error {
+        sink_error(err)
+    }
+    fn info(&self) -> &ImageInfo {
+        &self.info
+    }
+    fn frame_count(&self) -> Option<u32> {
+        Some(self.dec.n_frames() as u32)
+    }
+    fn render_next_frame(
+        &mut self,
+        stop: Option<&dyn Stop>,
+    ) -> Result<Option<zencodec::decode::AnimationFrame<'_>>, Self::Error> {
+        let i = self.yield_pos;
+        if i >= self.dec.n_frames() {
+            return Ok(None);
+        }
+        let mut check = || -> crate::Result<()> {
+            self.job.stop.check().map_err(Error::from)?;
+            if let Some(s) = stop {
+                s.check().map_err(Error::from)?;
+            }
+            Ok(())
+        };
+        self.dec.pull_display(i, &mut check)?;
+        let frame = self
+            .dec
+            .frame(i)
+            .ok_or(Error::Invalid("uncoded display position"))?;
+        let picture = frame.to_picture();
+        if picture.data_type != FrameDataType::Rgb {
+            return Err(Error::Unsupported("only RGB frames are supported by zencodec").into());
+        }
+        let wide = self.descriptor == PixelDescriptor::RGB16_SRGB;
+        let bytes = u64::from(picture.width) * u64::from(picture.height) * if wide { 6 } else { 3 };
+        self.job.limits.check_output_size(bytes).map_err(limit)?;
+        self.canvas = rgb_bytes(&picture, wide)?;
+        self.yield_pos += 1;
+        let row_bytes = picture.width as usize * if wide { 6 } else { 3 };
+        let slice = PixelSlice::new(
+            &self.canvas,
+            picture.width,
+            picture.height,
+            row_bytes,
+            self.descriptor,
+        )
+        .map_err(|e| {
+            CodecError::from_parts(
+                Some("zencoolchic"),
+                ErrorCategory::Internal(zencodec::InternalKind::Bug),
+                alloc::boxed::Box::new(e),
+            )
+            .start_at()
+        })?;
+        Ok(Some(zencodec::decode::AnimationFrame::new(
+            slice, 0, i as u32,
+        )))
+    }
+    fn render_next_frame_to_sink(
+        &mut self,
+        stop: Option<&dyn Stop>,
+        sink: &mut dyn DecodeRowSink,
+    ) -> Result<Option<OutputInfo>, Self::Error> {
+        zencodec::helpers::copy_frame_to_sink(self, stop, sink)
     }
 }
 
