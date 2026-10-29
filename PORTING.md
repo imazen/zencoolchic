@@ -11,7 +11,7 @@ missing codec features, validation gaps, performance work and integration limits
 
 | Module | Upstream | Status | Parity evidence |
 |---|---|---|---|
-| Video / frame / Cool-chic headers | `bitstream/header/*.py` | done (I frames) | 12 oracle streams; `tests/oracle.rs` |
+| Video / frame / Cool-chic headers | `bitstream/header/*.py` | done | 12 oracle streams + 3-frame `multi_i`; `tests/oracle.rs` |
 | Network parameters (exp-Golomb, per-module q-step) | `bitstream/neuralnet/*.py` | done | `expgolomb::tests::round_trip_all_orders`; kodim14 |
 | Fixed-point ARM / IFCE | `bitstream/component/armint.py` | done | latents bit-exact on 12 streams, incl. no-IFCE and no-stabiliser |
 | Wavefront latent decode | `bitstream/component/latent.py` | done (wavefront and width ≤ 9 raster order) | latents bit-exact on 12 streams |
@@ -21,7 +21,8 @@ missing codec features, validation gaps, performance work and integration limits
 | Final resize (bicubic; nearest / bilinear ported) | `F.interpolate` | bicubic tested (`mid_lat1_debug`, latents from 1/2 resolution); nearest/bilinear implementations lack independent frozen upstream cases | `mid_lat1_debug` |
 | Common randomness | `component/core/noise.py` | done | `mid_wasserstein_debug` (`--tune wasserstein`): all samples identical |
 | YUV 4:2:0 / 4:4:4 output | `io/format/yuv.py` | done | `yuv420_8b_debug`, `yuv444_10b_debug` (10-bit) |
-| Inter frames (P/B), warper, global motion | `bitstream/decode.py`, `component/intercoding/` | not ported: `Error::Unsupported`; multiple I frames are also refused | — |
+| Multi-frame all-intra decode | `bitstream/decode.py::decode_video`, `utils/codingstructure.py` | done: `decode_video` returns frames in display order; coding structure rebuilt and cross-checked against each frame header | `multi_i` oracle case: three upstream-decoded frames (mixed RGB / 4:2:0, mixed sizes) bit-exact |
+| Inter frames (P/B), warper, global motion | `bitstream/decode.py::decode_frame`, `component/intercoding/` | not ported: `Error::Unsupported` | — |
 
 ### Measured parity (2026-10-17, mac, torch 2.14.1 CPU)
 

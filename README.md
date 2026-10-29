@@ -4,10 +4,12 @@ A safe-Rust port of [Cool-chic](https://github.com/Orange-OpenSource/Cool-Chic) 
 overfitted neural image codec: each image carries its own tiny decoder (latent grids, an
 auto-regressive entropy model, upsampling and a small synthesis CNN, about 2000 MAC per pixel).
 
-**Status: still-image decoder and experimental encoder.** The decoder's integer latents
-match upstream on 12 oracle streams; floating-point reconstruction differs by at most one
-output step. Inter frames are not ported. See [`PORTING.md`](PORTING.md) for evidence.
-[Remaining work](docs/REMAINING-WORK.md) maps the unported features to source and tests.
+**Status: still-image and all-intra video decoder, experimental encoder.** The decoder's
+integer latents match upstream on 12 oracle streams; floating-point reconstruction differs
+by at most one output step. `decode_video` returns every frame of an all-intra stream in
+display order. Inter (P/B) frames are not ported. See [`PORTING.md`](PORTING.md) for
+evidence. [Remaining work](docs/REMAINING-WORK.md) maps the unported features to source
+and tests.
 
 ```rust
 let data = std::fs::read("kodim14.cool")?;
@@ -33,8 +35,9 @@ The last arguments are iteration budget (minimum 2000), lambda, and architecture
 These are one-image observations, not a quality or speed calibration
 ([recorded benchmark](benchmarks/encode_cid22_1279330_2026-10-17.tsv)).
 
-Encoding YUV/10-bit input, common randomness / Wasserstein tuning, latents starting below
-full resolution, and video are not supported. [Encoder details](docs/ENCODER.md) covers
+Encoding YUV/10-bit input, latents starting below full resolution, and video are not
+supported; `Tune::Wasserstein` (common randomness + VGG16 perceptual loss) is available
+with supplied weights. [Encoder details](docs/ENCODER.md) covers
 settings, determinism, the training pipeline, and parity evidence.
 
 Optional `zencodec` support provides RGB probing/decoding and, with `encoder`, a public
