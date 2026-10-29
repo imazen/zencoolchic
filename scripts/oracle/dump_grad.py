@@ -4,7 +4,9 @@ Usage: python -I scripts/oracle/dump_grad.py <Cool-Chic checkout> <image.png> <o
 config: "hop" (default), "small" (tiny networks, fast), "wass" (common randomness +
   Wasserstein tune on the small networks), "miniwass" (same, but the loss's VGG16 is
   replaced by a tiny seeded conv stack with the same tap/pool positions; the weights
-  ride along in the dump so no external file is needed).
+  ride along in the dump so no external file is needed), "yuv420" (small networks;
+  the target is the input downsampled to a 4:2:0 dict, and the loss is upstream's
+  per-plane-sample-weighted MSE).
 
 Latents and all network weights get seeded random values (upstream initializes latents to
 zero, which would make most gradients trivially zero). The pass is deterministic: the
@@ -189,11 +191,25 @@ if "wasserstein" in dist_weight:
         tensors_grad_taps.append(torch.autograd.grad(di, fa)[0].detach().clone())
 rate_bits = out["rate"].sum()
 n_pixels = h * w
+if config == "yuv420":
+    from coolchic.io.format.yuv import convert_444_to_420, yuv_dict_clamp  # noqa: E402
+    from coolchic.training.loss import _compute_mse  # noqa: E402
+
+    # Upstream's encode-side reconstruction tail: downsample the clamped output
+    # to the {y,u,v} dict, then the per-plane-sample-weighted MSE.
+    dec_d = yuv_dict_clamp(convert_444_to_420(out["raw_out"]), 0.0, 1.0)
+    tgt_d = convert_444_to_420(img)
+    mse = _compute_mse(dec_d, tgt_d).reshape(())
+    flat_target = torch.cat(
+        [tgt_d["y"].reshape(-1), tgt_d["u"].reshape(-1), tgt_d["v"].reshape(-1)]
+    )
+else:
+    flat_target = img.reshape(-1)
 dist = dist_weight["mse"] * mse + dist_weight.get("wasserstein", 0.0) * wd
 loss = dist + lmbda * rate_bits / n_pixels
 loss.backward()
 
-tensors = [("target", img), ("uniform_noise", uniform)]
+tensors = [("target", flat_target), ("uniform_noise", uniform)]
 names = []
 for name, p in cc.named_parameters():
     names.append(name)
@@ -237,6 +253,7 @@ json.dump(
         "softround_temperature": 0.3,
         "noise_parameter": noise_parameter,
         "flag_common_randomness": flag_cr,
+        "frame_data_type": "yuv420" if config == "yuv420" else "rgb",
         "dist_weight": dist_weight,
         "vgg_dims": MINI_VGG_DIMS if config == "miniwass" else None,
         "loss": loss.item(),
