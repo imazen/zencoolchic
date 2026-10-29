@@ -82,8 +82,11 @@ headers.
   residue and motion cfgs (arm 9,2 / 5,1, custom layer strings, latent
   2-6 / 1-4, ups 6+5 / 4+3) also validates: the I frame decodes
   bit-identically and the P frame agrees to 73.6 dB (1,115/24,576 samples
-  off by ≤2 — the same float-accumulation class as `pb_128`). Note
-  upstream v5.0.1's own checkpoint-resume path serializes the wrong
+  off by ≤2 — the same float-accumulation class as `pb_128`). An
+  upstream-encoded 10-bit 4:4:4 still (mop cfg: IFCE=4, ifce_resolution
+  (0,2), hyperlatents, stabilisers) agrees within 1 on 2/12,288 samples —
+  every header data type now has an upstream-encoded differential case.
+  Note upstream v5.0.1's own checkpoint-resume path serializes the wrong
   `frame_data_type`/`bitdepth` (`rgb`/8) for still-yuv encodes; a fresh
   `cc_encode` run produces correct headers, and resume is unported here
   anyway.
