@@ -9,8 +9,14 @@ cargo run --release --example encode --features encoder -- input.ppm output.cool
 ```
 
 The current direct entry points live in the doc-hidden `unstable` module and are experimental.
-The encoder accepts interleaved RGB8; it does not convert color. Use full-range sRGB input.
-It does not encode YUV, higher bit depths, sub-full-resolution starting latents, or video.
+`encode_rgb8`/`train_rgb8` accept interleaved 8-bit RGB; the encoder does not convert
+color, so use full-range sRGB input. `encode_frame`/`train_frame` take three planar
+`u16` planes: RGB and YUV 4:4:4 at full resolution, or YUV 4:2:0 with
+full-resolution luma and half-resolution chroma (even luma dimensions), at 8–16
+bits per sample. The 4:2:0 loss reproduces upstream's downsample-then-clamp tail
+and per-plane-sample MSE weighting; `Tune::Wasserstein` rejects 4:2:0 the way
+upstream's VGG path requires a full-resolution three-channel tensor.
+It does not encode sub-full-resolution starting latents or video.
 The decoder supports more stream tools than the encoder creates; see
 [the porting table](../PORTING.md#decoder).
 

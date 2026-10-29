@@ -26,7 +26,11 @@ same bytes across Python/torch versions, devices or random generators.
   ImageNet VGG16 (a ~528 MB torchvision download on first use); `miniwass`
   substitutes a deterministic ten-convolution miniature (seed 4242) whose flat
   weights are embedded in the dump as `vgg` with `vgg_dims`, so the frozen
-  gradient case needs no external weights. Wasserstein dumps also store the
+  gradient case needs no external weights. The `yuv420` config trains the same
+  small networks against the input downsampled to a 4:2:0 dict
+  (`convert_444_to_420` + `yuv_dict_clamp` + the per-plane-sample-weighted
+  `_compute_mse`) so the encode-side YUV loss and its chroma-average backward
+  are checked against float64 autograd. Wasserstein dumps also store the
   clamped `decoded` image, `tap{i}` features, `gtap{i}` tap gradients,
   `grad_dec` (`d wasserstein/d decoded`), `wasserstein_per_tap` and
   `dist_weight`.
