@@ -13,6 +13,7 @@ use crate::header::{
 use crate::latent::{self, Grid};
 use crate::nn::{self, CommonNoise, Conv, Planes, Scale, Synthesis, Upsampling};
 use crate::rangecoder::RangeDecoder;
+use crate::warp;
 
 /// Pre-flight limits, checked against the headers before any picture-sized allocation.
 #[derive(Debug, Clone, Copy)]
@@ -633,6 +634,41 @@ struct DecodedFrame {
 }
 
 impl DecodedFrame {
+    /// The frame as a 3-channel full-resolution tensor — upstream converts
+    /// 4:2:0 references to 4:4:4 with a `scale_factor=2` nearest upsample
+    /// before warping (`convert_420_to_444`).
+    fn as_444(&self) -> Result<Planes> {
+        let (w, h) = self.plane_dims[0];
+        let (w, h) = (w as usize, h as usize);
+        match self.data_type {
+            FrameDataType::Rgb | FrameDataType::Yuv444 => Ok(Planes {
+                c: 3,
+                h,
+                w,
+                data: self.planes.concat(),
+            }),
+            FrameDataType::Yuv420 => {
+                let (cw, ch) = (self.plane_dims[1].0 as usize, self.plane_dims[1].1 as usize);
+                if 2 * cw != w || 2 * ch != h {
+                    return Err(Error::Invalid("4:2:0 chroma/luma size mismatch"));
+                }
+                let mut data = Vec::with_capacity(3 * h * w);
+                data.extend_from_slice(&self.planes[0]);
+                for p in &self.planes[1..3] {
+                    for y in 0..h {
+                        let row = &p[(y / 2) * cw..(y / 2) * cw + cw];
+                        for x in 0..w {
+                            data.push(row[x / 2]);
+                        }
+                    }
+                }
+                debug_assert_eq!((2 * cw, 2 * ch), (w, h));
+                Ok(Planes { c: 3, h, w, data })
+            }
+            FrameDataType::Flow => Err(Error::Invalid("flow reference frame")),
+        }
+    }
+
     /// Integer samples (`round(x · (2^b - 1))`), one plane per channel.
     fn to_picture(&self) -> Picture {
         let max = ((1u32 << self.bitdepth) - 1) as f32;
@@ -651,12 +687,22 @@ impl DecodedFrame {
     }
 }
 
-/// Cool-chic internals of one frame, kept for oracle inspection (upstream drops them).
-struct FrameAux {
+/// Cool-chic internals of one frame's network, kept for oracle inspection
+/// (upstream drops them).
+struct CcAux {
     grids: Vec<Grid>,
     is_hyperlatent: Vec<bool>,
-    /// Residue synthesis output before the reconstruction tail, `[c][h][w]`.
+    /// Synthesis output before the reconstruction tail, `[c][h][w]`.
     raw: Planes,
+}
+
+/// Per-frame internals: the residue network always, plus the motion network
+/// for inter frames.
+struct FrameAux {
+    residue: CcAux,
+    /// Only oracle tests read the motion network's internals.
+    #[cfg_attr(not(all(test, feature = "oracle")), allow(dead_code))]
+    motion: Option<CcAux>,
 }
 
 /// The shared reconstruction tail of upstream `decode_frame`: quantize the
@@ -727,6 +773,117 @@ fn finish_frame(decoded: &Planes, fh: &FrameHeader) -> Result<DecodedFrame> {
     })
 }
 
+/// Decodes one P or B frame: residue + motion Cool-chic payloads, globally
+/// shifted references, warping and alpha/beta compositing — the inter branch of
+/// upstream `decode_frame`. Returns the frame and the remaining bytes.
+fn decode_inter<'a>(
+    fh: &FrameHeader,
+    index_references: &[u32],
+    data: &'a [u8],
+    frames: &[Option<DecodedFrame>],
+    limits: &Limits,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<(DecodedFrame, FrameAux, &'a [u8])> {
+    // Residue first, then motion, in stream order.
+    let (residue, r_grids, r_hyper, rest) = decode_coolchic(data, limits, check)?;
+    let (motion, m_grids, m_hyper, rest) = decode_coolchic(rest, limits, check)?;
+
+    let mut refs = Vec::with_capacity(index_references.len());
+    for &d in index_references {
+        let rf = frames
+            .get(d as usize)
+            .and_then(|f| f.as_ref())
+            .ok_or(Error::Invalid("missing reference frame"))?;
+        // 4:2:0 references are upsampled to 4:4:4 before warping.
+        refs.push(rf.as_444()?);
+    }
+    let (h, w) = (refs[0].h, refs[0].w);
+    if refs[1..].iter().any(|r| r.h != h || r.w != w)
+        || residue.h != h
+        || residue.w != w
+        || motion.h != h
+        || motion.w != w
+    {
+        return Err(Error::Invalid("reference/residue/motion size mismatch"));
+    }
+    if fh.global_flow.len() != 2 * refs.len() {
+        return Err(Error::Invalid("global_flow"));
+    }
+    let filter_size = fh
+        .warp_filter_size
+        .ok_or(Error::Invalid("missing warp_filter_size"))?;
+    let (need_res, need_mot) = if fh.frame_type == FrameType::B {
+        (5, 4)
+    } else {
+        (4, 2)
+    };
+    if residue.c < need_res || motion.c < need_mot {
+        return Err(Error::Invalid("residue/motion channel count"));
+    }
+    let n = h * w;
+
+    // Integer global translation per reference ((x, y) pairs in stream order).
+    let shifted: Vec<Planes> = refs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| warp::translate(r, fh.global_flow[2 * i], fh.global_flow[2 * i + 1]))
+        .collect();
+
+    // Flow channel 0 is the horizontal (x) displacement, channel 1 vertical.
+    let mut pred = warp::warp(
+        &shifted[0],
+        &motion.data[..n],
+        &motion.data[n..2 * n],
+        filter_size,
+    )?;
+    if fh.frame_type == FrameType::B {
+        let pred1 = warp::warp(
+            &shifted[1],
+            &motion.data[2 * n..3 * n],
+            &motion.data[3 * n..4 * n],
+            filter_size,
+        )?;
+        // pred = beta * warp(ref0, flow1) + (1 - beta) * warp(ref1, flow2)
+        // with beta = clamp(residue[4] + 0.5, 0, 1), shared across channels.
+        let beta = &residue.data[4 * n..5 * n];
+        for c in 0..3 {
+            for (i, &b) in beta.iter().enumerate() {
+                let b = (b + 0.5).clamp(0.0, 1.0);
+                pred.data[c * n + i] = b * pred.data[c * n + i] + (1.0 - b) * pred1.data[c * n + i];
+            }
+        }
+    }
+
+    // decoded = clamp(residue[3] + 0.5, 0, 1) * pred + residue[:, :3]
+    let alpha = &residue.data[3 * n..4 * n];
+    let mut img = Vec::with_capacity(3 * n);
+    for c in 0..3 {
+        for (i, &a) in alpha.iter().enumerate() {
+            img.push((a + 0.5).clamp(0.0, 1.0) * pred.data[c * n + i] + residue.data[c * n + i]);
+        }
+    }
+    let decoded = Planes {
+        c: 3,
+        h,
+        w,
+        data: img,
+    };
+    let frame = finish_frame(&decoded, fh)?;
+    let aux = FrameAux {
+        residue: CcAux {
+            grids: r_grids,
+            is_hyperlatent: r_hyper,
+            raw: residue,
+        },
+        motion: Some(CcAux {
+            grids: m_grids,
+            is_hyperlatent: m_hyper,
+            raw: motion,
+        }),
+    };
+    Ok((frame, aux, rest))
+}
+
 /// Decodes the first frame of a Cool-chic bitstream (an image).
 pub fn decode(data: &[u8], limits: &Limits) -> Result<Picture> {
     decode_inner(data, limits, &mut || Ok(())).map(|(p, _)| p)
@@ -759,12 +916,17 @@ fn decode_inner(
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<(Picture, DecodeDetails)> {
     let (frames, aux) = decode_video_inner(data, limits, true, check)?;
-    let aux = aux.ok_or(Error::Invalid("no frames"))?;
+    let aux = aux.into_iter().next().ok_or(Error::Invalid("no frames"))?;
     let latents = DecodeDetails {
-        grids: aux.grids.into_iter().map(|g| (g.h, g.w, g.data)).collect(),
-        is_hyperlatent: aux.is_hyperlatent,
-        raw_channels: aux.raw.c,
-        raw: aux.raw.data,
+        grids: aux
+            .residue
+            .grids
+            .into_iter()
+            .map(|g| (g.h, g.w, g.data))
+            .collect(),
+        is_hyperlatent: aux.residue.is_hyperlatent,
+        raw_channels: aux.residue.raw.c,
+        raw: aux.residue.raw.data,
     };
     Ok((frames[0].to_picture(), latents))
 }
@@ -778,7 +940,7 @@ fn decode_video_inner(
     limits: &Limits,
     single_frame: bool,
     check: &mut dyn FnMut() -> Result<()>,
-) -> Result<(Vec<DecodedFrame>, Option<FrameAux>)> {
+) -> Result<(Vec<DecodedFrame>, Vec<FrameAux>)> {
     check()?;
     let (vh, rest) = VideoHeader::parse(data)?;
     if vh.n_frames > limits.max_frames {
@@ -791,7 +953,8 @@ fn decode_video_inner(
     let n = vh.n_frames as usize;
     let mut frames: Vec<Option<DecodedFrame>> = Vec::new();
     frames.resize_with(n, || None);
-    let mut aux = None;
+    let mut aux: Vec<Option<FrameAux>> = Vec::new();
+    aux.resize_with(n, || None);
     let mut rest = rest;
     for sf in &structure {
         check()?;
@@ -812,25 +975,38 @@ fn decode_video_inner(
                 "frame header does not match the coding structure",
             ));
         }
-        if fh.frame_type != FrameType::I {
-            return Err(Error::Unsupported("inter frames"));
-        }
-        let (raw, grids, hyper, r) = decode_coolchic(rest, limits, check)?;
-        rest = r;
-        let frame = finish_frame(&raw, &fh)?;
-        frames[sf.display_order as usize] = Some(frame);
-        if single_frame {
-            aux = Some(FrameAux {
-                grids,
-                is_hyperlatent: hyper,
-                raw,
-            });
+        match fh.frame_type {
+            FrameType::I => {
+                let (raw, grids, hyper, r) = decode_coolchic(rest, limits, check)?;
+                rest = r;
+                let frame = finish_frame(&raw, &fh)?;
+                frames[sf.display_order as usize] = Some(frame);
+                aux[sf.display_order as usize] = Some(FrameAux {
+                    residue: CcAux {
+                        grids,
+                        is_hyperlatent: hyper,
+                        raw,
+                    },
+                    motion: None,
+                });
+            }
+            FrameType::P | FrameType::B => {
+                let (frame, f_aux, r) =
+                    decode_inter(&fh, &sf.index_references, rest, &frames, limits, check)?;
+                rest = r;
+                frames[sf.display_order as usize] = Some(frame);
+                aux[sf.display_order as usize] = Some(f_aux);
+            }
         }
     }
     // A valid structure covers every display position exactly once.
     let frames = frames
         .into_iter()
         .map(|f| f.ok_or(Error::Invalid("uncoded display position")))
+        .collect::<Result<Vec<_>>>()?;
+    let aux = aux
+        .into_iter()
+        .map(|a| a.ok_or(Error::Invalid("uncoded display position")))
         .collect::<Result<Vec<_>>>()?;
     Ok((frames, aux))
 }
@@ -934,9 +1110,10 @@ mod tests {
     }
 
     #[test]
-    fn inter_frames_are_still_unsupported() {
+    fn inter_frame_without_payloads_errors() {
         let (stream, _, _) = two_frame_stream(0, 1);
-        // Take frame 0 from the real stream, then append a P-frame header.
+        // Take frame 0 from the real stream, then append a bare P-frame header:
+        // its residue and motion Cool-chic payloads are absent.
         let (_vh, rest) = VideoHeader::parse(&stream).unwrap();
         let (_fh, r1) = FrameHeader::parse(rest).unwrap();
         let (ch, r2) = CoolChicHeader::parse(r1).unwrap();
@@ -971,7 +1148,70 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Err(Error::Unsupported(_))
+            Err(Error::Truncated(_)) | Err(Error::Invalid(_))
         ));
+    }
+}
+
+#[cfg(all(test, feature = "oracle"))]
+mod oracle {
+    use super::*;
+    use crate::oracle_fixtures;
+    use alloc::vec;
+    use std::{eprintln, format, vec::Vec};
+
+    fn read_f32(data: &[u8]) -> Vec<f32> {
+        data.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect()
+    }
+
+    /// Per-frame raw Cool-chic outputs (residue always, motion for inter)
+    /// match upstream's synthesis before the reconstruction tail.
+    #[test]
+    fn video_raw_outputs_match_upstream() {
+        for name in oracle_fixtures::cases("video") {
+            let data = oracle_fixtures::read("video", &format!("{name}.cool"));
+            let meta: serde_json::Value =
+                serde_json::from_slice(&oracle_fixtures::read("video", &format!("{name}.json")))
+                    .unwrap();
+            let n_frames = meta["n_frames"].as_u64().unwrap() as usize;
+            let limits = Limits {
+                max_frames: n_frames as u32,
+                ..Default::default()
+            };
+            let (_, aux) = decode_video_inner(&data, &limits, false, &mut || Ok(())).unwrap();
+            for (i, fmeta) in meta["frames"].as_array().unwrap().iter().enumerate() {
+                let frame_type = fmeta["frame_type"].as_str().unwrap_or("I");
+                let mut ccs = vec![("residue", &aux[i].residue.raw)];
+                if let Some(m) = aux[i].motion.as_ref() {
+                    ccs.push(("motion", &m.raw));
+                }
+                for (cc, raw) in ccs {
+                    let shape = fmeta[&format!("{cc}_shape")].as_array().unwrap();
+                    assert_eq!(raw.c as u64, shape[1].as_u64().unwrap());
+                    assert_eq!(raw.h as u64, shape[2].as_u64().unwrap());
+                    assert_eq!(raw.w as u64, shape[3].as_u64().unwrap());
+                    let want = read_f32(&oracle_fixtures::read(
+                        "video",
+                        &format!("{name}.{i}.{cc}.f32"),
+                    ));
+                    assert_eq!(raw.data.len(), want.len());
+                    let max = raw
+                        .data
+                        .iter()
+                        .zip(&want)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    eprintln!("{name} frame {i} {cc} ({frame_type}): raw max |Δ| {max:e}");
+                    assert!(
+                        max <= 1e-6,
+                        "{name} frame {i} {cc}: raw error {max:e} exceeds recorded bound"
+                    );
+                }
+            }
+        }
     }
 }

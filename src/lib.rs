@@ -36,6 +36,7 @@ mod train;
 #[cfg(feature = "encoder")]
 #[doc(hidden)]
 pub mod unstable;
+mod warp;
 #[cfg(feature = "encoder")]
 mod write;
 
