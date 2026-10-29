@@ -49,6 +49,50 @@ pub struct TrainOptions {
     /// (upstream `rescale_output`); it is incompatible with
     /// [`Tune::Wasserstein`]'s common randomness.
     pub latent_res: Option<(u8, u8)>,
+    /// Per-module architecture overrides, applied on top of `arch`'s preset
+    /// after `latent_res` (upstream's `cfg/dec/*` fields / `--*_residue` CLI
+    /// knobs; see [`ModuleArch`]). On stills it customizes the single module;
+    /// in video it applies to every I frame's residue module.
+    pub custom: Option<ModuleArch>,
+}
+
+/// Custom architecture of one Cool-chic module — upstream's
+/// `cfg/dec/{intra,residue,motion}/*.cfg` fields and the matching
+/// `--<name>_{residue,motion}` CLI knobs, in upstream's `parsecli` string
+/// syntax so cfg-file values paste verbatim. Every `None` keeps the preset
+/// chosen by [`TrainOptions::arch`]. Anything upstream can express
+/// (e.g. the `vlop` residue cfg, which has no preset here) is reachable.
+#[derive(Clone, Debug, Default)]
+pub struct ModuleArch {
+    /// `--layers_synthesis_*`: comma-separated
+    /// `out_ft-k_size-{linear|residual}-{none|relu}` tokens plus an optional
+    /// `/stabiliser` suffix. `X` in `out_ft` is replaced by the module's
+    /// output feature count (3 for a still, `3+refs` residue, `2*refs`
+    /// motion). Upstream examples: `"16-1-linear-relu,X-1-linear-none,
+    /// X-3-residual-none/stabiliser"` (residue mop), `"8-1-linear-relu,
+    /// X-1-linear-none/stabiliser"` (motion lop).
+    pub layers_synthesis: Option<String>,
+    /// `--arm_*`: `"context,hidden"` plus an optional `/stabiliser` suffix
+    /// (`"10,2/stabiliser"`, `"6,1"` — without the suffix the ARM stabiliser
+    /// is off).
+    pub arm: Option<String>,
+    /// `--output_feature_ifce_*` (0–31). Forced to 0 when
+    /// `ifce_resolution` resolves to `None`, like upstream.
+    pub output_feature_ifce: Option<u32>,
+    /// `--ifce_resolution_*`: `"no"` for none, `"lo-hi"` for a grid range.
+    /// A `Some` range requires `output_feature_ifce > 0` — the header cannot
+    /// serialize the pair otherwise.
+    pub ifce_resolution: Option<String>,
+    /// `--latent_resolution_*`: `"auto"` (image-size-derived `(0, 6..8)`)
+    /// or `"lo-hi"` (0–15, `lo <= hi`).
+    pub latent_resolution: Option<String>,
+    /// `--hyperlatent_resolution_*`: `"no"`, `"auto"` (`(4, 6..8)`) or
+    /// `"lo-hi"`.
+    pub hyperlatent_resolution: Option<String>,
+    /// `--ups_k_size_*` (0–15): kernel size of each upsampling conv.
+    pub ups_k_size: Option<u32>,
+    /// `--ups_preconcat_k_size_*` (0–15): kernel size of the merge conv.
+    pub ups_preconcat_k_size: Option<u32>,
 }
 
 impl Default for TrainOptions {
@@ -63,6 +107,7 @@ impl Default for TrainOptions {
             tune: Tune::Mse,
             vgg: None,
             latent_res: None,
+            custom: None,
         }
     }
 }
@@ -257,6 +302,15 @@ pub struct VideoOptions<'a> {
     /// `None` to skip guided pre-training for this frame. The trained model is
     /// injected into every odd warm-up candidate, like upstream.
     pub flow: Option<FlowEstimator<'a>>,
+    /// Architecture overrides for each P/B frame's residue module (upstream's
+    /// `--*_residue` knobs / `cfg/dec/residue/*.cfg`; I frames use
+    /// [`TrainOptions::custom`]).
+    pub custom_residue: Option<ModuleArch>,
+    /// Architecture overrides for each P/B frame's motion module (upstream's
+    /// `--*_motion` knobs / `cfg/dec/motion/*.cfg`). `final_upsampling` stays
+    /// `nearest` and `latent`/`hyperlatent` keep upstream's motion shapes
+    /// unless overridden.
+    pub custom_motion: Option<ModuleArch>,
 }
 
 /// The external optical-flow callback of [`VideoOptions::flow`].
@@ -541,10 +595,22 @@ pub(crate) fn encode_video_with_stop(
                 h_r.n_latent_grids =
                     (hi - lo + 1) as u32 + h_r.hyperlatent_resolution.map_or(0, |[a, b]| b - a + 1);
             }
+            let n_pix_u = (w * h) as u64;
+            if let Some(c) = &vopt.custom_residue {
+                config::apply_module_arch(&mut h_r, c, 3 + n_refs as u32, n_pix_u)?;
+            }
+            if opt.tune == Tune::Wasserstein && h_r.latent_resolution[0] > 0 {
+                return Err(crate::Error::InvalidArgument(
+                    "tune=wasserstein needs full-resolution latents",
+                ));
+            }
             // Upstream: common randomness only on the residue encoder, and only
             // for `--tune wasserstein` (`utils/parsecli.py`).
             h_r.flag_common_randomness = opt.tune == Tune::Wasserstein;
-            let h_m = config::header_motion(arch, h as u32, w as u32, 2 * n_refs as u32);
+            let mut h_m = config::header_motion(arch, h as u32, w as u32, 2 * n_refs as u32);
+            if let Some(c) = &vopt.custom_motion {
+                config::apply_module_arch(&mut h_m, c, 2 * n_refs as u32, n_pix_u)?;
+            }
             let a_r = crate::decode::arch(&h_r)?;
             let a_m = crate::decode::arch(&h_m)?;
             let s_r = Shape::new(&h_r, &a_r)?;
@@ -849,6 +915,14 @@ fn setup(
         hdr.n_latent_grids =
             (hi - lo + 1) as u32 + hdr.hyperlatent_resolution.map_or(0, |[a, b]| b - a + 1);
     }
+    if let Some(c) = &opt.custom {
+        config::apply_module_arch(&mut hdr, c, 3, (planes[0].height * planes[0].width) as u64)?;
+    }
+    if flag_cr && hdr.latent_resolution[0] > 0 {
+        return Err(crate::Error::InvalidArgument(
+            "tune=wasserstein needs full-resolution latents",
+        ));
+    }
     // Upstream: common randomness only on the residue encoder, and only for
     // `--tune wasserstein` (`utils/parsecli.py`).
     hdr.flag_common_randomness = flag_cr;
@@ -1141,6 +1215,132 @@ mod tests {
         // the point of this test is the plumbing, not the quality.
         assert!(report.quantized.psnr_db > 10.0);
         let _ = frames;
+    }
+
+    /// `ModuleArch` overrides write upstream-cfg-shaped fields into the
+    /// serialized header and the stream still decodes; malformed or
+    /// unrepresentable combinations are refused.
+    #[test]
+    fn custom_arch_overrides_round_trip() {
+        let rgb: Vec<u8> = (0..3 * 16 * 16)
+            .map(|i| ((i * 7 + 13) % 256) as u8)
+            .collect();
+        let report = encode_rgb8(
+            &rgb,
+            16,
+            16,
+            &TrainOptions {
+                arch: 3,
+                rdoq: false,
+                n_itr: 2000,
+                custom: Some(ModuleArch {
+                    // The vlop residue cfg has no preset here; it is
+                    // reachable through the override strings instead.
+                    layers_synthesis: Some(
+                        "8-1-linear-relu,X-1-linear-none,X-3-residual-none/stabiliser".into(),
+                    ),
+                    arm: Some("6,1/stabiliser".into()),
+                    output_feature_ifce: Some(0),
+                    ifce_resolution: Some("no".into()),
+                    latent_resolution: Some("1-4".into()),
+                    hyperlatent_resolution: Some("no".into()),
+                    ups_k_size: Some(6),
+                    ups_preconcat_k_size: Some(5),
+                }),
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        let (_, rest) = crate::header::VideoHeader::parse(&report.bitstream).unwrap();
+        let (_, rest) = crate::header::FrameHeader::parse(rest).unwrap();
+        let (ch, _) = crate::header::CoolChicHeader::parse(rest).unwrap();
+        assert_eq!(ch.latent_resolution, [1, 4]);
+        assert_eq!(ch.hyperlatent_resolution, None);
+        assert_eq!(ch.n_latent_grids, 4);
+        assert_eq!(ch.spatial_context_arm, 6);
+        assert_eq!(ch.n_hidden_layers_arm, 1);
+        assert!(ch.linear_stabiliser_arm);
+        assert_eq!(ch.output_feature_ifce, 0);
+        assert_eq!(ch.ifce_resolution, None);
+        assert_eq!(ch.ups_k_size, 6);
+        assert_eq!(ch.ups_preconcat_k_size, 5);
+        assert!(ch.linear_stabiliser_synth);
+        let layers: Vec<(u32, u32, bool, bool)> = ch
+            .layers_synthesis
+            .iter()
+            .map(|l| (l.out_ft, l.k_size, l.residual, l.relu))
+            .collect();
+        assert_eq!(
+            layers,
+            vec![
+                (8, 1, false, true),
+                (3, 1, false, false),
+                (3, 3, true, false)
+            ]
+        );
+        let pic = crate::decode(&report.bitstream, &crate::Limits::default()).unwrap();
+        assert_eq!((pic.width, pic.height), (16, 16));
+        assert!(report.quantized.psnr_db > 10.0);
+    }
+
+    /// Malformed `ModuleArch` strings and header-unrepresentable
+    /// combinations are `InvalidArgument`, not panics or silent drops.
+    #[test]
+    fn custom_arch_rejects_bad_values() {
+        let rgb: Vec<u8> = vec![128u8; 3 * 16 * 16];
+        let try_custom = |m: ModuleArch| {
+            encode_rgb8(
+                &rgb,
+                16,
+                16,
+                &TrainOptions {
+                    arch: 3,
+                    rdoq: false,
+                    n_itr: 2000,
+                    custom: Some(m),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+        };
+        for m in [
+            ModuleArch {
+                layers_synthesis: Some("8-1-weird-relu".into()),
+                ..Default::default()
+            },
+            ModuleArch {
+                layers_synthesis: Some("8-16-linear-relu".into()), // k > 15 unrepresentable
+                ..Default::default()
+            },
+            ModuleArch {
+                arm: Some("6".into()), // missing the hidden count
+                ..Default::default()
+            },
+            ModuleArch {
+                arm: Some("64,1".into()), // context > 63 unrepresentable
+                ..Default::default()
+            },
+            ModuleArch {
+                // IFCE range with zero IFCE features cannot be serialized.
+                output_feature_ifce: Some(0),
+                ifce_resolution: Some("0-2".into()),
+                ..Default::default()
+            },
+            ModuleArch {
+                latent_resolution: Some("5-2".into()), // lo > hi
+                ..Default::default()
+            },
+            ModuleArch {
+                ups_k_size: Some(16), // 4-bit field
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                matches!(try_custom(m), Err(crate::Error::InvalidArgument(_))),
+                "override should be rejected"
+            );
+        }
     }
 
     /// A stream trained with `latent_res` below full resolution carries the
@@ -1495,6 +1695,8 @@ mod tests {
             warp_filter_size: Some(4),
             itr_motion_pretrain: 100,
             flow: Some(&mut estimator),
+            custom_residue: None,
+            custom_motion: None,
         };
         let report = encode_video(
             crate::FrameDataType::Rgb,
@@ -1527,6 +1729,95 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.len(), 3);
         assert!(decoded.iter().all(|f| f.bitdepth == 10));
+    }
+
+    /// `custom`/`custom_residue`/`custom_motion` apply to the I-, P-residue
+    /// and P-motion modules respectively: the I-frame's serialized
+    /// `CoolChicHeader` carries the override fields, the P frame encodes with
+    /// overridden residue/motion shapes and the stream decodes.
+    #[test]
+    fn video_custom_module_archs() {
+        let (w, h) = (16usize, 16usize);
+        let data: Vec<Vec<u16>> = (0..2)
+            .map(|shift| {
+                (0..3 * w * h)
+                    .map(|i| ((i * 11 + shift * 53) % 256) as u16)
+                    .collect()
+            })
+            .collect();
+        let frames: Vec<Vec<Plane>> = data
+            .iter()
+            .map(|d| {
+                (0..3)
+                    .map(|c| Plane {
+                        width: w as u32,
+                        height: h as u32,
+                        samples: &d[c * w * h..(c + 1) * w * h],
+                    })
+                    .collect()
+            })
+            .collect();
+        let views: Vec<&[Plane]> = frames.iter().map(|f| f.as_slice()).collect();
+        let opt = TrainOptions {
+            arch: 3,
+            n_itr: 2000,
+            rdoq: false,
+            custom: Some(ModuleArch {
+                arm: Some("7,1".into()),
+                ups_k_size: Some(6),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut vopt = VideoOptions {
+            itr_motion_pretrain: 100,
+            custom_residue: Some(ModuleArch {
+                arm: Some("9,2".into()),
+                layers_synthesis: Some("8-1-linear-relu,X-1-linear-none".into()),
+                ..Default::default()
+            }),
+            custom_motion: Some(ModuleArch {
+                arm: Some("5,1".into()),
+                latent_resolution: Some("2-4".into()),
+                hyperlatent_resolution: Some("no".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let report = encode_video(
+            crate::FrameDataType::Rgb,
+            8,
+            &views,
+            &[0],
+            &[1],
+            &opt,
+            &mut vopt,
+            &mut |_| {},
+        )
+        .unwrap();
+        // The first CoolChicHeader in the stream is the I-frame's, carrying
+        // the `custom` overrides.
+        let (_, rest) = crate::header::VideoHeader::parse(&report.bitstream).unwrap();
+        let (_, rest) = crate::header::FrameHeader::parse(rest).unwrap();
+        let (ch, _) = crate::header::CoolChicHeader::parse(rest).unwrap();
+        assert_eq!(ch.spatial_context_arm, 7);
+        assert_eq!(ch.n_hidden_layers_arm, 1);
+        assert_eq!(ch.ups_k_size, 6);
+        assert!(
+            report
+                .frames
+                .iter()
+                .any(|f| f.frame_type == crate::header::FrameType::P)
+        );
+        let decoded = crate::decode_video(
+            &report.bitstream,
+            &crate::Limits {
+                max_frames: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded.len(), 2);
     }
 
     /// Every warp filter size round-trips end to end: the header records it and
@@ -1567,6 +1858,8 @@ mod tests {
                 warp_filter_size: Some(filter),
                 itr_motion_pretrain: 100,
                 flow: None,
+                custom_residue: None,
+                custom_motion: None,
             };
             let report = encode_video(
                 crate::FrameDataType::Rgb,
