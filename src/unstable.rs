@@ -42,6 +42,13 @@ pub struct TrainOptions {
     /// Frozen VGG16 feature weights for [`Tune::Wasserstein`]
     /// (`scripts/oracle/dump_vgg.py`, `Vgg16::from_le_bytes`).
     pub vgg: Option<Arc<Vgg16>>,
+    /// `latent_resolution` range `(lo, hi)` (upstream `--latent_residue lo-hi`):
+    /// `lo` is the finest grid's downsample exponent and `hi` the coarsest.
+    /// `None` uses the preset default `(0, 6..8 by image size)`. `lo > 0` runs
+    /// synthesis below image resolution and bicubic-rescales the output
+    /// (upstream `rescale_output`); it is incompatible with
+    /// [`Tune::Wasserstein`]'s common randomness.
+    pub latent_res: Option<(u8, u8)>,
 }
 
 impl Default for TrainOptions {
@@ -55,6 +62,7 @@ impl Default for TrainOptions {
             rdoq: true,
             tune: Tune::Mse,
             vgg: None,
+            latent_res: None,
         }
     }
 }
@@ -314,6 +322,11 @@ fn setup(
                     "tune=wasserstein does not support yuv420 frame data",
                 ));
             }
+            if opt.latent_res.is_some_and(|(lo, _)| lo > 0) {
+                return Err(crate::Error::InvalidArgument(
+                    "tune=wasserstein needs full-resolution latents",
+                ));
+            }
             (Dist::WASSERSTEIN, true)
         }
     };
@@ -324,6 +337,19 @@ fn setup(
         _ => Arch::Low,
     };
     let mut hdr = config::header(arch, planes[0].height, planes[0].width);
+    if let Some((lo, hi)) = opt.latent_res {
+        if lo > hi || hi > 15 {
+            return Err(crate::Error::InvalidArgument(
+                "latent_res must satisfy lo <= hi <= 15",
+            ));
+        }
+        hdr.latent_resolution = [lo as u32, hi as u32];
+        // Upstream's auto hyperlatent range stays (4, v) — image-size-derived,
+        // independent of the latent range — so hyper grids may sit below the
+        // coarsest latent level.
+        hdr.n_latent_grids =
+            (hi - lo + 1) as u32 + hdr.hyperlatent_resolution.map_or(0, |[a, b]| b - a + 1);
+    }
     // Upstream: common randomness only on the residue encoder, and only for
     // `--tune wasserstein` (`utils/parsecli.py`).
     hdr.flag_common_randomness = flag_cr;
@@ -592,6 +618,55 @@ mod tests {
         // the point of this test is the plumbing, not the quality.
         assert!(report.quantized.psnr_db > 10.0);
         let _ = frames;
+    }
+
+    /// A stream trained with `latent_res` below full resolution carries the
+    /// matching `latent_resolution`/`final_upsampling` header fields and
+    /// decodes through `rescale_output` (upstream `--latent_residue lo-hi`).
+    #[test]
+    fn below_full_res_latents_encode_round_trips() {
+        let rgb: Vec<u8> = (0..3 * 16 * 16)
+            .map(|i| ((i * 7 + 13) % 256) as u8)
+            .collect();
+        let report = encode_rgb8(
+            &rgb,
+            16,
+            16,
+            &TrainOptions {
+                arch: 3,
+                rdoq: false,
+                latent_res: Some((2, 4)),
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        let (_, rest) = crate::header::VideoHeader::parse(&report.bitstream).unwrap();
+        let (_, rest) = crate::header::FrameHeader::parse(rest).unwrap();
+        let (ch, _) = crate::header::CoolChicHeader::parse(rest).unwrap();
+        assert_eq!(ch.latent_resolution, [2, 4]);
+        assert_eq!(ch.final_upsampling, crate::header::FinalUpsampling::Bicubic);
+        let pic = crate::decode(&report.bitstream, &crate::Limits::default()).unwrap();
+        assert_eq!((pic.width, pic.height), (16, 16));
+        assert!(report.quantized.psnr_db > 10.0);
+        // The incompatible combination upstream cannot run is refused early.
+        assert!(matches!(
+            encode_rgb8(
+                &rgb,
+                16,
+                16,
+                &TrainOptions {
+                    tune: Tune::Wasserstein,
+                    latent_res: Some((2, 4)),
+                    vgg: Some(std::sync::Arc::new(
+                        Vgg16::from_dims(&[(3, 4); 10], &[0.0; 10 * 4 * 3 * 9 + 40]).unwrap()
+                    )),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            ),
+            Err(crate::Error::InvalidArgument(_))
+        ));
     }
 
     /// A 10-bit 4:4:4 frame encodes with the right header fields and decodes.

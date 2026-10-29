@@ -412,6 +412,127 @@ pub(crate) fn nearest(src: &[f32], h: usize, w: usize, oh: usize, ow: usize, s: 
     out
 }
 
+/// Transpose of [`bicubic`]: `F.interpolate` backward scatters each output
+/// gradient to the (edge-clamped) taps of its gather, weighted the same.
+#[cfg_attr(not(feature = "encoder"), allow(dead_code))]
+pub(crate) fn bicubic_backward(
+    dout: &[f32],
+    h: usize,
+    w: usize,
+    oh: usize,
+    ow: usize,
+    s: Scale,
+) -> Vec<f32> {
+    if oh == h && ow == w {
+        return dout.to_vec();
+    }
+    let sy = src_scale(s, h, oh);
+    let sx = src_scale(s, w, ow);
+    let mut g = vec![0.0f32; h * w];
+    for oy in 0..oh {
+        let ry = sy * (oy as f32 + 0.5) - 0.5;
+        let iy = libm::floorf(ry) as isize;
+        let cy = cubic_coeffs(ry - iy as f32);
+        for ox in 0..ow {
+            let rx = sx * (ox as f32 + 0.5) - 0.5;
+            let ix = libm::floorf(rx) as isize;
+            let cx = cubic_coeffs(rx - ix as f32);
+            let d = dout[oy * ow + ox];
+            for (j, &wy) in cy.iter().enumerate() {
+                let yy = (iy - 1 + j as isize).clamp(0, h as isize - 1) as usize;
+                let row = &mut g[yy * w..yy * w + w];
+                for (k, &wx) in cx.iter().enumerate() {
+                    let xx = (ix - 1 + k as isize).clamp(0, w as isize - 1) as usize;
+                    row[xx] += d * wy * wx;
+                }
+            }
+        }
+    }
+    g
+}
+
+/// Transpose of [`bilinear`].
+#[cfg_attr(not(feature = "encoder"), allow(dead_code))]
+pub(crate) fn bilinear_backward(
+    dout: &[f32],
+    h: usize,
+    w: usize,
+    oh: usize,
+    ow: usize,
+    s: Scale,
+) -> Vec<f32> {
+    let sy = src_scale(s, h, oh);
+    let sx = src_scale(s, w, ow);
+    let idx = |r: f32, n: usize| -> (usize, usize, f32) {
+        let r = r.max(0.0);
+        let i0 = (r as usize).min(n - 1);
+        let i1 = if i0 < n - 1 { i0 + 1 } else { i0 };
+        (i0, i1, r - i0 as f32)
+    };
+    let mut g = vec![0.0f32; h * w];
+    for oy in 0..oh {
+        let (y0, y1, ly) = idx(sy * (oy as f32 + 0.5) - 0.5, h);
+        for ox in 0..ow {
+            let (x0, x1, lx) = idx(sx * (ox as f32 + 0.5) - 0.5, w);
+            let d = dout[oy * ow + ox];
+            g[y0 * w + x0] += d * (1.0 - lx) * (1.0 - ly);
+            g[y0 * w + x1] += d * lx * (1.0 - ly);
+            g[y1 * w + x0] += d * (1.0 - lx) * ly;
+            g[y1 * w + x1] += d * lx * ly;
+        }
+    }
+    g
+}
+
+/// Transpose of [`nearest`]: each output cell sends its gradient to one input.
+#[cfg_attr(not(feature = "encoder"), allow(dead_code))]
+pub(crate) fn nearest_backward(
+    dout: &[f32],
+    h: usize,
+    w: usize,
+    oh: usize,
+    ow: usize,
+    s: Scale,
+) -> Vec<f32> {
+    let sy = src_scale(s, h, oh);
+    let sx = src_scale(s, w, ow);
+    let mut g = vec![0.0f32; h * w];
+    for oy in 0..oh {
+        let y = (libm::floorf(oy as f32 * sy) as usize).min(h - 1);
+        for ox in 0..ow {
+            let x = (libm::floorf(ox as f32 * sx) as usize).min(w - 1);
+            g[y * w + x] += dout[oy * ow + ox];
+        }
+    }
+    g
+}
+
+/// Transpose of [`resize`] on a flat `[c][h][w]` buffer: `dout` holds `c`
+/// planes of `out` size; the result is `c` planes of `inp` size.
+#[cfg_attr(not(feature = "encoder"), allow(dead_code))]
+pub(crate) fn resize_backward(
+    dout: &[f32],
+    c: usize,
+    inp: (usize, usize),
+    out: (usize, usize),
+    mode: FinalUpsampling,
+    s: Scale,
+) -> Vec<f32> {
+    let (h, w) = inp;
+    let (oh, ow) = out;
+    let mut g = vec![0.0f32; c * h * w];
+    for ch in 0..c {
+        let d = &dout[ch * oh * ow..(ch + 1) * oh * ow];
+        let r = match mode {
+            FinalUpsampling::Nearest => nearest_backward(d, h, w, oh, ow, s),
+            FinalUpsampling::Bilinear => bilinear_backward(d, h, w, oh, ow, s),
+            FinalUpsampling::Bicubic => bicubic_backward(d, h, w, oh, ow, s),
+        };
+        g[ch * h * w..(ch + 1) * h * w].copy_from_slice(&r);
+    }
+    g
+}
+
 pub(crate) fn resize(p: &Planes, oh: usize, ow: usize, mode: FinalUpsampling, s: Scale) -> Planes {
     let mut out = Planes::zeros(p.c, oh, ow);
     for c in 0..p.c {

@@ -2,6 +2,7 @@
 //! scores (upstream `nnquant/rdoq.py`: `score_arm`, `score_ifce`, `score_syn_image`).
 //! `tests::stages_compose_to_the_evaluation_pass` holds them equal to `ops::step`.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use super::arm_batch::arm_pass;
@@ -80,12 +81,13 @@ pub(crate) fn upsample(shape: &Shape, p: &Params, q: &[Vec<f32>]) -> Vec<f32> {
     up
 }
 
-/// Synthesis + output transform of the latent-channel stack `up`: the decoded picture
-/// before clamping, `[c][h][w]`. The common-randomness planes are appended when the
+/// Synthesis + output transform of the latent-channel stack `up`, then
+/// `rescale_output`: the decoded picture before clamping, `[c][ih][iw]` at
+/// image resolution. The common-randomness planes are appended when the
 /// shape has them (upstream `get_synthesis_input`).
 pub(crate) fn synthesize(shape: &Shape, p: &Params, up: &[f32]) -> Vec<f32> {
-    let (ih, iw) = shape.img;
-    let n = ih * iw;
+    let (sh, sw) = shape.syn_size;
+    let n = sh * sw;
     let mut syn_in = Vec::with_capacity(up.len() + shape.cr.as_ref().map_or(0, Vec::len));
     syn_in.extend_from_slice(up);
     if let Some(cr) = &shape.cr {
@@ -93,7 +95,7 @@ pub(crate) fn synthesize(shape: &Shape, p: &Params, up: &[f32]) -> Vec<f32> {
     }
     let mut cur = syn_in.clone();
     for l in &p.syn {
-        let mut o = conv_forward(l, &cur, ih, iw);
+        let mut o = conv_forward(l, &cur, sh, sw);
         if l.relu {
             for v in &mut o {
                 *v = v.max(0.0);
@@ -102,12 +104,36 @@ pub(crate) fn synthesize(shape: &Shape, p: &Params, up: &[f32]) -> Vec<f32> {
         cur = o;
     }
     if let Some(st) = &p.syn_stab {
-        let s = conv_forward(st, &syn_in[..st.c_in * n], ih, iw);
+        let s = conv_forward(st, &syn_in[..st.c_in * n], sh, sw);
         for (a, b) in cur.iter_mut().zip(&s) {
             *a += *b;
         }
     }
-    conv_forward(&p.out_transform, &cur, ih, iw)
+    let raw = conv_forward(&p.out_transform, &cur, sh, sw);
+    rescale_output(shape, &raw)
+}
+
+/// Upstream `rescale_output`: `F.interpolate(raw, size=img_size)` when the
+/// synthesis ran below image resolution; a copy otherwise.
+pub(crate) fn rescale_output(shape: &Shape, raw: &[f32]) -> Vec<f32> {
+    let (sh, sw) = shape.syn_size;
+    let (ih, iw) = shape.img;
+    if (sh, sw) == (ih, iw) {
+        return raw.to_vec();
+    }
+    let c = raw.len() / (sh * sw);
+    let mut out = vec![0.0f32; c * ih * iw];
+    for ch in 0..c {
+        let plane = crate::nn::Planes {
+            c: 1,
+            h: sh,
+            w: sw,
+            data: raw[ch * sh * sw..(ch + 1) * sh * sw].to_vec(),
+        };
+        let r = crate::nn::resize(&plane, ih, iw, shape.final_ups, crate::nn::Scale::Size);
+        out[ch * ih * iw..(ch + 1) * ih * iw].copy_from_slice(&r.data);
+    }
+    out
 }
 
 /// `round(clamp(raw, 0, 1) · max) / max`: the bit-quantized evaluation picture.

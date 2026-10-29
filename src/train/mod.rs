@@ -229,19 +229,36 @@ pub(crate) struct Shape {
     pub(crate) cr: Option<Vec<f32>>,
     /// IFCE input layout of every grid (a function of the grid sizes only).
     pub(crate) ifce_stacks: Vec<ifce::Stack>,
+    /// Synthesis-input (and -output) resolution: the finest non-hyperlatent
+    /// grid, `ceil(img / 2^latent_resolution[0])`. Equal to `img` when the
+    /// latent range starts at full resolution.
+    pub(crate) syn_size: (usize, usize),
+    /// `rescale_output` mode: the `F.interpolate` applied to the synthesis
+    /// output when `syn_size` is below `img` (upstream `final_upsampling_type`).
+    pub(crate) final_ups: crate::header::FinalUpsampling,
 }
 
 impl Shape {
     pub(crate) fn new(h: &crate::header::CoolChicHeader, a: &Arch) -> crate::Result<Self> {
-        if h.latent_resolution[0] != 0 {
+        if h.latent_resolution[0] != 0 && h.flag_common_randomness {
+            // Upstream concatenates full-resolution CR planes with the
+            // below-resolution synthesis input; that path cannot run.
             return Err(crate::Error::Unsupported(
-                "training with latents below full resolution",
+                "common randomness with latents below full resolution",
             ));
         }
         let (ih, iw) = (h.img_size[0] as usize, h.img_size[1] as usize);
+        let syn_size = a
+            .size_per_latent
+            .iter()
+            .zip(&a.is_hyperlatent)
+            .find(|&(_, &hyper)| !hyper)
+            .map(|(&(gh, gw), _)| (gh, gw))
+            .ok_or(crate::Error::Invalid("no non-hyperlatent grids"))?;
         // Same stream as the decoder: one noise plane per common-randomness latent,
-        // `fixed_upsampling` + bicubic resize to the image size (upstream
-        // `CoolChicEncoder.get_synthesis_input`).
+        // `fixed_upsampling` + bicubic resize to the synthesis input resolution
+        // (upstream `CoolChicEncoder.get_synthesis_input` resizes to `img_size`,
+        // which coincides for `latent_resolution[0] == 0`).
         let cr = h.flag_common_randomness.then(|| {
             let mut noise = crate::nn::CommonNoise::new();
             let planes: Vec<crate::nn::Planes> = a
@@ -252,8 +269,8 @@ impl Shape {
             let up = crate::nn::fixed_upsampling(&planes, crate::header::FinalUpsampling::Bicubic);
             crate::nn::resize(
                 &up,
-                ih,
-                iw,
+                syn_size.0,
+                syn_size.1,
                 crate::header::FinalUpsampling::Bicubic,
                 crate::nn::Scale::Size,
             )
@@ -280,6 +297,8 @@ impl Shape {
             ifce_stacks: (0..a.size_per_latent.len())
                 .map(|i| ifce::stack_for(&a.size_per_latent, i))
                 .collect(),
+            syn_size,
+            final_ups: h.final_upsampling,
         })
     }
 

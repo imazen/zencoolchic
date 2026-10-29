@@ -459,6 +459,11 @@ pub(super) fn step(
     let n_grids = shape.grids.len();
     let (ih, iw) = shape.img;
     let n_pix = ih * iw;
+    // Synthesis resolution: the finest latent grid (image size when the latent
+    // range starts at full resolution; upstream `rescale_output` bridges the
+    // gap with `final_upsampling_type` interpolation).
+    let (sh, sw) = shape.syn_size;
+    let n_syn = sh * sw;
 
     // 1. Quantize (parallel, element-wise).
     let mut q: Vec<Vec<f32>> = Vec::with_capacity(n_grids);
@@ -581,7 +586,7 @@ pub(super) fn step(
         uh = th;
         uw = tw;
     }
-    debug_assert_eq!((uh, uw), (ih, iw));
+    debug_assert_eq!((uh, uw), (sh, sw));
 
     use rayon::prelude::*;
     // Synthesis input: the latent channels, then the constant common-randomness planes.
@@ -597,18 +602,20 @@ pub(super) fn step(
     let mut syn_inputs: Vec<Vec<f32>> = Vec::with_capacity(p.syn.len());
     let mut cur = syn_in;
     for l in &p.syn {
-        let mut o = conv_forward(l, &cur, ih, iw);
+        let mut o = conv_forward(l, &cur, sh, sw);
         if l.relu {
             o.par_iter_mut().for_each(|v| *v = v.max(0.0));
         }
         syn_inputs.push(core::mem::replace(&mut cur, o));
     }
     if let Some(st) = &p.syn_stab {
-        let s = conv_forward(st, &up[..st.c_in * n_pix], ih, iw);
+        let s = conv_forward(st, &up[..st.c_in * n_syn], sh, sw);
         par_add(&mut cur, &s);
     }
     let pre_out = cur;
-    let raw = conv_forward(&p.out_transform, &pre_out, ih, iw);
+    let raw_syn = conv_forward(&p.out_transform, &pre_out, sh, sw);
+    // `rescale_output`: the scored picture is always at image resolution.
+    let raw = eval::rescale_output(shape, &raw_syn);
 
     // 5. Loss: `w_mse · mse + w_wass · wasserstein + lambda · rate / n_pixels`.
     let out_max = cfg.eval_bitdepth.map(|b| ((1u32 << b) - 1) as f32);
@@ -713,14 +720,27 @@ pub(super) fn step(
         };
     }
 
-    // 6. Synthesis backward.
+    // 6. Synthesis backward. `draw` is the image-resolution gradient; the
+    // `rescale_output` transpose maps it to synthesis resolution first.
+    let draw_syn = if (sh, sw) == (ih, iw) {
+        draw
+    } else {
+        crate::nn::resize_backward(
+            &draw,
+            raw_syn.len() / n_syn,
+            (sh, sw),
+            (ih, iw),
+            shape.final_ups,
+            crate::nn::Scale::Size,
+        )
+    };
     let mut d_pre = vec![0.0f32; pre_out.len()];
     conv_backward(
         &p.out_transform,
         &pre_out,
-        ih,
-        iw,
-        &draw,
+        sh,
+        sw,
+        &draw_syn,
         &mut d_pre,
         &mut grads.out_transform,
     );
@@ -728,11 +748,11 @@ pub(super) fn step(
     if let (Some(st), Some(gst)) = (&p.syn_stab, grads.syn_stab.as_mut()) {
         conv_backward(
             st,
-            &up[..st.c_in * n_pix],
-            ih,
-            iw,
+            &up[..st.c_in * n_syn],
+            sh,
+            sw,
             &d_pre,
-            &mut d_up[..st.c_in * n_pix],
+            &mut d_up[..st.c_in * n_syn],
             gst,
         );
     }
@@ -744,7 +764,7 @@ pub(super) fn step(
             let o = if li + 1 < p.syn.len() {
                 &syn_inputs[li + 1]
             } else {
-                &pre_out_before_stab(&p.syn, &syn_inputs, ih, iw)
+                &pre_out_before_stab(&p.syn, &syn_inputs, sh, sw)
             };
             d.par_iter_mut().zip(o.par_iter()).for_each(|(dv, &ov)| {
                 if ov <= 0.0 {
@@ -754,7 +774,7 @@ pub(super) fn step(
         }
         let g = &mut grads.syn[li];
         let mut dx = vec![0.0f32; x.len()];
-        conv_backward(l, x, ih, iw, &d, &mut dx, g);
+        conv_backward(l, x, sh, sw, &d, &mut dx, g);
         d = dx;
     }
     // The synthesis-input gradient covers the common-randomness channels too; they are
