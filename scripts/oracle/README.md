@@ -37,6 +37,12 @@ same bytes across Python/torch versions, devices or random generators.
 - `dump_soap.py`: seed 7, initial parameters, fixed gradient steps and final
   parameters. Rank-deficient trajectory differences are explained by
   [soap_null_space_probe.py](soap_null_space_probe.py) and [PORTING.md](../../PORTING.md).
+- `dump_video.py <upstream> <out_prefix> <in.cool>...`: assembles an all-intra
+  multi-frame stream from single-frame `.cool` payloads using upstream's own
+  `CodingStructure`/`VideoHeader`/`FrameHeader` writers, decodes it with
+  upstream's `decode_video`, and writes `<out>.cool`, `<out>.json` and
+  `<out>.<i>.planes.u16` per frame. The frozen `multi_i` case mixes RGB and
+  4:2:0 frames of different sizes.
 
 ## Set up a fresh reference checkout
 
@@ -86,11 +92,12 @@ just oracle-all
 The explicit environment variables make tests use those raw dumps. All 12 decoder
 and four gradient cases are still required, and any additional cases are checked.
 The checked-in compressed payloads are always tested for integrity independently
-of overrides. Unset the three override variables to test frozen references again.
+of overrides. Unset the override variables to test frozen references again.
 
-The decoder dumper currently captures a **single still frame**. Before porting
-video, extend it to label intermediates by frame and residue/motion network;
-one shared `captured["raw"]` is insufficient for inter frames.
+The decoder dumper captures a **single still frame**; `dump_video.py` covers
+multi-intra containers. Before porting inter frames, extend the video dumper to
+label intermediates by frame and residue/motion network; one shared
+`captured["raw"]` is insufficient for inter frames.
 
 ## Restore and repack the original frozen bytes
 
@@ -107,7 +114,8 @@ compressed files and all six source inputs were restored, checked and repacked
 successfully on 2026-10-18. Repacking reproduced all 68 compressed payloads exactly
 on that environment. Original SHA-256s remain the primary reference identity.
 `small64_miniwass` was added on 2026-10-29 (70 payloads) with its own provenance
-above; the 68 older payloads are byte-identical.
+above; the 68 older payloads are byte-identical. The `multi_i` video case was
+added the same day (75 payloads); all previous payloads remain byte-identical.
 
 Do not point the packer at newly generated data while retaining an old manifest:
 it will reject changed hashes. Accepting a new golden set requires an intentional

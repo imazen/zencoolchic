@@ -582,6 +582,46 @@
       "shuffle_word_bytes": 1,
       "compressed_bytes": 243,
       "compressed_sha256": "bc60c691ad57f761fd39b47e0e59c6b923523dac0adf954e559e1610652c22b3"
+    },
+    {
+      "path": "video/multi_i.cool",
+      "bytes": 3456,
+      "sha256": "e5e5fbdb97fed8d76abd0e40a7feade873a9c2e86c63e5a7ee009b8a69be2783",
+      "shuffle_word_bytes": 1,
+      "compressed_bytes": 3406,
+      "compressed_sha256": "3f4ffec5c16dea066ab59b35cc0e59824d48af1ac32ec102cd75eeb441c2c18e"
+    },
+    {
+      "path": "video/multi_i.json",
+      "bytes": 574,
+      "sha256": "465c4ef4aa93ceee1b2c2a23639dd0481a5eab007c4f2ebfd85cd7430f21013c",
+      "shuffle_word_bytes": 1,
+      "compressed_bytes": 163,
+      "compressed_sha256": "3a9f4a7bcee22e4e9faa1a6e31b2a34e6dd6f2539b88443e3218820ca1f26242"
+    },
+    {
+      "path": "video/multi_i.0.planes.u16",
+      "bytes": 24576,
+      "sha256": "5a5caaee80568a4c7bd88710adf8d7ffef40b2b91f21ed058a76519c2c90f18e",
+      "shuffle_word_bytes": 2,
+      "compressed_bytes": 10998,
+      "compressed_sha256": "a24ceb7348014ef4de1d194aa7ddd695fce642d0201230adeee3600dceec53ed"
+    },
+    {
+      "path": "video/multi_i.1.planes.u16",
+      "bytes": 4608,
+      "sha256": "a265771dd17528107f8f447df7ecf3afb0a6f6ba04b86b7eb508fcbb95045c1f",
+      "shuffle_word_bytes": 2,
+      "compressed_bytes": 1175,
+      "compressed_sha256": "11655c3a56d8938f81b3edf9519b4cc06298c6593bb3414cb04f8f89cd3591ca"
+    },
+    {
+      "path": "video/multi_i.2.planes.u16",
+      "bytes": 24576,
+      "sha256": "42ac6b7f98e48e4a94bd93a791e959efbb749dc3afd0b5fa8a280d18c866c6be",
+      "shuffle_word_bytes": 2,
+      "compressed_bytes": 11347,
+      "compressed_sha256": "98bb7d6452931905e26fbc61273e5da27fc83415fe4e71983c6699d43a2dc47b"
     }
   ],
   "schema_version": 1,
@@ -594,5 +634,11 @@
     "encoder": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***",
     "layout": "byte planes, least-significant byte first, whole file",
     "dictionary": null
-  }
+  },
+  "video_cases": [
+    {
+      "name": "multi_i",
+      "n_frames": 3
+    }
+  ]
 }

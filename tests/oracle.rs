@@ -129,3 +129,51 @@ fn matches_upstream_decoder() {
         );
     }
 }
+
+#[test]
+fn matches_upstream_video_decoder() {
+    for name in oracle_fixtures::cases("video") {
+        let data = oracle_fixtures::read("video", &format!("{name}.cool"));
+        let meta: serde_json::Value =
+            serde_json::from_slice(&oracle_fixtures::read("video", &format!("{name}.json")))
+                .unwrap();
+        let n_frames = meta["n_frames"].as_u64().unwrap() as usize;
+        let limits = zencoolchic::Limits {
+            max_frames: n_frames as u32,
+            ..Default::default()
+        };
+        let pics = zencoolchic::decode_video(&data, &limits).unwrap();
+        assert_eq!(pics.len(), n_frames, "{name}: frame count");
+        for (i, pic) in pics.iter().enumerate() {
+            let want_px = read_u16(&oracle_fixtures::read(
+                "video",
+                &format!("{name}.{i}.planes.u16"),
+            ));
+            let got_px: Vec<u16> = pic.planes.iter().flatten().copied().collect();
+            assert_eq!(got_px.len(), want_px.len(), "{name} frame {i}: pixel count");
+            let fmeta = &meta["frames"][i];
+            assert_eq!(pic.bitdepth as u64, fmeta["bitdepth"].as_u64().unwrap());
+            let data_type = match pic.data_type {
+                zencoolchic::FrameDataType::Rgb => "rgb",
+                zencoolchic::FrameDataType::Yuv420 => "yuv420",
+                zencoolchic::FrameDataType::Yuv444 => "yuv444",
+                zencoolchic::FrameDataType::Flow => "flow",
+            };
+            assert_eq!(
+                Some(data_type),
+                fmeta["frame_data_type"].as_str(),
+                "{name} frame {i}: color model"
+            );
+            let shapes = fmeta["plane_shapes"].as_array().unwrap();
+            assert_eq!(pic.planes.len(), shapes.len(), "{name} frame {i}: planes");
+            for ((plane, &(w, h)), shape) in pic.planes.iter().zip(&pic.plane_dims).zip(shapes) {
+                assert_eq!(h as u64, shape[0].as_u64().unwrap());
+                assert_eq!(w as u64, shape[1].as_u64().unwrap());
+                assert_eq!(plane.len(), h as usize * w as usize);
+            }
+            let mismatched = got_px.iter().zip(&want_px).filter(|(a, b)| a != b).count();
+            assert_eq!(mismatched, 0, "{name} frame {i}: samples differ");
+        }
+        eprintln!("{name}: {n_frames} frames decoded bit-exactly");
+    }
+}

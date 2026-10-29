@@ -1,8 +1,9 @@
 # Frozen Cool-chic 5 regression references
 
-These 70 zstd payloads preserve every original reference byte: 12 decoder/writer
-cases, four gradient cases, and the SOAP optimizer reference. Original payloads
-total 14,331,585 bytes; compressed payloads total 5,858,006 bytes. No Python
+These 75 zstd payloads preserve every original reference byte: 12 decoder/writer
+cases, four gradient cases, one three-frame video case, and the SOAP optimizer
+reference. Original payloads total 14,389,375 bytes; compressed payloads total
+5,885,095 bytes. No Python
 environment, external executable, download or shared storage is needed to run:
 
 ```sh
@@ -44,8 +45,12 @@ gradient seed is 1234 and SOAP seed is 7. Decoder metadata retains shapes and th
 torch version. `small64_miniwass` exercises the Wasserstein distortion path with
 common randomness; its feature extractor is a deterministic ten-convolution
 miniature (seed 4242, embedded in the dump as `vgg`/`vgg_dims`) rather than
-ImageNet VGG16, so no 528 MB download is needed. Upstream's license notice is
-retained in [upstream-notices](../../../upstream-notices/COOL-CHIC-LICENSE.txt).
+ImageNet VGG16, so no 528 MB download is needed. The `multi_i` video case is a
+three-frame all-intra stream assembled from `small64_lop_2k`, `yuv420_8b_debug`
+and `small64_vhop_2k` by `dump_video.py` using upstream's own header classes;
+the expected planes are upstream `decode_video` output. Upstream's license
+notice is retained in
+[upstream-notices](../../../upstream-notices/COOL-CHIC-LICENSE.txt).
 
 Packing uses [pack_fixtures.py](../../../scripts/oracle/pack_fixtures.py) with
 zstd 1.5.7, `-19 -T1`, from the original layout and its manifest. It refuses to
@@ -56,7 +61,7 @@ new platform is not promised to reproduce the same bytes. Preserve these goldens
 and add new cases with their own provenance instead of silently replacing them.
 
 For explicit regeneration comparisons, `ZENCOOLCHIC_ORACLE_DIR`,
-`ZENCOOLCHIC_GRAD_DIR`, and `ZENCOOLCHIC_SOAP_DIR` select raw, uncompressed
-directories. They must include every required case; additional cases are tested
+`ZENCOOLCHIC_GRAD_DIR`, `ZENCOOLCHIC_SOAP_DIR`, and `ZENCOOLCHIC_VIDEO_DIR`
+select raw, uncompressed directories. They must include every required case; additional cases are tested
 too. These explicitly selected new dumps are compared numerically and are not
 required to have the frozen files' hashes. No missing-file fallback occurs.

@@ -28,6 +28,7 @@ const GRADIENTS: &[&str] = &[
     "small64_miniwass",
     "small64_small",
 ];
+const VIDEO: &[&str] = &["multi_i"];
 
 fn manifest() -> &'static serde_json::Value {
     static MANIFEST: OnceLock<serde_json::Value> = OnceLock::new();
@@ -64,6 +65,26 @@ fn manifest() -> &'static serde_json::Value {
                 }
             }
         }
+        // Video cases carry a per-case frame count: {name, n_frames} objects.
+        let video_cases: Vec<&str> = m["video_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let name = c["name"].as_str().unwrap();
+                let n = c["n_frames"].as_u64().unwrap();
+                expected.insert(format!("video/{name}.cool"));
+                expected.insert(format!("video/{name}.json"));
+                for i in 0..n {
+                    expected.insert(format!("video/{name}.{i}.planes.u16"));
+                }
+                name
+            })
+            .collect();
+        assert_eq!(
+            video_cases, VIDEO,
+            "video_cases: required fixture inventory"
+        );
         let entries = m["files"].as_array().unwrap();
         let actual: BTreeSet<_> = entries
             .iter()
@@ -80,6 +101,7 @@ fn override_dir(group: &str) -> Option<PathBuf> {
         "decoder" => "ZENCOOLCHIC_ORACLE_DIR",
         "gradients" => "ZENCOOLCHIC_GRAD_DIR",
         "soap" => "ZENCOOLCHIC_SOAP_DIR",
+        "video" => "ZENCOOLCHIC_VIDEO_DIR",
         _ => panic!("unknown fixture group {group}"),
     };
     std::env::var_os(variable).map(PathBuf::from)
@@ -90,14 +112,24 @@ pub(crate) fn cases(group: &str) -> Vec<String> {
         "decoder" => ("decoder_cases", "cool"),
         "gradients" => ("gradient_cases", "json"),
         "soap" => ("soap_cases", "json"),
+        "video" => ("video_cases", "cool"),
         _ => panic!("unknown fixture group {group}"),
     };
-    let required: Vec<String> = manifest()[key]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| String::from(v.as_str().unwrap()))
-        .collect();
+    let required: Vec<String> = if group == "video" {
+        manifest()["video_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| String::from(c["name"].as_str().unwrap()))
+            .collect()
+    } else {
+        manifest()[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| String::from(v.as_str().unwrap()))
+            .collect()
+    };
     if let Some(dir) = override_dir(group) {
         let mut names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("explicit fixture override {}: {e}", dir.display()))
