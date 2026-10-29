@@ -23,7 +23,23 @@ finest grid size and the output is interpolated to the image with the
 (`Tune::Wasserstein`) cannot run below full resolution — upstream cannot
 concatenate its full-resolution noise planes there either — so that
 combination is rejected.
-It does not encode video.
+
+`encode_video` encodes multi-frame streams: a `VideoHeader` plus per-frame
+records in coding order. `VideoOptions` supplies `intra_pos`/`p_pos` display
+positions, `warp_filter` (2/4/8/12, default 8), `itr_motion` motion-pretraining
+iterations (default 1000), and an optional `FlowEstimator` callback — the
+external flow field upstream gets from RAFT, used only to pretrain the motion
+model (global translation needs no estimator). I frames use the intra preset;
+P/B frames use the inter preset with joint residue+motion training, odd
+warm-up candidates seeded by the pretrained motion, residue-then-motion
+quantization/RDOQ (motion's partner raw is the decoded residue payload), and
+immediate decode into the reference store. `examples/encvideo.rs` encodes a
+sequence of P6 RGB8 PPMs:
+
+```sh
+cargo run --release --example encvideo --features encoder -- out.cool f0.ppm f1.ppm f2.ppm [n_itr]
+```
+
 The decoder supports more stream tools than the encoder creates; see
 [the porting table](../PORTING.md#decoder).
 
