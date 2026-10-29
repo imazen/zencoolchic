@@ -2,11 +2,28 @@
 //! being designed and will go through review before release.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::train::Shape;
 use crate::train::config::{self, Arch};
 use crate::train::trainer::{self, Preset, Problem};
+use crate::train::wasserstein::Wasserstein;
+use crate::train::{Dist, Shape};
+
+pub use crate::train::wasserstein::Vgg16;
+
+/// Distortion tuning (upstream `--tune`): which metrics the rate–distortion loss uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Tune {
+    /// `{"mse": 1.0}` (upstream default).
+    #[default]
+    Mse,
+    /// `{"mse": 0.2, "wasserstein": 0.004}`: the perceptual tuning of "Perceptually
+    /// optimised Cool-chic for CLIC 2025". Turns on the common-randomness synthesis
+    /// channels and needs [`TrainOptions::vgg`] (RGB only, like upstream).
+    Wasserstein,
+}
 
 /// Encoder settings (upstream `cc_encode.py` defaults: lambda 1e-3, lr 1e-2, 10,000
 /// iterations, `hop`).
@@ -20,6 +37,11 @@ pub struct TrainOptions {
     pub seed: u64,
     /// Run RDOQ on the quantized networks (upstream always does).
     pub rdoq: bool,
+    /// Distortion tuning of the main and hard-round phases (warm-up is always MSE).
+    pub tune: Tune,
+    /// Frozen VGG16 feature weights for [`Tune::Wasserstein`]
+    /// (`scripts/oracle/dump_vgg.py`, `Vgg16::from_le_bytes`).
+    pub vgg: Option<Arc<Vgg16>>,
 }
 
 impl Default for TrainOptions {
@@ -31,6 +53,8 @@ impl Default for TrainOptions {
             arch: 1,
             seed: 0,
             rdoq: true,
+            tune: Tune::Mse,
+            vgg: None,
         }
     }
 }
@@ -74,13 +98,15 @@ pub(crate) fn encode_rgb8_with_stop(
     stop: &dyn enough::Stop,
 ) -> crate::Result<EncodeReport> {
     stop.check()?;
-    let (hdr, shape, template, target, pb_lambda, gain) = setup(rgb, width, height, opt)?;
+    let (hdr, shape, template, target, wass, dist, gain) = setup(rgb, width, height, opt)?;
     let pb = Problem {
         shape: &shape,
         target: &target,
         bitdepth: 8,
-        lambda: pb_lambda,
+        lambda: opt.lambda,
         gain,
+        dist,
+        wass: wass.as_ref(),
     };
     let n_pix = (width as usize * height as usize) as f64;
     let (p, l) = run_training(&pb, &template, opt, log, stop)?;
@@ -132,7 +158,8 @@ type Setup = (
     Shape,
     crate::train::Params,
     Vec<f32>,
-    f32,
+    Option<Wasserstein>,
+    Dist,
     f32,
 );
 
@@ -156,13 +183,28 @@ fn setup(rgb: &[u8], width: u32, height: u32, opt: &TrainOptions) -> crate::Resu
             "lr must be positive, iterations >= 2000, arch <= 3",
         ));
     }
+    let (dist, flag_cr) = match opt.tune {
+        Tune::Mse => (Dist::MSE, false),
+        Tune::Wasserstein => {
+            if opt.vgg.is_none() {
+                return Err(crate::Error::InvalidArgument(
+                    "tune=wasserstein needs Vgg16 weights in TrainOptions::vgg \
+                     (dumped by scripts/oracle/dump_vgg.py)",
+                ));
+            }
+            (Dist::WASSERSTEIN, true)
+        }
+    };
     let arch = match opt.arch {
         0 => Arch::VeryHigh,
         1 => Arch::High,
         2 => Arch::Medium,
         _ => Arch::Low,
     };
-    let hdr = config::header(arch, height, width);
+    let mut hdr = config::header(arch, height, width);
+    // Upstream: common randomness only on the residue encoder, and only for
+    // `--tune wasserstein` (`utils/parsecli.py`).
+    hdr.flag_common_randomness = flag_cr;
     let a = crate::decode::arch(&hdr)?;
     let shape = Shape::new(&hdr, &a)?;
     let template = shape.zero_params(&hdr, &a);
@@ -172,12 +214,18 @@ fn setup(rgb: &[u8], width: u32, height: u32, opt: &TrainOptions) -> crate::Resu
             target.push(rgb[3 * i + c] as f32 / 255.0);
         }
     }
+    let wass = opt
+        .vgg
+        .as_ref()
+        .filter(|_| flag_cr)
+        .map(|v| Wasserstein::new(v.clone(), &target, h, w));
     Ok((
         hdr,
         shape,
         template,
         target,
-        opt.lambda,
+        wass,
+        dist,
         trainer::encoder_gain(opt.lambda),
     ))
 }
@@ -189,7 +237,7 @@ fn run_training(
     log: &mut dyn FnMut(String),
     stop: &dyn enough::Stop,
 ) -> crate::Result<(crate::train::Params, crate::train::LossTerms)> {
-    let preset = Preset::intra(opt.lambda, opt.start_lr, opt.n_itr);
+    let preset = Preset::intra(opt.lambda, opt.start_lr, opt.n_itr, pb.dist);
     let n_pix = (pb.shape.img.0 * pb.shape.img.1) as f64;
     let mut total = 0usize;
     let mut progress =
@@ -216,13 +264,15 @@ pub fn train_rgb8(
     opt: &TrainOptions,
     log: &mut dyn FnMut(String),
 ) -> crate::Result<TrainReport> {
-    let (_hdr, shape, template, target, lambda, gain) = setup(rgb, width, height, opt)?;
+    let (_hdr, shape, template, target, wass, dist, gain) = setup(rgb, width, height, opt)?;
     let pb = Problem {
         shape: &shape,
         target: &target,
         bitdepth: 8,
-        lambda,
+        lambda: opt.lambda,
         gain,
+        dist,
+        wass: wass.as_ref(),
     };
     let n_pix = (width as usize * height as usize) as f64;
     let (_p, l) = run_training(&pb, &template, opt, log, &enough::Unstoppable)?;
@@ -246,18 +296,20 @@ pub fn bench_train_steps(
         arch,
         ..Default::default()
     };
-    let (_hdr, shape, template, target, lambda, gain) = setup(rgb, width, height, &opt)?;
+    let (_hdr, shape, template, target, wass, dist, gain) = setup(rgb, width, height, &opt)?;
     let pb = Problem {
         shape: &shape,
         target: &target,
         bitdepth: 8,
-        lambda,
+        lambda: opt.lambda,
         gain,
+        dist,
+        wass: wass.as_ref(),
     };
     let mut rng = trainer::Rng::new(1);
     let mut p = template.clone();
     trainer::initialize(&mut p, &shape, &mut rng);
-    let mut ph = Preset::intra(lambda, 1e-2, 10_000).phases[0].clone();
+    let mut ph = Preset::intra(opt.lambda, 1e-2, 10_000, pb.dist).phases[0].clone();
     ph.max_itr = n;
     ph.freq_valid = n + 1; // one validation at the end only
     let t = std::time::Instant::now();
@@ -270,4 +322,72 @@ pub fn bench_train_steps(
         &enough::Unstoppable,
     )?;
     Ok(t.elapsed().as_secs_f64() * 1e3 / n as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    /// `Tune::Wasserstein` with embedded miniature feature weights: the whole path
+    /// (common-randomness synthesis channels, weighted distortion, stream write)
+    /// produces a stream the decoder accepts, carrying `flag_common_randomness`.
+    #[test]
+    fn wasserstein_encode_writes_common_randomness_stream() {
+        // Same (c_in, c_out) structure as `dump_grad.py`'s `miniwass`.
+        let dims = [
+            (3usize, 4usize),
+            (4, 4),
+            (4, 8),
+            (8, 8),
+            (8, 4),
+            (4, 4),
+            (4, 8),
+            (8, 4),
+            (4, 4),
+            (4, 4),
+        ];
+        let n: usize = dims.iter().map(|&(ci, co)| co * ci * 9 + co).sum();
+        let mut weights = Vec::with_capacity(n);
+        let mut s = 0x9e3779b9u32;
+        for _ in 0..n {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            weights.push((((s >> 8) & 0xffffff) as f32 / 16777216.0 - 0.5) * 0.1);
+        }
+        let vgg = Arc::new(Vgg16::from_dims(&dims, &weights).unwrap());
+        let (w, h) = (16usize, 16usize);
+        let rgb: Vec<u8> = (0..3 * w * h).map(|i| (i * 5) as u8).collect();
+        let opt = TrainOptions {
+            arch: 3,
+            tune: Tune::Wasserstein,
+            vgg: Some(vgg),
+            rdoq: false,
+            ..Default::default()
+        };
+        let report = encode_rgb8(&rgb, w as u32, h as u32, &opt, &mut |_| {}).unwrap();
+        assert!(report.trained.loss.is_finite());
+        let (_, rest) = crate::header::VideoHeader::parse(&report.bitstream).unwrap();
+        let (_, rest) = crate::header::FrameHeader::parse(rest).unwrap();
+        let (ch, _) = crate::header::CoolChicHeader::parse(rest).unwrap();
+        assert!(ch.flag_common_randomness);
+        let pic = crate::decode(&report.bitstream, &crate::Limits::default()).unwrap();
+        assert_eq!((pic.width, pic.height), (w as u32, h as u32));
+    }
+
+    /// `Tune::Wasserstein` without [`TrainOptions::vgg`] is an argument error.
+    #[test]
+    fn wasserstein_tune_requires_vgg_weights() {
+        let rgb = vec![0u8; 3 * 16 * 16];
+        let e = encode_rgb8(
+            &rgb,
+            16,
+            16,
+            &TrainOptions {
+                tune: Tune::Wasserstein,
+                ..Default::default()
+            },
+            &mut |_| {},
+        );
+        assert!(matches!(e, Err(crate::Error::InvalidArgument(_))));
+    }
 }

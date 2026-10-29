@@ -5,7 +5,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::soap::{SoapConfig, SoapState};
-use super::{LossTerms, Params, Quantizer, Role, Shape, StepCfg, forward_backward};
+use super::wasserstein::Wasserstein;
+use super::{Dist, LossTerms, Params, Quantizer, Role, Shape, StepCfg, forward_backward};
 
 /// xoshiro256** with Box–Muller normals. Not torch's generator: only the distributions match.
 #[derive(Clone, Debug)]
@@ -152,6 +153,9 @@ pub(crate) struct Phase {
     pub(crate) betas_model: (f32, f32),
     pub(crate) betas_latent: (f32, f32),
     pub(crate) precondition_frequency_model: usize,
+    /// Distortion weights (`dist_weight`): warm-up phases are pure MSE; the main and
+    /// hard-round phases use the preset's weights.
+    pub(crate) dist: Dist,
 }
 
 impl Phase {
@@ -169,6 +173,7 @@ impl Phase {
             betas_model: (0.95, 0.95),
             betas_latent: (0.9, 0.999),
             precondition_frequency_model: 10,
+            dist: Dist::MSE,
         }
     }
 }
@@ -178,13 +183,15 @@ impl Phase {
 #[derive(Clone, Debug)]
 pub(crate) struct Preset {
     pub(crate) lambda: f32,
+    /// The preset's distortion weights (main and hard-round phases; warm-up is MSE).
+    pub(crate) dist: Dist,
     /// (candidates, phase) per warm-up stage.
     pub(crate) warmup: Vec<(usize, Phase)>,
     pub(crate) phases: Vec<Phase>,
 }
 
 impl Preset {
-    pub(crate) fn intra(lambda: f32, start_lr: f32, n_itr: usize) -> Self {
+    pub(crate) fn intra(lambda: f32, start_lr: f32, n_itr: usize, dist: Dist) -> Self {
         assert!(
             n_itr >= 2000,
             "the intra preset needs at least 2000 iterations"
@@ -220,12 +227,15 @@ impl Preset {
         main.noise = Noise::Gaussian;
         main.softround_temperature = (0.35, 0.08);
         main.noise_parameter = (0.22, 0.15);
+        main.dist = dist;
         let mut ste = Phase::defaults(1.0e-4, iter_ste);
         ste.schedule_lr = true;
         ste.hardround = true;
         ste.noise = Noise::None;
+        ste.dist = dist;
         Self {
             lambda,
+            dist,
             warmup,
             phases: vec![main, ste],
         }
@@ -254,17 +264,35 @@ pub(crate) struct Problem<'a> {
     pub(crate) bitdepth: u32,
     pub(crate) lambda: f32,
     pub(crate) gain: f32,
+    /// The preset's distortion weights: everything outside a training phase (network
+    /// quantization, RDOQ, the final evaluation) scores with these, like upstream's
+    /// `training_preset.dist_weight`.
+    pub(crate) dist: Dist,
+    /// Feature extractor of the Wasserstein term; required when `dist.wass != 0`.
+    pub(crate) wass: Option<&'a Wasserstein>,
 }
 
 /// Upstream `test()`: hardround latents, no noise, output rounded to the bit depth.
-pub(crate) fn evaluate(pb: &Problem<'_>, p: &Params, scratch: &mut Params) -> LossTerms {
+/// `dist` is the phase's `dist_weight` — the preset's everywhere but in warm-up.
+pub(crate) fn evaluate_dist(
+    pb: &Problem<'_>,
+    p: &Params,
+    dist: Dist,
+    scratch: &mut Params,
+) -> LossTerms {
     let cfg = StepCfg {
         quantizer: Quantizer::Hardround,
         gain: pb.gain,
         lambda: pb.lambda,
         eval_bitdepth: Some(pb.bitdepth),
+        dist,
     };
-    forward_backward(pb.shape, p, pb.target, &[], cfg, scratch)
+    forward_backward(pb.shape, p, pb.target, &[], cfg, pb.wass, scratch)
+}
+
+/// The evaluation pass at the preset's distortion weights.
+pub(crate) fn evaluate(pb: &Problem<'_>, p: &Params, scratch: &mut Params) -> LossTerms {
+    evaluate_dist(pb, p, pb.dist, scratch)
 }
 
 /// Progress callback: (iteration in phase, training loss, last validation).
@@ -281,7 +309,7 @@ pub(crate) fn train(
 ) -> crate::Result<(Params, LossTerms)> {
     stop.check()?;
     let mut grads = p.zeros_like();
-    let mut best = evaluate(pb, &p, &mut grads);
+    let mut best = evaluate_dist(pb, &p, ph.dist, &mut grads);
     let mut best_p = p.clone();
     let layout = p.layout();
     let n_lat: usize = p.latents.iter().map(|l| l.len()).sum();
@@ -340,8 +368,17 @@ pub(crate) fn train(
             gain: pb.gain,
             lambda: pb.lambda,
             eval_bitdepth: None,
+            dist: ph.dist,
         };
-        let terms = forward_backward(pb.shape, &p, pb.target, noise_slice, cfg, &mut grads);
+        let terms = forward_backward(
+            pb.shape,
+            &p,
+            pb.target,
+            noise_slice,
+            cfg,
+            pb.wass,
+            &mut grads,
+        );
 
         // clip_grad_norm_(weights, 0.1)
         {
@@ -393,7 +430,7 @@ pub(crate) fn train(
 
         let mut valid = None;
         if (cnt + 1) % ph.freq_valid == 0 || cnt + 1 == ph.max_itr {
-            let v = evaluate(pb, &p, &mut grads);
+            let v = evaluate_dist(pb, &p, ph.dist, &mut grads);
             if v.loss < best.loss {
                 best = v;
                 best_p = p.clone();

@@ -34,6 +34,7 @@ pub(crate) mod soap;
 #[cfg(all(test, feature = "oracle"))]
 mod tests;
 pub(crate) mod trainer;
+pub(crate) mod wasserstein;
 
 /// Float linear layer, `y = W x + b (+ x if residual)`, `W` row-major `[out][in]`.
 #[derive(Clone, Debug)]
@@ -223,31 +224,59 @@ pub(crate) struct Shape {
     pub(crate) ups_pre_k: usize,
     /// `Some(n)`: the synthesis stabiliser reads the first `n` input channels.
     pub(crate) syn_stab_in: Option<usize>,
+    /// Common-randomness synthesis channels at image resolution (`[c][h][w]` planes),
+    /// generated once from the fixed `CommonGaussianNoiseGenerator` stream.
+    pub(crate) cr: Option<Vec<f32>>,
     /// IFCE input layout of every grid (a function of the grid sizes only).
     pub(crate) ifce_stacks: Vec<ifce::Stack>,
 }
 
 impl Shape {
     pub(crate) fn new(h: &crate::header::CoolChicHeader, a: &Arch) -> crate::Result<Self> {
-        if h.flag_common_randomness {
-            return Err(crate::Error::Unsupported("training with common randomness"));
-        }
         if h.latent_resolution[0] != 0 {
             return Err(crate::Error::Unsupported(
                 "training with latents below full resolution",
             ));
         }
+        let (ih, iw) = (h.img_size[0] as usize, h.img_size[1] as usize);
+        // Same stream as the decoder: one noise plane per common-randomness latent,
+        // `fixed_upsampling` + bicubic resize to the image size (upstream
+        // `CoolChicEncoder.get_synthesis_input`).
+        let cr = h.flag_common_randomness.then(|| {
+            let mut noise = crate::nn::CommonNoise::new();
+            let planes: Vec<crate::nn::Planes> = a
+                .size_per_latent_cr
+                .iter()
+                .map(|&(ch, cw)| noise.sample(ch, cw))
+                .collect();
+            let up = crate::nn::fixed_upsampling(&planes, crate::header::FinalUpsampling::Bicubic);
+            crate::nn::resize(
+                &up,
+                ih,
+                iw,
+                crate::header::FinalUpsampling::Bicubic,
+                crate::nn::Scale::Size,
+            )
+            .data
+        });
         Ok(Self {
-            img: (h.img_size[0] as usize, h.img_size[1] as usize),
+            img: (ih, iw),
             grids: a.size_per_latent.clone(),
             is_hyper: a.is_hyperlatent.clone(),
             window: context_window_indices(h.spatial_context_arm as usize)?,
             n_ifce_out: h.output_feature_ifce as usize,
             ups_k: h.ups_k_size as usize,
             ups_pre_k: h.ups_preconcat_k_size as usize,
+            // With common randomness the stabiliser still reads only the latent
+            // channels (upstream divides `input_feature_synthesis` by two).
             syn_stab_in: h
                 .linear_stabiliser_synth
-                .then_some(a.input_feature_synthesis),
+                .then_some(if h.flag_common_randomness {
+                    a.input_feature_synthesis / 2
+                } else {
+                    a.input_feature_synthesis
+                }),
+            cr,
             ifce_stacks: (0..a.size_per_latent.len())
                 .map(|i| ifce::stack_for(&a.size_per_latent, i))
                 .collect(),
@@ -313,6 +342,27 @@ pub(crate) enum Quantizer {
     Hardround,
 }
 
+/// Per-metric distortion weights of one forward pass (upstream `dist_weight`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Dist {
+    pub(crate) mse: f32,
+    /// Weight of the VGG16 Wasserstein term (0 for the default MSE tuning).
+    pub(crate) wass: f32,
+}
+
+impl Dist {
+    /// `{"mse": 1.0}` (upstream `--tune mse`, also the warm-up phases of every preset).
+    pub(crate) const MSE: Self = Self {
+        mse: 1.0,
+        wass: 0.0,
+    };
+    /// `{"mse": 0.2, "wasserstein": 0.8 / 200}` (upstream `--tune wasserstein`).
+    pub(crate) const WASSERSTEIN: Self = Self {
+        mse: 0.2,
+        wass: 0.004,
+    };
+}
+
 /// Settings of one forward pass.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StepCfg {
@@ -321,30 +371,40 @@ pub(crate) struct StepCfg {
     pub(crate) gain: f32,
     pub(crate) lambda: f32,
     /// `Some(bitdepth)`: evaluation pass (upstream `test()`): output rounded to the bit
-    /// depth before the MSE, no backward pass.
+    /// depth before the distortion, no backward pass.
     pub(crate) eval_bitdepth: Option<u32>,
+    /// Distortion weights of the phase (upstream `training_phase.dist_weight`).
+    pub(crate) dist: Dist,
 }
 
 /// Loss terms of one forward pass.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LossTerms {
+    /// `dist + lambda · rate / n_pixels`.
     pub(crate) loss: f64,
+    /// `dist_weight · distortion`: `w_mse · mse + w_wass · wasserstein`.
+    pub(crate) dist: f64,
+    /// The MSE alone (PSNR reporting).
     pub(crate) mse: f64,
+    /// The Wasserstein distance alone (0 without the feature weights).
+    pub(crate) wass: f64,
     pub(crate) rate_bits: f64,
 }
 
 /// One forward pass, plus the backward pass unless `cfg.eval_bitdepth` is set. `noise` is
 /// the additive quantization noise, one value per latent (all grids concatenated, finest
 /// first); empty for no noise. `grads` is overwritten (left zero for an evaluation pass).
+/// `wass` must be given when `cfg.dist.wass` is non-zero.
 pub(crate) fn forward_backward(
     shape: &Shape,
     p: &Params,
     target: &[f32],
     noise: &[f32],
     cfg: StepCfg,
+    wass: Option<&wasserstein::Wasserstein>,
     grads: &mut Params,
 ) -> LossTerms {
-    ops::step(shape, p, target, noise, cfg, grads)
+    ops::step(shape, p, target, noise, cfg, wass, grads)
 }
 
 /// Kumaraswamy noise from uniform samples (upstream `generate_kumaraswamy_noise`).

@@ -40,7 +40,7 @@ fn header_from(cfg: &serde_json::Value) -> CoolChicHeader {
         img_size: pair("img_size"),
         latent_resolution: pair("latent_resolution"),
         n_latent_grids: 0,
-        flag_common_randomness: false,
+        flag_common_randomness: cfg["flag_common_randomness"].as_bool().unwrap_or(false),
         final_upsampling: FinalUpsampling::Bicubic,
         nn_q_step: PerModule {
             arm: [1.0; 2],
@@ -166,6 +166,15 @@ fn gradients_match_torch_autograd() {
                 target = v.clone();
             } else if name == "uniform_noise" {
                 uniform = v.clone();
+            } else if name == "vgg"
+                || name == "decoded"
+                || name == "grad_dec"
+                || name.starts_with("tap")
+                || name.starts_with("gtap")
+            {
+                // "vgg": the miniature feature stack of `miniwass` dumps, read below.
+                // "decoded"/"grad_dec"/"tap{i}"/"gtap{i}": the clamped output picture,
+                // its wasserstein gradients, and its VGG taps — all compared below.
             } else if let Some(n) = name.strip_prefix("grad:") {
                 let _ = n;
             } else if let Some(s) = slot(&mut p, name, &ifce_grids) {
@@ -175,6 +184,7 @@ fn gradients_match_torch_autograd() {
         }
         let mut g = p.zeros_like();
         let noise = kumaraswamy_noise(&uniform, cfg["noise_parameter"].as_f64().unwrap() as f32);
+        let dist_weight = |k: &str| cfg["dist_weight"][k].as_f64().unwrap_or(0.0) as f32;
         let step = StepCfg {
             quantizer: Quantizer::Softround {
                 temperature: cfg["softround_temperature"].as_f64().unwrap() as f32,
@@ -182,8 +192,60 @@ fn gradients_match_torch_autograd() {
             gain: 16.0,
             lambda: cfg["lmbda"].as_f64().unwrap() as f32,
             eval_bitdepth: None,
+            dist: if cfg["dist_weight"].is_object() {
+                Dist {
+                    mse: dist_weight("mse"),
+                    wass: dist_weight("wasserstein"),
+                }
+            } else {
+                Dist::MSE
+            },
         };
-        let terms = forward_backward(&shape, &p, &target, &noise, step, &mut g);
+        // Wasserstein dumps need the feature weights: `miniwass` dumps embed a tiny
+        // stack as the "vgg" tensor with dims in `vgg_dims`; real-VGG dumps point at
+        // `dump_vgg.py`'s flat f32 file through `ZENCOOLCHIC_VGG16`.
+        let wasserstein = (step.dist.wass != 0.0).then(|| {
+            let vgg = if cfg["vgg_dims"].is_array() {
+                let dims: Vec<(usize, usize)> = cfg["vgg_dims"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| {
+                        (
+                            d[0].as_u64().unwrap() as usize,
+                            d[1].as_u64().unwrap() as usize,
+                        )
+                    })
+                    .collect();
+                let weights = &tensors
+                    .iter()
+                    .find(|(n, _)| n == "vgg")
+                    .unwrap_or_else(|| panic!("{name}: missing vgg tensor"))
+                    .1;
+                wasserstein::Vgg16::from_dims(&dims, weights).unwrap()
+            } else {
+                let path = std::env::var("ZENCOOLCHIC_VGG16")
+                    .expect("wasserstein fixture without embedded weights or ZENCOOLCHIC_VGG16");
+                let bytes = std::fs::read(&path)
+                    .unwrap_or_else(|e| panic!("{name}: cannot read {path}: {e}"));
+                wasserstein::Vgg16::from_le_bytes(&bytes).unwrap()
+            };
+            wasserstein::Wasserstein::new(
+                std::sync::Arc::new(vgg),
+                &target,
+                h.img_size[0] as usize,
+                h.img_size[1] as usize,
+            )
+        });
+        let terms = forward_backward(
+            &shape,
+            &p,
+            &target,
+            &noise,
+            step,
+            wasserstein.as_ref(),
+            &mut g,
+        );
         let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-30);
         std::eprintln!(
             "{}: loss {:.7} vs {:.7} (rel {:.1e}); mse rel {:.1e}; rate {:.2} vs {:.2} (rel {:.1e})",
@@ -196,11 +258,81 @@ fn gradients_match_torch_autograd() {
             cfg["rate_bits"].as_f64().unwrap(),
             rel(terms.rate_bits, cfg["rate_bits"].as_f64().unwrap()),
         );
+        if let Some(w) = cfg["wasserstein"].as_f64() {
+            std::eprintln!(
+                "  wasserstein {:.9} vs {:.9} (rel {:.1e})",
+                terms.wass,
+                w,
+                rel(terms.wass, w)
+            );
+            assert!(rel(terms.wass, w) < 1e-5, "wasserstein mismatch");
+        }
+        // Per-tap distances on the dumped `decoded` picture isolate which VGG stage
+        // differs from the oracle.
+        if let (Some(wm), Some((_, dec))) = (
+            wasserstein.as_ref(),
+            tensors.iter().find(|(n, _)| n == "decoded"),
+        ) {
+            for (i, f) in wm
+                .tap_features(dec, shape.img.0, shape.img.1)
+                .iter()
+                .enumerate()
+            {
+                let tname: String = std::format!("tap{i}");
+                if let Some((_, theirs)) = tensors.iter().find(|(n, _)| n == &tname) {
+                    let diff: Vec<f32> = f.iter().zip(theirs).map(|(a, b)| a - b).collect();
+                    std::eprintln!(
+                        "  tap{i} feat rel err {:.2e} (|theirs| {:.3e})",
+                        l2(&diff) / l2(theirs).max(1e-30),
+                        l2(theirs)
+                    );
+                }
+            }
+            let mine = wm.tap_dists(dec, shape.img.0, shape.img.1);
+            if let Some(theirs) = cfg["wasserstein_per_tap"].as_array() {
+                for (i, (m, t)) in mine.iter().zip(theirs).enumerate() {
+                    let t = t.as_f64().unwrap();
+                    std::eprintln!("  tap{i} dist {m:.9} vs {t:.9} (rel {:.1e})", rel(*m, t));
+                }
+            }
+            // Per-tap gradient oracle: isolates the stats backward from the VGG chain.
+            for (i, f) in wm
+                .tap_grads(dec, shape.img.0, shape.img.1)
+                .iter()
+                .enumerate()
+            {
+                let tname: String = std::format!("gtap{i}");
+                if let Some((_, theirs)) = tensors.iter().find(|(n, _)| n == &tname) {
+                    let diff: Vec<f32> = f.iter().zip(theirs).map(|(a, b)| a - b).collect();
+                    std::eprintln!(
+                        "  tap{i} grad rel err {:.2e} (|theirs| {:.3e})",
+                        l2(&diff) / l2(theirs).max(1e-30),
+                        l2(theirs)
+                    );
+                }
+            }
+            // Full backward oracle: `d wasserstein / d decoded` from torch autograd.
+            let (_d0, tape) = wm.forward(dec, shape.img.0, shape.img.1);
+            let g = wm.backward(&tape);
+            if let Some((_, theirs)) = tensors.iter().find(|(n, _)| n == "grad_dec") {
+                let diff: Vec<f32> = g.iter().zip(theirs).map(|(a, b)| a - b).collect();
+                let r = l2(&diff) / l2(theirs).max(1e-30);
+                std::eprintln!(
+                    "  d_wass/d_dec rel err {r:.2e} (|theirs| {:.3e}, max|diff| {:.3e})",
+                    l2(theirs),
+                    diff.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
+                );
+                assert!(r < 1e-3, "wasserstein backward mismatch");
+            }
+        }
         let mut worst = 0.0f64;
         for (name, v) in &tensors {
             let Some(pname) = name.strip_prefix("grad:") else {
                 continue;
             };
+            if pname == "dec" {
+                continue; // `grad_dec`: compared against `wm.backward` above
+            }
             if pname.contains("output_transform") {
                 continue; // frozen upstream: torch gives no gradient for it
             }

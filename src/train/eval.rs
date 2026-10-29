@@ -80,11 +80,18 @@ pub(crate) fn upsample(shape: &Shape, p: &Params, q: &[Vec<f32>]) -> Vec<f32> {
     up
 }
 
-/// Synthesis + output transform: the decoded picture before clamping, `[c][h][w]`.
-pub(crate) fn synthesize(shape: &Shape, p: &Params, syn_in: &[f32]) -> Vec<f32> {
+/// Synthesis + output transform of the latent-channel stack `up`: the decoded picture
+/// before clamping, `[c][h][w]`. The common-randomness planes are appended when the
+/// shape has them (upstream `get_synthesis_input`).
+pub(crate) fn synthesize(shape: &Shape, p: &Params, up: &[f32]) -> Vec<f32> {
     let (ih, iw) = shape.img;
     let n = ih * iw;
-    let mut cur = syn_in.to_vec();
+    let mut syn_in = Vec::with_capacity(up.len() + shape.cr.as_ref().map_or(0, Vec::len));
+    syn_in.extend_from_slice(up);
+    if let Some(cr) = &shape.cr {
+        syn_in.extend_from_slice(cr);
+    }
+    let mut cur = syn_in.clone();
     for l in &p.syn {
         let mut o = conv_forward(l, &cur, ih, iw);
         if l.relu {
@@ -103,17 +110,26 @@ pub(crate) fn synthesize(shape: &Shape, p: &Params, syn_in: &[f32]) -> Vec<f32> 
     conv_forward(&p.out_transform, &cur, ih, iw)
 }
 
-/// MSE of the clamped picture rounded to `bitdepth`.
-pub(crate) fn distortion(raw: &[f32], target: &[f32], bitdepth: u32) -> f64 {
+/// `round(clamp(raw, 0, 1) · max) / max`: the bit-quantized evaluation picture.
+pub(crate) fn quantized(raw: &[f32], bitdepth: u32) -> Vec<f32> {
     let m = ((1u32 << bitdepth) - 1) as f32;
     raw.iter()
+        .map(|&r| libm::rintf(r.clamp(0.0, 1.0) * m) / m)
+        .collect()
+}
+
+/// MSE of two same-length planes (e.g. the [`quantized`] picture against the target).
+pub(crate) fn distortion_of(a: &[f32], target: &[f32]) -> f64 {
+    a.iter()
         .zip(target)
-        .map(|(&r, &t)| {
-            let c = libm::rintf(r.clamp(0.0, 1.0) * m) / m;
-            ((c - t) * (c - t)) as f64
-        })
+        .map(|(&x, &t)| ((x - t) * (x - t)) as f64)
         .sum::<f64>()
-        / raw.len() as f64
+        / a.len() as f64
+}
+
+/// MSE of the clamped picture rounded to `bitdepth`.
+pub(crate) fn distortion(raw: &[f32], target: &[f32], bitdepth: u32) -> f64 {
+    distortion_of(&quantized(raw, bitdepth), target)
 }
 
 #[cfg(test)]
@@ -145,6 +161,8 @@ mod tests {
             bitdepth: 8,
             lambda: 1e-3,
             gain: 16.0,
+            dist: crate::train::Dist::MSE,
+            wass: None,
         };
         let mut scratch = p.zeros_like();
         let want = evaluate(&pb, &p, &mut scratch);
@@ -184,6 +202,7 @@ mod tests {
             gain: 16.0,
             lambda: 1e-3,
             eval_bitdepth: None,
+            dist: crate::train::Dist::MSE,
         };
         let run = |threads: usize| {
             let pool = rayon::ThreadPoolBuilder::new()
@@ -192,7 +211,7 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 let mut g = p.zeros_like();
-                let t = forward_backward(&shape, &p, &target, &noise, cfg, &mut g);
+                let t = forward_backward(&shape, &p, &target, &noise, cfg, None, &mut g);
                 let bits: Vec<u32> = g
                     .tensors()
                     .iter()

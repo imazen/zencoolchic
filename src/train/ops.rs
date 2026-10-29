@@ -7,6 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::arm_batch::{ArmBackward, MlpGrad as ArmGrad, arm_pass};
+use super::wasserstein::Wasserstein;
 use super::{ConvLayer, LossTerms, Params, Quantizer, Shape, StepCfg, WINDOW, full_kernel};
 use crate::simd::{axpy, dot};
 
@@ -448,6 +449,7 @@ pub(super) fn step(
     target: &[f32],
     noise: &[f32],
     cfg: StepCfg,
+    wass: Option<&Wasserstein>,
     grads: &mut Params,
 ) -> LossTerms {
     let lambda = cfg.lambda;
@@ -581,8 +583,18 @@ pub(super) fn step(
     debug_assert_eq!((uh, uw), (ih, iw));
 
     use rayon::prelude::*;
+    // Synthesis input: the latent channels, then the constant common-randomness planes.
+    let syn_in = match &shape.cr {
+        Some(cr) => {
+            let mut v = Vec::with_capacity(up.len() + cr.len());
+            v.extend_from_slice(&up);
+            v.extend_from_slice(cr);
+            v
+        }
+        None => up.clone(),
+    };
     let mut syn_inputs: Vec<Vec<f32>> = Vec::with_capacity(p.syn.len());
-    let mut cur = up.clone();
+    let mut cur = syn_in;
     for l in &p.syn {
         let mut o = conv_forward(l, &cur, ih, iw);
         if l.relu {
@@ -597,12 +609,13 @@ pub(super) fn step(
     let pre_out = cur;
     let raw = conv_forward(&p.out_transform, &pre_out, ih, iw);
 
-    // 5. Loss.
+    // 5. Loss: `w_mse · mse + w_wass · wasserstein + lambda · rate / n_pixels`.
     let n_el = raw.len();
     let mut draw = vec![0.0f32; n_el];
     let out_max = cfg.eval_bitdepth.map(|b| ((1u32 << b) - 1) as f32);
     // Fixed-size chunks: partial sums are added in chunk order (thread-count independent).
     const CH: usize = 1 << 14;
+    let w_mse = cfg.dist.mse;
     let partial: Vec<f64> = draw
         .par_chunks_mut(CH)
         .zip(raw.par_chunks(CH))
@@ -617,17 +630,48 @@ pub(super) fn step(
                 let e = c - t;
                 m += (e * e) as f64;
                 if (0.0..=1.0).contains(&r) {
-                    *d = 2.0 * e / n_el as f32;
+                    *d = w_mse * 2.0 * e / n_el as f32;
                 }
             }
             m
         })
         .collect();
     let mse = partial.iter().sum::<f64>() / n_el as f64;
+    // The Wasserstein term sees the same clamped (and, for the evaluation pass,
+    // bit-quantized) picture as the MSE.
+    let mut wass_dist = 0.0f64;
+    if cfg.dist.wass != 0.0 {
+        let w = wass.expect("wasserstein weight without feature weights");
+        let dec: Vec<f32> = raw
+            .iter()
+            .map(|&r| {
+                let mut c = r.clamp(0.0, 1.0);
+                if let Some(mx) = out_max {
+                    c = libm::rintf(c * mx) / mx;
+                }
+                c
+            })
+            .collect();
+        if backward {
+            let (wd, tape) = w.forward(&dec, ih, iw);
+            wass_dist = wd;
+            let dwd = w.backward(&tape);
+            for (d, (&r, &g)) in draw.iter_mut().zip(raw.iter().zip(&dwd)) {
+                if (0.0..=1.0).contains(&r) {
+                    *d += cfg.dist.wass * g;
+                }
+            }
+        } else {
+            wass_dist = w.eval(&dec, ih, iw);
+        }
+    }
+    let dist = w_mse as f64 * mse + cfg.dist.wass as f64 * wass_dist;
     if !backward {
         return LossTerms {
-            loss: mse + lambda as f64 * rate_total / n_pix as f64,
+            loss: dist + lambda as f64 * rate_total / n_pix as f64,
+            dist,
             mse,
+            wass: wass_dist,
             rate_bits: rate_total,
         };
     }
@@ -676,7 +720,9 @@ pub(super) fn step(
         conv_backward(l, x, ih, iw, &d, &mut dx, g);
         d = dx;
     }
-    par_add(&mut d_up, &d);
+    // The synthesis-input gradient covers the common-randomness channels too; they are
+    // constants, so only the first `up.len()` (latent) channels keep a gradient.
+    par_add(&mut d_up, &d[..up.len()]);
 
     // 7. Upsampling backward.
     let mut dk2_t: Vec<Vec<f32>> = k2_t.iter().map(|k| vec![0.0; k.len()]).collect();
@@ -766,8 +812,10 @@ pub(super) fn step(
 
     let rate_bits = rate_total;
     LossTerms {
-        loss: mse + lambda as f64 * rate_bits / n_pix as f64,
+        loss: dist + lambda as f64 * rate_bits / n_pix as f64,
+        dist,
         mse,
+        wass: wass_dist,
         rate_bits,
     }
 }

@@ -217,7 +217,7 @@ fn orders_for(p: &Params, m: Module, shift: [i32; 2]) -> [u32; 2] {
 /// Loss of the evaluation pass with the network rate of the decided modules added.
 fn loss_with_nn(pb: &Problem<'_>, t: &LossTerms, nn_bits: f32) -> f64 {
     let n_pix = (pb.shape.img.0 * pb.shape.img.1) as f64;
-    t.mse + pb.lambda as f64 * (t.rate_bits + nn_bits as f64) / n_pix
+    t.dist + pb.lambda as f64 * (t.rate_bits + nn_bits as f64) / n_pix
 }
 
 /// Upstream `quantize_model`: per module (sorted by name), try every (weight, bias) step and

@@ -17,6 +17,19 @@ use super::quantize::{Module, NnQuant, module_values_mut, network_rate, nn_rate_
 use super::trainer::{Problem, Rng};
 use super::{Params, Shape};
 
+/// Weighted distortion of the bitdepth-quantized synthesis output, like upstream's
+/// `loss_function` on the eval image (`score_syn_image`).
+fn dist_quant(pb: &Problem<'_>, raw: &[f32]) -> f64 {
+    let dec = eval::quantized(raw, pb.bitdepth);
+    let mut d = pb.dist.mse as f64 * eval::distortion_of(&dec, pb.target);
+    if pb.dist.wass != 0.0 {
+        let (ih, iw) = pb.shape.img;
+        let w = pb.wass.expect("wasserstein weight without feature weights");
+        d += pb.dist.wass as f64 * w.eval(&dec, ih, iw);
+    }
+    d
+}
+
 fn score(pb: &Problem<'_>, p: &Params, q: &NnQuant, m: Module, fixed: &Fixed) -> f64 {
     let shape: &Shape = pb.shape;
     let n_pix = (shape.img.0 * shape.img.1) as f64;
@@ -30,15 +43,13 @@ fn score(pb: &Problem<'_>, p: &Params, q: &NnQuant, m: Module, fixed: &Fixed) ->
         }
         Module::Synthesis => {
             let raw = eval::synthesize(shape, p, &fixed.syn_in);
-            eval::distortion(&raw, pb.target, pb.bitdepth)
-                + pb.lambda as f64 * nn_rate_of(p, q, m) as f64 / n_pix
+            dist_quant(pb, &raw) + pb.lambda as f64 * nn_rate_of(p, q, m) as f64 / n_pix
         }
         Module::Upsampling => {
             let syn_in = eval::upsample(shape, p, &fixed.q);
             let raw = eval::synthesize(shape, p, &syn_in);
             let rate = eval::latent_rate(shape, &p.arm, &fixed.q, &fixed.inter);
-            eval::distortion(&raw, pb.target, pb.bitdepth)
-                + pb.lambda as f64 * (rate + network_rate(p, q) as f64) / n_pix
+            dist_quant(pb, &raw) + pb.lambda as f64 * (rate + network_rate(p, q) as f64) / n_pix
         }
     }
 }
