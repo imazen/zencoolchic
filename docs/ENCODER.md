@@ -24,6 +24,25 @@ finest grid size and the output is interpolated to the image with the
 concatenate its full-resolution noise planes there either — so that
 combination is rejected.
 
+Beyond the presets, `TrainOptions::custom: Option<ModuleArch>` applies
+upstream's per-module architecture overrides (the `cfg/dec/*.cfg` fields /
+`--layers_synthesis`, `--arm`, `--output_feature_ifce`, `--ifce_resolution`,
+`--latent_resolution`, `--hyperlatent_resolution`, `--ups_k_size`,
+`--ups_preconcat_k_size` CLI strings) on top of the selected `arch` preset.
+The strings use upstream's syntax verbatim, so cfg-file values copy over
+unchanged: `layers_synthesis` is comma-separated `out_ft-k_size-{linear|residual}-{none|relu}`
+tokens (`X` in `out_ft` is replaced by the module's output feature count) with
+an optional `/stabiliser` suffix; `arm` is `context,hidden` with the same
+suffix; resolutions are `auto`, `no` or `lo-hi`. Overrides are validated
+against the serialized header field widths and rejected with
+`InvalidArgument` when unrepresentable (`ifce_resolution` is serialized only
+when `output_feature_ifce > 0`, so a range with zero features is refused).
+For video, `VideoOptions::custom_residue` / `custom_motion` apply the same
+overrides to each P/B frame's residue and motion modules — upstream's
+`--*_residue`/`--*_motion` knobs — while `TrainOptions::custom` covers the
+I frames. The unreachable-by-preset `vlop` residue configuration is one use
+of this surface.
+
 `encode_video` encodes multi-frame streams: a `VideoHeader` plus per-frame
 records in coding order. `VideoOptions` supplies `intra_pos`/`p_pos` display
 positions, `warp_filter` (2/4/8/12, default 8), `itr_motion` motion-pretraining
