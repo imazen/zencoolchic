@@ -32,6 +32,7 @@ grad-dump:
     mkdir -p {{grad_dir}}
     {{coolchic}}/.venv/bin/python -I scripts/oracle/dump_grad.py {{coolchic}} {{sources}}/small64.png {{grad_dir}}/small64_small small f64
     {{coolchic}}/.venv/bin/python -I scripts/oracle/dump_grad.py {{coolchic}} {{sources}}/small64.png {{grad_dir}}/small64_hop hop f64
+    {{coolchic}}/.venv/bin/python -I scripts/oracle/dump_grad.py {{coolchic}} {{sources}}/small64.png {{grad_dir}}/small64_miniwass miniwass f64
     {{coolchic}}/.venv/bin/python -I scripts/oracle/dump_grad.py {{coolchic}} {{sources}}/mid130x97.png {{grad_dir}}/mid_hop hop f64
 
 # Training forward/backward vs torch.autograd (float64).

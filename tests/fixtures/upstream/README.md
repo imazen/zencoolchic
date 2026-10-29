@@ -1,8 +1,8 @@
 # Frozen Cool-chic 5 regression references
 
-These 68 zstd payloads preserve every original reference byte: 12 decoder/writer
-cases, three gradient cases, and the SOAP optimizer reference. Original payloads
-total 13,877,910 bytes; compressed payloads total 5,580,326 bytes. No Python
+These 70 zstd payloads preserve every original reference byte: 12 decoder/writer
+cases, four gradient cases, and the SOAP optimizer reference. Original payloads
+total 14,331,585 bytes; compressed payloads total 5,858,006 bytes. No Python
 environment, external executable, download or shared storage is needed to run:
 
 ```sh
@@ -41,8 +41,11 @@ in [scripts/oracle](../../../scripts/oracle). The kodim14 stream is upstream's
 The original environment was macOS ARM64, Python 3.12.13, torch 2.14.1 CPU.
 Gradient references ran torch in float64 and serialized tensors as F32; the
 gradient seed is 1234 and SOAP seed is 7. Decoder metadata retains shapes and the
-torch version. Upstream's license notice is retained in
-[upstream-notices](../../../upstream-notices/COOL-CHIC-LICENSE.txt).
+torch version. `small64_miniwass` exercises the Wasserstein distortion path with
+common randomness; its feature extractor is a deterministic ten-convolution
+miniature (seed 4242, embedded in the dump as `vgg`/`vgg_dims`) rather than
+ImageNet VGG16, so no 528 MB download is needed. Upstream's license notice is
+retained in [upstream-notices](../../../upstream-notices/COOL-CHIC-LICENSE.txt).
 
 Packing uses [pack_fixtures.py](../../../scripts/oracle/pack_fixtures.py) with
 zstd 1.5.7, `-19 -T1`, from the original layout and its manifest. It refuses to

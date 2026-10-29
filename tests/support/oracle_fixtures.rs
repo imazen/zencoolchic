@@ -22,7 +22,12 @@ const DECODER: &[&str] = &[
     "yuv420_8b_debug",
     "yuv444_10b_debug",
 ];
-const GRADIENTS: &[&str] = &["mid_hop", "small64_hop", "small64_small"];
+const GRADIENTS: &[&str] = &[
+    "mid_hop",
+    "small64_hop",
+    "small64_miniwass",
+    "small64_small",
+];
 
 fn manifest() -> &'static serde_json::Value {
     static MANIFEST: OnceLock<serde_json::Value> = OnceLock::new();
