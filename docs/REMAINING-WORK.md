@@ -101,12 +101,21 @@ provides AXPY/dot; [ops.rs](../src/train/ops.rs), [arm_batch.rs](../src/train/ar
 and [ifce.rs](../src/train/ifce.rs) use those kernels and rayon. Further optimization
 must start from the current implementation and preserve arithmetic order.
 
-RDOQ [score](../src/train/rdoq.rs) already caches per-module invariant latents,
-IFCE contexts and synthesis inputs. Candidates recompute affected stages over the
-full image. Spatial incremental scoring remains to be implemented and checked
-against the current scores, selected moves and final stream; adding the existing
-cache again would not be progress. Quantization search likewise uses shared
-evaluation rather than a separate scalar-only network implementation.
+RDOQ [score](../src/train/rdoq.rs) caches per-module invariant latents,
+IFCE contexts and synthesis inputs. Synthesis-module candidates additionally
+score through [SynInc](../src/train/eval.rs): a move touches one output channel
+of one tensor, so only that channel and the downstream suffix are recomputed
+while accepted prefix-layer outputs and the stabiliser are cached. The result is
+bit-identical to the full forward — proven by
+`eval::tests::syninc_matches_full_synthesize_per_parameter` (every parameter,
+both biases and weights, across accepted-move invalidations) and by identical
+scores, selected moves and stream bytes end to end. The other modules still
+score full-stage per candidate, matching upstream, which does the same; an
+upsampling candidate could reuse a similar cache if profiles justify it.
+Quantization evaluates its independent (weight, bias) shift candidates on the
+problem-sized rayon pool with per-worker scratch and selects the first minimum
+in stream order — identical outputs, roughly 9% faster on the 128px RDOQ
+encode (this host, Zen 5).
 
 The [shared-NN assessment](zennn-assessment.md) identifies owned kernels to reuse,
 their source revisions, consumers and bit-order/performance risks. No `zennn`
