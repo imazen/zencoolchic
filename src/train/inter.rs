@@ -112,7 +112,19 @@ pub(crate) fn pair_step(
         eval_bitdepth: Some(8),
         ..mc
     };
-    let raw_m = forward_backward(ms, mp, mt, mn, fwd, StepAux::default(), mscratch).raw;
+    let raw_m = forward_backward(
+        ms,
+        mp,
+        mt,
+        mn,
+        fwd,
+        StepAux {
+            raw_only: true,
+            ..Default::default()
+        },
+        mscratch,
+    )
+    .raw;
     let ctx_r = InterCtx {
         role: InterRole::Residue,
         shared: inter,
@@ -127,6 +139,7 @@ pub(crate) fn pair_step(
         StepAux {
             wass: res.wass,
             inter: Some(ctx_r),
+            ..Default::default()
         },
         res.grads,
     );
@@ -144,6 +157,7 @@ pub(crate) fn pair_step(
         StepAux {
             wass: mw,
             inter: Some(ctx_m),
+            ..Default::default()
         },
         mg,
     );
@@ -166,7 +180,10 @@ pub(crate) fn pair_eval(
         mot.target,
         &[],
         mot.cfg,
-        StepAux::default(),
+        StepAux {
+            raw_only: true,
+            ..Default::default()
+        },
         mot.scratch,
     )
     .raw;
@@ -184,6 +201,7 @@ pub(crate) fn pair_eval(
         StepAux {
             wass: res.wass,
             inter: Some(ctx_r),
+            ..Default::default()
         },
         res.grads,
     );
@@ -201,6 +219,7 @@ pub(crate) fn pair_eval(
         StepAux {
             wass: mot.wass,
             inter: Some(ctx_m),
+            ..Default::default()
         },
         mot.grads,
     );

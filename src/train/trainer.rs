@@ -344,6 +344,7 @@ impl Problem<'_> {
         super::ops::StepAux {
             wass: self.wass,
             inter: self.inter,
+            ..Default::default()
         }
     }
 }

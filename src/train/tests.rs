@@ -253,6 +253,7 @@ fn gradients_match_torch_autograd() {
             ops::StepAux {
                 wass: wasserstein.as_ref(),
                 inter: None,
+                ..Default::default()
             },
             &mut g,
         )

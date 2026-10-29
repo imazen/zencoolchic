@@ -451,6 +451,12 @@ pub(crate) struct StepAux<'a> {
     pub(crate) wass: Option<&'a Wasserstein>,
     /// P/B inter-frame context (reference compositing + gradient scatter).
     pub(crate) inter: Option<super::inter::InterCtx<'a>>,
+    /// Capture only the model's raw output (`out_raw`): skips the loss tail
+    /// and the backward pass. Upstream's joint forward reads
+    /// `cc_enc_out[cc].get("raw_out")` before any loss, so a partner-model
+    /// capture must not score the model's own output against the frame target
+    /// (channel counts differ).
+    pub(crate) raw_only: bool,
 }
 
 pub(super) fn step(
@@ -505,9 +511,14 @@ pub(super) fn step(
     }
     let mut dq: Vec<Vec<f32>> = q.iter().map(|g| vec![0.0; g.len()]).collect();
 
-    // 2. IFCE contexts (channel-major).
+    // 2. IFCE contexts (channel-major). A raw capture scores nothing: the
+    // IFCE/ARM stages feed only the rate term and latent gradients.
     let n_ifce = shape.n_ifce_out;
-    let (inter_cm, ifce_tape) = super::ifce::forward(shape, &p.ifce, &q);
+    let (inter_cm, ifce_tape) = if aux.raw_only {
+        (Vec::new(), Vec::new())
+    } else {
+        super::ifce::forward(shape, &p.ifce, &q)
+    };
 
     // 3. ARM + rate (row-batched, `arm_batch`).
     let rate_w = lambda / n_pix as f32;
@@ -516,18 +527,22 @@ pub(super) fn step(
         .map(|c| c.as_ref().map_or(Vec::new(), |c| vec![0.0; c.len()]))
         .collect();
     let mut arm_g = ArmGrad::new(&p.arm);
-    let rate_total = arm_pass(
-        shape,
-        &p.arm,
-        &q,
-        &inter_cm,
-        backward.then_some(ArmBackward {
-            grad: &mut arm_g,
-            dq: &mut dq,
-            d_inter: &mut d_inter_cm,
-            rate_w,
-        }),
-    );
+    let rate_total = if aux.raw_only {
+        0.0
+    } else {
+        arm_pass(
+            shape,
+            &p.arm,
+            &q,
+            &inter_cm,
+            backward.then_some(ArmBackward {
+                grad: &mut arm_g,
+                dq: &mut dq,
+                d_inter: &mut d_inter_cm,
+                rate_w,
+            }),
+        )
+    };
     if backward {
         arm_g.write(&mut grads.arm);
     }
@@ -627,6 +642,12 @@ pub(super) fn step(
     let raw_syn = conv_forward(&p.out_transform, &pre_out, sh, sw);
     // `rescale_output`: the scored picture is always at image resolution.
     let raw = eval::rescale_output(shape, &raw_syn);
+    if aux.raw_only {
+        if let Some(o) = out_raw {
+            *o = raw;
+        }
+        return LossTerms::default();
+    }
 
     // Inter frames composite warped references and the residue into the scored
     // picture (upstream `FrameEncoder.forward`); intra scores the model's own
