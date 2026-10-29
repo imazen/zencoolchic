@@ -1,9 +1,9 @@
 # Frozen Cool-chic 5 regression references
 
-These 75 zstd payloads preserve every original reference byte: 12 decoder/writer
-cases, four gradient cases, one three-frame video case, and the SOAP optimizer
-reference. Original payloads total 14,389,375 bytes; compressed payloads total
-5,885,095 bytes. No Python
+These 99 zstd payloads preserve every original reference byte: 12 decoder/writer
+cases, four gradient cases, two video cases, a warper vector case, and the SOAP
+optimizer reference. Original payloads total 16,518,098 bytes; compressed payloads
+total 6,773,048 bytes. No Python
 environment, external executable, download or shared storage is needed to run:
 
 ```sh
@@ -30,7 +30,8 @@ retain their original little-endian bit patterns; no numerical conversion occurs
 
 Expected outputs contain full arrays, not hashes alone. Exact latents and writer
 bytes are asserted. Decoder reconstruction is held to the existing raw bound
-9.3e-7 and output-sample difference at most one step. Gradient and SOAP thresholds
+1e-6 (residue and motion synthesis) and output-sample difference at most one
+step. Gradient and SOAP thresholds
 retain their existing values; rank-deficient SOAP trajectories remain diagnostic.
 
 ## Provenance and maintenance
@@ -48,7 +49,15 @@ miniature (seed 4242, embedded in the dump as `vgg`/`vgg_dims`) rather than
 ImageNet VGG16, so no 528 MB download is needed. The `multi_i` video case is a
 three-frame all-intra stream assembled from `small64_lop_2k`, `yuv420_8b_debug`
 and `small64_vhop_2k` by `dump_video.py` using upstream's own header classes;
-the expected planes are upstream `decode_video` output. Upstream's license
+the expected planes are upstream `decode_video` output. The `pb_128` video case
+was encoded by upstream's `cc_encode.py` (`--debug` preset, warp filter size 8)
+on 2026-10-29 on Linux x86-64, Python 3.12, torch 2.15.0+cpu: a synthetic
+four-frame 128×128 4:2:0 source with real motion, coded I→P→B→B.
+`dump_video.py --decode` captured upstream's decoded planes plus the raw
+residue and motion synthesis outputs (`.f32`) for each frame. The `vec` warp
+case holds `dump_warp.py` output: one seeded 20×24×3 input, its flow field,
+upstream `Warper` outputs at filter sizes 2/4/8/12 and a `vanilla_warp_fn`
+nearest translation (dx=3, dy=-2). Upstream's license
 notice is retained in
 [upstream-notices](../../../upstream-notices/COOL-CHIC-LICENSE.txt).
 
@@ -61,7 +70,7 @@ new platform is not promised to reproduce the same bytes. Preserve these goldens
 and add new cases with their own provenance instead of silently replacing them.
 
 For explicit regeneration comparisons, `ZENCOOLCHIC_ORACLE_DIR`,
-`ZENCOOLCHIC_GRAD_DIR`, `ZENCOOLCHIC_SOAP_DIR`, and `ZENCOOLCHIC_VIDEO_DIR`
-select raw, uncompressed directories. They must include every required case; additional cases are tested
+`ZENCOOLCHIC_GRAD_DIR`, `ZENCOOLCHIC_SOAP_DIR`, `ZENCOOLCHIC_VIDEO_DIR`, and
+`ZENCOOLCHIC_WARP_DIR` select raw, uncompressed directories. They must include every required case; additional cases are tested
 too. These explicitly selected new dumps are compared numerically and are not
 required to have the frozen files' hashes. No missing-file fallback occurs.

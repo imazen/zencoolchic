@@ -15,7 +15,7 @@ from pathlib import Path
 def word_bytes(name):
     if name.endswith(".latents.i64"):
         return 8
-    if name.endswith((".raw.f32", ".bin")):
+    if name.endswith((".f32", ".bin")):
         return 4
     if name.endswith(".planes.u16"):
         return 2

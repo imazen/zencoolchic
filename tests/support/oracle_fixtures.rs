@@ -28,7 +28,8 @@ const GRADIENTS: &[&str] = &[
     "small64_miniwass",
     "small64_small",
 ];
-const VIDEO: &[&str] = &["multi_i"];
+const VIDEO: &[&str] = &["multi_i", "pb_128"];
+const WARP: &[&str] = &["vec"];
 
 fn manifest() -> &'static serde_json::Value {
     static MANIFEST: OnceLock<serde_json::Value> = OnceLock::new();
@@ -65,7 +66,8 @@ fn manifest() -> &'static serde_json::Value {
                 }
             }
         }
-        // Video cases carry a per-case frame count: {name, n_frames} objects.
+        // Video cases carry a per-case frame count and raw-dump tags:
+        // {name, n_frames, raw: ["0.residue", "1.motion", ...]} objects.
         let video_cases: Vec<&str> = m["video_cases"]
             .as_array()
             .unwrap()
@@ -78,6 +80,10 @@ fn manifest() -> &'static serde_json::Value {
                 for i in 0..n {
                     expected.insert(format!("video/{name}.{i}.planes.u16"));
                 }
+                for tag in c["raw"].as_array().map(|a| &a[..]).unwrap_or(&[]) {
+                    let tag = tag.as_str().unwrap();
+                    expected.insert(format!("video/{name}.{tag}.f32"));
+                }
                 name
             })
             .collect();
@@ -85,6 +91,22 @@ fn manifest() -> &'static serde_json::Value {
             video_cases, VIDEO,
             "video_cases: required fixture inventory"
         );
+        // Warp cases carry raw-dump tags: {name, raw: ["x", "flow", ...]}.
+        let warp_cases: Vec<&str> = m["warp_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let name = c["name"].as_str().unwrap();
+                expected.insert(format!("warp/{name}.json"));
+                for tag in c["raw"].as_array().unwrap() {
+                    let tag = tag.as_str().unwrap();
+                    expected.insert(format!("warp/{name}.{tag}.f32"));
+                }
+                name
+            })
+            .collect();
+        assert_eq!(warp_cases, WARP, "warp_cases: required fixture inventory");
         let entries = m["files"].as_array().unwrap();
         let actual: BTreeSet<_> = entries
             .iter()
@@ -102,6 +124,7 @@ fn override_dir(group: &str) -> Option<PathBuf> {
         "gradients" => "ZENCOOLCHIC_GRAD_DIR",
         "soap" => "ZENCOOLCHIC_SOAP_DIR",
         "video" => "ZENCOOLCHIC_VIDEO_DIR",
+        "warp" => "ZENCOOLCHIC_WARP_DIR",
         _ => panic!("unknown fixture group {group}"),
     };
     std::env::var_os(variable).map(PathBuf::from)
@@ -113,10 +136,11 @@ pub(crate) fn cases(group: &str) -> Vec<String> {
         "gradients" => ("gradient_cases", "json"),
         "soap" => ("soap_cases", "json"),
         "video" => ("video_cases", "cool"),
+        "warp" => ("warp_cases", "json"),
         _ => panic!("unknown fixture group {group}"),
     };
-    let required: Vec<String> = if group == "video" {
-        manifest()["video_cases"]
+    let required: Vec<String> = if matches!(group, "video" | "warp") {
+        manifest()[key]
             .as_array()
             .unwrap()
             .iter()

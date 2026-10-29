@@ -37,12 +37,22 @@ same bytes across Python/torch versions, devices or random generators.
 - `dump_soap.py`: seed 7, initial parameters, fixed gradient steps and final
   parameters. Rank-deficient trajectory differences are explained by
   [soap_null_space_probe.py](soap_null_space_probe.py) and [PORTING.md](../../PORTING.md).
-- `dump_video.py <upstream> <out_prefix> <in.cool>...`: assembles an all-intra
-  multi-frame stream from single-frame `.cool` payloads using upstream's own
-  `CodingStructure`/`VideoHeader`/`FrameHeader` writers, decodes it with
-  upstream's `decode_video`, and writes `<out>.cool`, `<out>.json` and
-  `<out>.<i>.planes.u16` per frame. The frozen `multi_i` case mixes RGB and
-  4:2:0 frames of different sizes.
+- `dump_video.py <upstream> --assemble <out_prefix> <in.cool>...`: assembles an
+  all-intra multi-frame stream from single-frame `.cool` payloads using
+  upstream's own `CodingStructure`/`VideoHeader`/`FrameHeader` writers, decodes
+  it with upstream's `decode_video`, and writes `<out>.cool`, `<out>.json`,
+  `<out>.<i>.planes.u16` and `<out>.<i>.residue.f32` per frame. The frozen
+  `multi_i` case mixes RGB and 4:2:0 frames of different sizes.
+- `dump_video.py <upstream> --decode <out_prefix> <in.cool>`: decodes an
+  upstream-encoded (possibly inter) stream with upstream's `decode_video`,
+  capturing the same outputs plus `<out>.<i>.motion.f32` for P/B frames. The
+  frozen `pb_128` case came from upstream `cc_encode.py` (`--debug`, warp
+  filter size 8) on a synthetic four-frame 128×128 4:2:0 source with real
+  motion, coded I→P→B→B.
+- `dump_warp.py <upstream> <out_prefix>`: writes a seeded input image, a flow
+  field, upstream `Warper` outputs at filter sizes 2/4/8/12 and a
+  `vanilla_warp_fn` nearest integer translation (`dx=3, dy=-2`). The frozen
+  `vec` warp case verifies every interpolation kernel path.
 
 ## Set up a fresh reference checkout
 
@@ -95,9 +105,8 @@ The checked-in compressed payloads are always tested for integrity independently
 of overrides. Unset the override variables to test frozen references again.
 
 The decoder dumper captures a **single still frame**; `dump_video.py` covers
-multi-intra containers. Before porting inter frames, extend the video dumper to
-label intermediates by frame and residue/motion network; one shared
-`captured["raw"]` is insufficient for inter frames.
+multi-frame containers and labels intermediates by frame and residue/motion
+network (`{i}.residue.f32`, `{i}.motion.f32`).
 
 ## Restore and repack the original frozen bytes
 
@@ -116,6 +125,9 @@ on that environment. Original SHA-256s remain the primary reference identity.
 `small64_miniwass` was added on 2026-10-29 (70 payloads) with its own provenance
 above; the 68 older payloads are byte-identical. The `multi_i` video case was
 added the same day (75 payloads); all previous payloads remain byte-identical.
+The `pb_128` inter video case, per-frame raw dumps and the `vec` warp case were
+added later that day (99 payloads); `multi_i.json` gained frame/raw metadata and
+every other payload remains byte-identical.
 
 Do not point the packer at newly generated data while retaining an old manifest:
 it will reject changed hashes. Accepting a new golden set requires an intentional
