@@ -498,14 +498,17 @@ pub(crate) fn train(
                 // parallel and independent of the thread count.
                 use rayon::prelude::*;
                 let seed = rng.next_u64();
-                noise.par_chunks_mut(4096).enumerate().for_each(|(bi, ch)| {
-                    let mut r = Rng::new(seed ^ (bi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-                    for v in ch.iter_mut() {
-                        *v = match kind {
-                            Noise::Gaussian => r.normal() * noise_param,
-                            _ => super::ops::kumaraswamy(r.uniform(), noise_param),
-                        };
-                    }
+                super::pool(pb.shape.img.0 * pb.shape.img.1).install(|| {
+                    noise.par_chunks_mut(4096).enumerate().for_each(|(bi, ch)| {
+                        let mut r =
+                            Rng::new(seed ^ (bi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                        for v in ch.iter_mut() {
+                            *v = match kind {
+                                Noise::Gaussian => r.normal() * noise_param,
+                                _ => super::ops::kumaraswamy(r.uniform(), noise_param),
+                            };
+                        }
+                    });
                 });
                 &noise
             }
@@ -691,8 +694,10 @@ pub(crate) fn train_pair(
                 });
             }
         };
-        fill(&mut noise_r);
-        fill(&mut noise_m);
+        super::pool(pb_r.shape.img.0 * pb_r.shape.img.1).install(|| {
+            fill(&mut noise_r);
+            fill(&mut noise_m);
+        });
         let quantizer = if ph.hardround {
             Quantizer::Hardround
         } else {

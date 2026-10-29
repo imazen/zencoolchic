@@ -424,6 +424,34 @@ pub(crate) struct StepOut {
     pub(crate) raw: Vec<f32>,
 }
 
+/// Worker pool for the training and quantization kernels, sized to the
+/// problem. Measured per-step cost (`examples/bench_train.rs`, hop, Ryzen
+/// 9950X3D, 2026-10-29): the ambient pool loses to a small cap at every tested
+/// size — 64² best at 4 threads (+46% over 32), 128² at 8 (+38%), 256² flat
+/// from 4–16, 512² back to 4 (working set exceeds L3; more threads only add
+/// fork-join and bandwidth contention). The decomposition of every parallel
+/// op is thread-count independent, so results are unchanged.
+pub(crate) fn pool(n_pix: usize) -> &'static rayon::ThreadPool {
+    fn get(
+        n: usize,
+        slot: &'static std::sync::OnceLock<rayon::ThreadPool>,
+    ) -> &'static rayon::ThreadPool {
+        slot.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n.min(rayon::max_num_threads()))
+                .build()
+                .expect("rayon pool")
+        })
+    }
+    static P4: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    static P8: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    match n_pix {
+        ..=32_768 => get(4, &P4),
+        32_769..=131_072 => get(8, &P8),
+        _ => get(4, &P4),
+    }
+}
+
 /// One forward pass, plus the backward pass unless `cfg.eval_bitdepth` is set. `noise` is
 /// the additive quantization noise, one value per latent (all grids concatenated, finest
 /// first); empty for no noise. `grads` is overwritten (left zero for an evaluation pass).
@@ -439,7 +467,8 @@ pub(crate) fn forward_backward(
     grads: &mut Params,
 ) -> StepOut {
     let mut raw = Vec::new();
-    let terms = ops::step(shape, p, target, noise, cfg, aux, Some(&mut raw), grads);
+    let terms = pool(shape.img.0 * shape.img.1)
+        .install(|| ops::step(shape, p, target, noise, cfg, aux, Some(&mut raw), grads));
     StepOut { terms, raw }
 }
 

@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn training_step_is_independent_of_thread_count() {
-        use super::super::{Quantizer, StepCfg, forward_backward, ops::StepAux};
+        use super::super::{Quantizer, StepCfg, ops::StepAux};
         let hdr = config::header(config::Arch::High, 70, 90);
         let a = crate::decode::arch(&hdr).unwrap();
         let shape = Shape::new(&hdr, &a).unwrap();
@@ -517,9 +517,19 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 let mut g = p.zeros_like();
-                let t =
-                    forward_backward(&shape, &p, &target, &noise, cfg, StepAux::default(), &mut g)
-                        .terms;
+                // `forward_backward` installs the problem-sized worker pool;
+                // calling `ops::step` directly keeps this check honest about
+                // decomposition being independent of the actual pool size.
+                let t = super::super::ops::step(
+                    &shape,
+                    &p,
+                    &target,
+                    &noise,
+                    cfg,
+                    StepAux::default(),
+                    None,
+                    &mut g,
+                );
                 let bits: Vec<u32> = g
                     .tensors()
                     .iter()

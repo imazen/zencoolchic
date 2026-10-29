@@ -88,6 +88,7 @@ pub(crate) fn rdoq(
     stop: &dyn enough::Stop,
 ) -> crate::Result<()> {
     let shape = pb.shape;
+    let n_pix = shape.img.0 * shape.img.1;
     let qlat = eval::quantize_hard(p, pb.gain);
     for m in Module::SORTED {
         if q.shift[m.slot()].is_none() {
@@ -105,7 +106,7 @@ pub(crate) fn rdoq(
             if n == 0 {
                 continue;
             }
-            let mut best = score(pb, p, q, m, &fixed);
+            let mut best = super::pool(n_pix).install(|| score(pb, p, q, m, &fixed));
             let start = best;
             // Random visiting order (upstream torch.randperm).
             let mut order: Vec<usize> = (0..n).collect();
@@ -123,7 +124,7 @@ pub(crate) fn rdoq(
                         *module_values_mut(p, m, is_bias)[idx] =
                             initial + sign * shift as f32 * step;
                         evals += 1;
-                        let s = score(pb, p, q, m, &fixed);
+                        let s = super::pool(n_pix).install(|| score(pb, p, q, m, &fixed));
                         if s < best {
                             best = s;
                             best_value = *module_values_mut(p, m, is_bias)[idx];
