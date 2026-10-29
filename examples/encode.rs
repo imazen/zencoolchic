@@ -1,5 +1,5 @@
 //! Encode a binary PPM (P6, 8-bit) to a `.cool` bitstream, then decode it back and report
-//! PSNR and size. `cargo run --release --example encode --features encoder -- in.ppm out.cool [n_itr] [lambda] [arch]`
+//! PSNR and size. `cargo run --release --example encode --features encoder -- in.ppm out.cool [n_itr] [lambda] [arch] [seed]`
 
 fn read_ppm(data: &[u8]) -> (u32, u32, &[u8]) {
     let mut fields = Vec::new();
@@ -32,6 +32,9 @@ fn main() {
     }
     if let Some(a) = args.get(4) {
         opt.arch = a.parse().unwrap();
+    }
+    if let Some(s) = args.get(5) {
+        opt.seed = s.parse().unwrap();
     }
     let t = std::time::Instant::now();
     let r = zencoolchic::unstable::encode_rgb8(rgb, w, h, &opt, &mut |s| eprintln!("{s}")).unwrap();
