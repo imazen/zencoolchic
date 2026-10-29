@@ -250,7 +250,10 @@ fn gradients_match_torch_autograd() {
             &target,
             &noise,
             step,
-            wasserstein.as_ref(),
+            ops::StepAux {
+                wass: wasserstein.as_ref(),
+                inter: None,
+            },
             &mut g,
         );
         let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-30);

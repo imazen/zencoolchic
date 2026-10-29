@@ -21,6 +21,17 @@ use super::{Params, Shape};
 /// `loss_function` on the eval image (`score_syn_image`).
 fn dist_quant(pb: &Problem<'_>, raw: &[f32]) -> f64 {
     let (ih, iw) = pb.shape.img;
+    // P/B frames score the decoder's composited picture (quantized flow).
+    let img;
+    let raw = match pb.inter {
+        Some(i) => {
+            img = super::inter::composite(i, raw, iw, ih, true)
+                .expect("inter frame compositing")
+                .0;
+            &img
+        }
+        None => raw,
+    };
     let dec = eval::decoded_dict(
         raw,
         iw,

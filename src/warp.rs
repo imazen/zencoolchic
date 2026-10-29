@@ -131,23 +131,32 @@ fn dcoeffs(t: f32, filter_size: usize, kernel: Kernel) -> [f32; MAX_TAPS] {
 /// fractional part evaluated with the interpolation kernel. `flow_x`/`flow_y`
 /// are `h*w` planar displacements in pixels.
 fn warp_plane(
-    x: &[f32],
-    w: usize,
-    h: usize,
-    flow_x: &[f32],
-    flow_y: &[f32],
+    x: &Planes,
+    c: usize,
+    flow: (&[f32], &[f32]),
     filter_size: usize,
     kernel: Kernel,
+    quantize: bool,
 ) -> Vec<f32> {
+    let (w, h) = (x.w, x.h);
+    let x = &x.data[c * w * h..(c + 1) * w * h];
+    let (flow_x, flow_y) = flow;
     let mut out = vec![0.0f32; w * h];
     let mut line = [0.0f32; MAX_TAPS];
     let first = -(filter_size as i64 / 2) + 1;
     for y in 0..h {
         for x_ in 0..w {
             let i = y * w + x_;
-            // round(flow * 64) / 64 — inference-time flow quantization.
-            let qx = libm::rintf(flow_x[i] * FRAC_ACCURACY) / FRAC_ACCURACY;
-            let qy = libm::rintf(flow_y[i] * FRAC_ACCURACY) / FRAC_ACCURACY;
+            // round(flow * 64) / 64 — inference-time flow quantization;
+            // training mode (upstream `Warper.training`) uses the flow as-is.
+            let (qx, qy) = if quantize {
+                (
+                    libm::rintf(flow_x[i] * FRAC_ACCURACY) / FRAC_ACCURACY,
+                    libm::rintf(flow_y[i] * FRAC_ACCURACY) / FRAC_ACCURACY,
+                )
+            } else {
+                (flow_x[i], flow_y[i])
+            };
             let bx = libm::floorf(qx);
             let by = libm::floorf(qy);
             let cx = coeffs(qx - bx, filter_size, kernel);
@@ -178,6 +187,16 @@ fn warp_plane(
 /// Warps every plane of `x` with the same flow — upstream `Warper.forward` on a
 /// `[1, C, H, W]` tensor. `filter_size` comes from the frame header.
 pub(crate) fn warp(x: &Planes, flow_x: &[f32], flow_y: &[f32], filter_size: u32) -> Result<Planes> {
+    warp_impl(x, flow_x, flow_y, filter_size, true)
+}
+
+fn warp_impl(
+    x: &Planes,
+    flow_x: &[f32],
+    flow_y: &[f32],
+    filter_size: u32,
+    quantize: bool,
+) -> Result<Planes> {
     let kernel = Kernel::of(filter_size)?;
     let f = filter_size as usize;
     debug_assert!(f <= MAX_TAPS);
@@ -186,19 +205,21 @@ pub(crate) fn warp(x: &Planes, flow_x: &[f32], flow_y: &[f32], filter_size: u32)
         h: x.h,
         w: x.w,
         data: (0..x.c)
-            .flat_map(|c| {
-                warp_plane(
-                    &x.data[c * x.h * x.w..(c + 1) * x.h * x.w],
-                    x.w,
-                    x.h,
-                    flow_x,
-                    flow_y,
-                    f,
-                    kernel,
-                )
-            })
+            .flat_map(|c| warp_plane(x, c, (flow_x, flow_y), f, kernel, quantize))
             .collect(),
     })
+}
+
+/// Training-mode warp: same math as [`warp`] on the **unquantized** flow
+/// (upstream `self.training` skips the 1/64-pixel rounding).
+#[cfg(feature = "encoder")]
+pub(crate) fn warp_train(
+    x: &Planes,
+    flow_x: &[f32],
+    flow_y: &[f32],
+    filter_size: u32,
+) -> Result<Planes> {
+    warp_impl(x, flow_x, flow_y, filter_size, false)
 }
 
 /// Gradient of the *training-mode* warp with respect to the flow — upstream
@@ -423,6 +444,10 @@ mod tests {
     #[test]
     fn matches_upstream_warper() {
         for case in oracle_fixtures::cases("warp") {
+            // `comp` covers the inter compositing in `train::inter`'s tests.
+            if case != "vec" {
+                continue;
+            }
             let meta: serde_json::Value =
                 serde_json::from_slice(&oracle_fixtures::read("warp", &format!("{case}.json")))
                     .unwrap();

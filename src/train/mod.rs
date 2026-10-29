@@ -27,6 +27,7 @@ mod arm_batch;
 pub(crate) mod config;
 pub(crate) mod eval;
 pub(crate) mod ifce;
+pub(crate) mod inter;
 mod ops;
 pub(crate) mod quantize;
 pub(crate) mod rdoq;
@@ -416,17 +417,18 @@ pub(crate) struct LossTerms {
 /// One forward pass, plus the backward pass unless `cfg.eval_bitdepth` is set. `noise` is
 /// the additive quantization noise, one value per latent (all grids concatenated, finest
 /// first); empty for no noise. `grads` is overwritten (left zero for an evaluation pass).
-/// `wass` must be given when `cfg.dist.wass` is non-zero.
+/// `aux.wass` must be given when `cfg.dist.wass` is non-zero. `aux.inter` carries the
+/// reference/motion context of a P/B frame objective (`None` for intra).
 pub(crate) fn forward_backward(
     shape: &Shape,
     p: &Params,
     target: &[f32],
     noise: &[f32],
     cfg: StepCfg,
-    wass: Option<&wasserstein::Wasserstein>,
+    aux: ops::StepAux<'_>,
     grads: &mut Params,
 ) -> LossTerms {
-    ops::step(shape, p, target, noise, cfg, wass, grads)
+    ops::step(shape, p, target, noise, cfg, aux, grads)
 }
 
 /// Kumaraswamy noise from uniform samples (upstream `generate_kumaraswamy_noise`).

@@ -240,6 +240,7 @@ mod tests {
             gain: 16.0,
             dist: crate::train::Dist::MSE,
             wass: None,
+            inter: None,
         };
         let mut scratch = p.zeros_like();
         let want = evaluate(&pb, &p, &mut scratch);
@@ -257,7 +258,7 @@ mod tests {
 
     #[test]
     fn training_step_is_independent_of_thread_count() {
-        use super::super::{Quantizer, StepCfg, forward_backward};
+        use super::super::{Quantizer, StepCfg, forward_backward, ops::StepAux};
         let hdr = config::header(config::Arch::High, 70, 90);
         let a = crate::decode::arch(&hdr).unwrap();
         let shape = Shape::new(&hdr, &a).unwrap();
@@ -289,7 +290,8 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 let mut g = p.zeros_like();
-                let t = forward_backward(&shape, &p, &target, &noise, cfg, None, &mut g);
+                let t =
+                    forward_backward(&shape, &p, &target, &noise, cfg, StepAux::default(), &mut g);
                 let bits: Vec<u32> = g
                     .tensors()
                     .iter()

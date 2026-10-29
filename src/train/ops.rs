@@ -444,15 +444,25 @@ fn par_add(dst: &mut [f32], src: &[f32]) {
 // ---------------------------------------------------------------------------------------
 // The step
 
+/// Optional step contexts that do not change the model layout.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StepAux<'a> {
+    /// Wasserstein feature weights (intra `Tune::Wasserstein` only).
+    pub(crate) wass: Option<&'a Wasserstein>,
+    /// P/B inter-frame context (reference compositing + gradient scatter).
+    pub(crate) inter: Option<&'a super::inter::InterCtx>,
+}
+
 pub(super) fn step(
     shape: &Shape,
     p: &Params,
     target: &[f32],
     noise: &[f32],
     cfg: StepCfg,
-    wass: Option<&Wasserstein>,
+    aux: StepAux<'_>,
     grads: &mut Params,
 ) -> LossTerms {
+    let (wass, inter) = (aux.wass, aux.inter);
     let lambda = cfg.lambda;
     let backward = cfg.eval_bitdepth.is_none();
     grads.for_each_mut(|v| v.fill(0.0));
@@ -617,11 +627,25 @@ pub(super) fn step(
     // `rescale_output`: the scored picture is always at image resolution.
     let raw = eval::rescale_output(shape, &raw_syn);
 
+    // Inter frames composite warped references and the residue into the scored
+    // picture (upstream `FrameEncoder.forward`); intra scores the model's own
+    // raw output.
+    let (img3, tape) = match inter {
+        None => (None, None),
+        Some(i) => {
+            // Evaluation scores the decoder's picture: 1/64-quantized flow.
+            let (a, t) = super::inter::composite(i, &raw, iw, ih, !backward)
+                .expect("inter frame compositing");
+            (Some(a), Some(t))
+        }
+    };
+    let img: &[f32] = img3.as_deref().unwrap_or(&raw);
+
     // 5. Loss: `w_mse · mse + w_wass · wasserstein + lambda · rate / n_pixels`.
     let out_max = cfg.eval_bitdepth.map(|b| ((1u32 << b) - 1) as f32);
     // The scored frame data (upstream `decoded_image`): the clamped (and, for the
     // evaluation pass, bit-quantized) picture, downsampled to 4:2:0 for `Yuv420`.
-    let dec = eval::decoded_dict(&raw, iw, ih, cfg.frame_data_type, out_max);
+    let dec = eval::decoded_dict(img, iw, ih, cfg.frame_data_type, out_max);
     let n_el = dec.len();
     // `d mse / d dec`, mapped back to `draw` through the clamp/downsample below.
     let mut d_dec = vec![0.0f32; n_el];
@@ -643,26 +667,28 @@ pub(super) fn step(
         })
         .collect();
     let mse = partial.iter().sum::<f64>() / n_el as f64;
-    let mut draw = vec![0.0f32; raw.len()];
+    // `d_img`: the distortion gradient back-mapped onto the scored picture
+    // (this model's `raw` for intra, the composited picture for inter).
+    let mut d_img = vec![0.0f32; img.len()];
     match cfg.frame_data_type {
         crate::header::FrameDataType::Flow => {
             // Flow data is the raw output unscored by a clamp — the gradient
             // passes straight through.
-            draw.copy_from_slice(&d_dec);
+            d_img.copy_from_slice(&d_dec);
         }
         crate::header::FrameDataType::Yuv420 => {
             // Luma is clamped sample-wise; each chroma dict sample receives
             // 1/4 of its gradient at every source position of its 2×2 block.
             let n = ih * iw;
             let nc = (ih / 2) * (iw / 2);
-            for (d, (&r, &g)) in draw[..n].iter_mut().zip(raw[..n].iter().zip(&d_dec)) {
+            for (d, (&r, &g)) in d_img[..n].iter_mut().zip(img[..n].iter().zip(&d_dec)) {
                 if (0.0..=1.0).contains(&r) {
                     *d = g;
                 }
             }
             for c in 1..3 {
-                let src = &raw[c * n..(c + 1) * n];
-                let dst = &mut draw[c * n..(c + 1) * n];
+                let src = &img[c * n..(c + 1) * n];
+                let dst = &mut d_img[c * n..(c + 1) * n];
                 let dg = &d_dec[n + (c - 1) * nc..n + c * nc];
                 for by in 0..ih / 2 {
                     for bx in 0..iw / 2 {
@@ -684,7 +710,7 @@ pub(super) fn step(
             }
         }
         _ => {
-            for (d, (&r, &g)) in draw.iter_mut().zip(raw.iter().zip(&d_dec)) {
+            for (d, (&r, &g)) in d_img.iter_mut().zip(img.iter().zip(&d_dec)) {
                 if (0.0..=1.0).contains(&r) {
                     *d = g;
                 }
@@ -707,7 +733,7 @@ pub(super) fn step(
             let (wd, tape) = w.forward(&dec, ih, iw);
             wass_dist = wd;
             let dwd = w.backward(&tape);
-            for (d, (&r, &g)) in draw.iter_mut().zip(raw.iter().zip(&dwd)) {
+            for (d, (&r, &g)) in d_img.iter_mut().zip(img.iter().zip(&dwd)) {
                 if (0.0..=1.0).contains(&r) {
                     *d += cfg.dist.wass * g;
                 }
@@ -716,6 +742,16 @@ pub(super) fn step(
             wass_dist = w.eval(&dec, ih, iw);
         }
     }
+    // The distortion gradient `d_img` maps back onto this model's raw output:
+    // identity for intra; for P/B frames the inter scatter fans it out through
+    // the alpha/beta reparam gates (residue model) or the warp flow gradient
+    // (motion model).
+    let draw = match (inter, tape.as_ref()) {
+        (Some(i), Some(t)) => {
+            super::inter::scatter(i, t, &raw, &d_img, iw, ih).expect("inter gradient scatter")
+        }
+        _ => d_img,
+    };
     let dist = w_mse as f64 * mse + cfg.dist.wass as f64 * wass_dist;
     if !backward {
         return LossTerms {

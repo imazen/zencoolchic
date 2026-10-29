@@ -274,6 +274,18 @@ pub(crate) struct Problem<'a> {
     pub(crate) dist: Dist,
     /// Feature extractor of the Wasserstein term; required when `dist.wass != 0`.
     pub(crate) wass: Option<&'a Wasserstein>,
+    /// Reference/motion context for a P/B frame objective (`None` for intra).
+    pub(crate) inter: Option<&'a super::inter::InterCtx>,
+}
+
+impl Problem<'_> {
+    /// The `StepAux` matching this problem's optional contexts.
+    pub(crate) fn aux(&self) -> super::ops::StepAux<'_> {
+        super::ops::StepAux {
+            wass: self.wass,
+            inter: self.inter,
+        }
+    }
 }
 
 /// Upstream `test()`: hardround latents, no noise, output rounded to the bit depth.
@@ -292,7 +304,7 @@ pub(crate) fn evaluate_dist(
         dist,
         frame_data_type: pb.frame_data_type,
     };
-    forward_backward(pb.shape, p, pb.target, &[], cfg, pb.wass, scratch)
+    forward_backward(pb.shape, p, pb.target, &[], cfg, pb.aux(), scratch)
 }
 
 /// The evaluation pass at the preset's distortion weights.
@@ -382,7 +394,7 @@ pub(crate) fn train(
             pb.target,
             noise_slice,
             cfg,
-            pb.wass,
+            pb.aux(),
             &mut grads,
         );
 

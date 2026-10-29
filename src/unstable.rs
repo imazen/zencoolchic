@@ -189,6 +189,7 @@ pub(crate) fn encode_frame_with_stop(
         gain,
         dist,
         wass: wass.as_ref(),
+        inter: None,
     };
     let n_pix = n_pix as f64;
     let (p, l) = run_training(&pb, &template, opt, log, stop)?;
@@ -442,6 +443,7 @@ pub fn train_frame(
         gain,
         dist,
         wass: wass.as_ref(),
+        inter: None,
     };
     let n_pix = n_pix as f64;
     let (_p, l) = run_training(&pb, &template, opt, log, &enough::Unstoppable)?;
@@ -485,6 +487,7 @@ pub fn bench_train_steps(
         gain,
         dist,
         wass: wass.as_ref(),
+        inter: None,
     };
     let mut rng = trainer::Rng::new(1);
     let mut p = template.clone();
