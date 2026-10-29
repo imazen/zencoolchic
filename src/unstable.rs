@@ -237,6 +237,476 @@ pub(crate) fn encode_frame_with_stop(
     })
 }
 
+/// Inter-frame settings for [`encode_video`] (upstream `--warp_filter_size` and
+/// `--n_itr_pretrain_motion` plus the external optical-flow hook replacing
+/// upstream's internal RAFT call).
+#[derive(Default)]
+pub struct VideoOptions<'a> {
+    /// Warping interpolation taps written into inter frame headers
+    /// (upstream `--warp_filter_size`, default 8; valid values 2, 4, 8, 12).
+    /// `None` uses upstream's default.
+    pub warp_filter_size: Option<u32>,
+    /// Motion pre-training iterations (upstream `--n_itr_pretrain_motion`,
+    /// default 1000). `0` keeps upstream's default.
+    pub itr_motion_pretrain: usize,
+    /// External optical-flow estimator — upstream feeds RAFT the frame and each
+    /// globally-shifted reference as 4:4:4 tensors; this callback receives the
+    /// same tensors as `[3][h*w]` `0..=1` planes, `(display_index, frame,
+    /// shifted_refs)`, and returns one `[2][h*w]` pixel-unit flow field per
+    /// reference (each flow warps its shifted reference onto the frame), or
+    /// `None` to skip guided pre-training for this frame. The trained model is
+    /// injected into every odd warm-up candidate, like upstream.
+    pub flow: Option<FlowEstimator<'a>>,
+}
+
+/// The external optical-flow callback of [`VideoOptions::flow`].
+pub type FlowEstimator<'a> = &'a mut dyn FnMut(u32, &[f32], &[&[f32]]) -> Option<Vec<Vec<f32>>>;
+
+/// One frame's entry in [`VideoReport::frames`].
+#[derive(Clone, Debug)]
+pub struct VideoFrameReport {
+    /// Position in display order.
+    pub display_index: u32,
+    /// I, P or B — one per reference count, like upstream's header.
+    pub frame_type: crate::header::FrameType,
+    /// The header written ahead of the frame's payload(s).
+    pub header: crate::header::FrameHeader,
+    /// PSNR of the decoded frame (bitdepth-quantized, like upstream's final
+    /// `test()` numbers).
+    pub psnr_db: f64,
+}
+
+/// Result of [`encode_video`].
+#[derive(Clone, Debug)]
+pub struct VideoReport {
+    /// Per-frame results in coding order.
+    pub frames: Vec<VideoFrameReport>,
+    /// The complete bitstream.
+    pub bitstream: Vec<u8>,
+}
+
+/// Network quantization, optional RDOQ and the stream conversion of one
+/// cool-chic (upstream `quantize_model` + `rdoq_model` + `cc_enc.get_param`).
+fn finish_cc(
+    pb: &Problem<'_>,
+    p: &crate::train::Params,
+    hdr: &mut crate::header::CoolChicHeader,
+    opt: &TrainOptions,
+    log: &mut dyn FnMut(String),
+    stop: &dyn enough::Stop,
+) -> crate::Result<Vec<u8>> {
+    let has_ifce = p.ifce.iter().any(|m| m.is_some());
+    let (mut pq, q) = crate::train::quantize::quantize_model(pb, p, has_ifce, stop)?;
+    if opt.rdoq {
+        let mut rng = trainer::Rng::new(opt.seed ^ 0x5244_4f51);
+        crate::train::rdoq::rdoq(pb, &mut pq, &q, &mut rng, log, stop)?;
+    }
+    let (ints, lat) = crate::train::quantize::to_stream(&pq, &q, pb.gain);
+    crate::train::quantize::apply_to_header(hdr, &q);
+    let grids: Vec<crate::latent::Grid> = pb
+        .shape
+        .grids
+        .iter()
+        .zip(lat)
+        .map(|(&(gh, gw), data)| crate::latent::Grid { h: gh, w: gw, data })
+        .collect();
+    crate::write::write_coolchic_full(hdr, &ints, &grids)
+}
+
+/// Encodes a video: upstream `encode_one_frame` iterated in coding order.
+/// `frames` are display-order planar frames (same layout rules as
+/// [`encode_frame`]); `intra_pos`/`p_pos` mark I/P display positions exactly
+/// like upstream's `--intra_pos`/`--p_pos` (every other position is a B frame —
+/// both the first and last display index must be I or P). Every decoded frame
+/// is kept and handed to later frames as a warping reference, so a stream
+/// encodes deterministically and round-trips through [`crate::decode_video`].
+///
+/// Inter frames use [`Tune`]'s distortion on the composited picture (upstream's
+/// joint objective) — [`Tune::Wasserstein`] is allowed on YUV444/RGB video and
+/// attaches common randomness to the residue model only, like upstream.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_video(
+    frame_data_type: crate::FrameDataType,
+    bitdepth: u8,
+    frames: &[&[Plane<'_>]],
+    intra_pos: &[u32],
+    p_pos: &[u32],
+    opt: &TrainOptions,
+    vopt: &mut VideoOptions<'_>,
+    log: &mut dyn FnMut(String),
+) -> crate::Result<VideoReport> {
+    let stop = &enough::Unstoppable;
+    let vh = crate::header::VideoHeader {
+        n_frames: frames.len() as u32,
+        intra_pos: intra_pos.into(),
+        p_pos: p_pos.into(),
+    };
+    let structure = vh.coding_structure()?;
+    if opt.tune == Tune::Wasserstein && frame_data_type == crate::FrameDataType::Yuv420 {
+        return Err(crate::Error::InvalidArgument(
+            "tune=wasserstein does not support yuv420 frame data",
+        ));
+    }
+    if opt.tune == Tune::Wasserstein && opt.vgg.is_none() {
+        return Err(crate::Error::InvalidArgument(
+            "tune=wasserstein needs Vgg16 weights in TrainOptions::vgg",
+        ));
+    }
+    if opt.tune == Tune::Wasserstein && opt.latent_res.is_some_and(|(lo, _)| lo > 0) {
+        return Err(crate::Error::InvalidArgument(
+            "tune=wasserstein needs full-resolution latents",
+        ));
+    }
+    let warp_filter = vopt.warp_filter_size.unwrap_or(8);
+    if ![2, 4, 8, 12].contains(&warp_filter) {
+        return Err(crate::Error::InvalidArgument(
+            "warp_filter_size must be 2, 4, 8 or 12",
+        ));
+    }
+    let itr_motion = if vopt.itr_motion_pretrain == 0 {
+        1000
+    } else {
+        vopt.itr_motion_pretrain
+    };
+    // Validate every frame up front and normalize to f32 planes.
+    let max = ((1u32 << bitdepth) - 1) as f32;
+    let mut inputs = Vec::with_capacity(frames.len());
+    for planes in frames.iter() {
+        if planes.len() != 3 {
+            return Err(crate::Error::InvalidArgument(
+                "expected three planes per frame",
+            ));
+        }
+        let (w, h) = (planes[0].width as usize, planes[0].height as usize);
+        let (cw, ch) = match frame_data_type {
+            crate::FrameDataType::Yuv420 => {
+                if w % 2 != 0 || h % 2 != 0 {
+                    return Err(crate::Error::InvalidArgument(
+                        "yuv420 needs even luma dimensions",
+                    ));
+                }
+                (w / 2, h / 2)
+            }
+            crate::FrameDataType::Rgb | crate::FrameDataType::Yuv444 => (w, h),
+            _ => {
+                return Err(crate::Error::InvalidArgument(
+                    "frame_data_type must be Rgb/Yuv420/Yuv444",
+                ));
+            }
+        };
+        let mut norm = Vec::with_capacity(3);
+        let mut dims = Vec::with_capacity(3);
+        for (i, p) in planes.iter().enumerate() {
+            let (pw, ph) = if i == 0 { (w, h) } else { (cw, ch) };
+            if p.width as usize != pw
+                || p.height as usize != ph
+                || pw.checked_mul(ph) != Some(p.samples.len())
+            {
+                return Err(crate::Error::InvalidArgument(
+                    "plane dimensions do not match frame_data_type",
+                ));
+            }
+            if p.samples.iter().any(|&s| s as f32 > max) {
+                return Err(crate::Error::InvalidArgument(
+                    "sample exceeds the bitdepth range",
+                ));
+            }
+            norm.push(
+                p.samples
+                    .iter()
+                    .map(|&s| s as f32 / max)
+                    .collect::<Vec<f32>>(),
+            );
+            dims.push((p.width, p.height));
+        }
+        inputs.push((norm, dims));
+    }
+    let n_frames = frames.len();
+    let mut decoded: Vec<Option<crate::decode::DecodedFrame>> =
+        (0..n_frames).map(|_| None).collect();
+    let mut reports = Vec::with_capacity(n_frames);
+    let mut out = vh.to_bytes();
+    let dist = match opt.tune {
+        Tune::Mse => Dist::MSE,
+        Tune::Wasserstein => Dist::WASSERSTEIN,
+    };
+    for sf in &structure {
+        let (norm, dims) = &inputs[sf.display_order as usize];
+        let (w, h) = (dims[0].0 as usize, dims[0].1 as usize);
+        let n_pix = (w * h) as f64;
+        let target: Vec<f32> = norm.concat();
+        let mut fh = crate::header::FrameHeader {
+            display_index: sf.display_order,
+            frame_type: match sf.index_references.len() {
+                0 => crate::header::FrameType::I,
+                1 => crate::header::FrameType::P,
+                _ => crate::header::FrameType::B,
+            },
+            frame_data_type,
+            bitdepth: bitdepth as u32,
+            index_references: sf.index_references.clone(),
+            global_flow: Vec::new(),
+            warp_filter_size: None,
+        };
+        let cc_bytes: Vec<Vec<u8>> = if fh.frame_type == crate::header::FrameType::I {
+            let planes: Vec<Plane> = frames[sf.display_order as usize].to_vec();
+            let (hdr, shape, template, _t, wass, d, gain, _n, out_init) =
+                setup(frame_data_type, bitdepth, &planes, opt)?;
+            let pb = Problem {
+                shape: &shape,
+                target: &target,
+                frame_data_type,
+                bitdepth: bitdepth as u32,
+                lambda: opt.lambda,
+                gain,
+                dist: d,
+                wass: wass.as_ref(),
+                inter: None,
+                out_init,
+            };
+            let (p, l) = run_training(&pb, &template, opt, log, stop)?;
+            log(alloc::format!(
+                "I{}: trained psnr {:.3} dB, rate {:.4} bpp",
+                sf.display_order,
+                -10.0 * libm::log10(l.mse),
+                l.rate_bits / n_pix
+            ));
+            let mut hdr = hdr;
+            let bytes = finish_cc(&pb, &p, &mut hdr, opt, log, stop)?;
+            let (raw, _g, _hy, _rest) =
+                crate::decode::decode_coolchic(&bytes, &crate::Limits::default(), &mut || Ok(()))?;
+            decoded[sf.display_order as usize] = Some(crate::decode::finish_frame(&raw, &fh)?);
+            alloc::vec![bytes]
+        } else {
+            let n_refs = sf.index_references.len();
+            let mut refs = Vec::with_capacity(n_refs);
+            for &d in &sf.index_references {
+                let rf = decoded[d as usize]
+                    .as_ref()
+                    .ok_or(crate::Error::Invalid("missing reference frame"))?;
+                refs.push(rf.as_444()?);
+            }
+            // Global integer translation per reference, on the 4:4:4 tensors
+            // (upstream get_global_translation converts yuv420 the same way).
+            let target444 = crate::decode::planes_to_444(norm, dims, frame_data_type)?;
+            let global_flow: Vec<(i32, i32)> = refs
+                .iter()
+                .map(|r| crate::warp::global_translation(&target444, r))
+                .collect();
+            let shifted: Vec<crate::nn::Planes> = refs
+                .iter()
+                .zip(&global_flow)
+                .map(|(r, &(dx, dy))| crate::warp::translate(r, dx, dy))
+                .collect();
+            let arch = match opt.arch {
+                0 => Arch::VeryHigh,
+                1 => Arch::High,
+                2 => Arch::Medium,
+                _ => Arch::Low,
+            };
+            let mut h_r = config::header_inter(arch, h as u32, w as u32, 3 + n_refs as u32);
+            if let Some((lo, hi)) = opt.latent_res {
+                if lo > hi || hi > 15 {
+                    return Err(crate::Error::InvalidArgument(
+                        "latent_res must satisfy lo <= hi <= 15",
+                    ));
+                }
+                h_r.latent_resolution = [lo as u32, hi as u32];
+                h_r.n_latent_grids =
+                    (hi - lo + 1) as u32 + h_r.hyperlatent_resolution.map_or(0, |[a, b]| b - a + 1);
+            }
+            // Upstream: common randomness only on the residue encoder, and only
+            // for `--tune wasserstein` (`utils/parsecli.py`).
+            h_r.flag_common_randomness = opt.tune == Tune::Wasserstein;
+            let h_m = config::header_motion(arch, h as u32, w as u32, 2 * n_refs as u32);
+            let a_r = crate::decode::arch(&h_r)?;
+            let a_m = crate::decode::arch(&h_m)?;
+            let s_r = Shape::new(&h_r, &a_r)?;
+            let s_m = Shape::new(&h_m, &a_m)?;
+            let t_r = s_r.zero_params(&h_r, &a_r);
+            let t_m = s_m.zero_params(&h_m, &a_m);
+            // Guided motion pre-training: the external flow fields are learned
+            // like an image (upstream `guided_motion_pretraining`), then handed
+            // to every odd warm-up candidate.
+            let mut rng = trainer::Rng::new(opt.seed ^ 0x9d2c_5681_u64);
+            let mut pretrained = None;
+            if let Some(flow) = vopt.flow.as_deref_mut() {
+                let ref_slices: Vec<&[f32]> = shifted.iter().map(|r| r.data.as_slice()).collect();
+                if let Some(flows) = flow(sf.display_order, &target444.data, &ref_slices) {
+                    if flows.len() != n_refs || flows.iter().any(|f| f.len() != 2 * w * h) {
+                        return Err(crate::Error::InvalidArgument(
+                            "flow estimator must return one [2][h*w] field per reference",
+                        ));
+                    }
+                    let flow_target: Vec<f32> = flows.concat();
+                    let pb_flow = Problem {
+                        shape: &s_m,
+                        target: &flow_target,
+                        frame_data_type: crate::FrameDataType::Flow,
+                        bitdepth: 8,
+                        lambda: 20.0 * opt.lambda,
+                        gain: 16.0,
+                        dist: Dist::MSE,
+                        wass: None,
+                        inter: None,
+                        out_init: None,
+                    };
+                    let preset =
+                        Preset::inter(opt.lambda, opt.start_lr, opt.n_itr, itr_motion, dist);
+                    let phase = preset.motion_pretrain.as_ref().unwrap();
+                    let mut pm = t_m.clone();
+                    trainer::initialize(&mut pm, &s_m, &mut rng);
+                    let (pm, _l) =
+                        trainer::train(&pb_flow, pm, phase, &mut rng, &mut |_, _, _| {}, stop)?;
+                    pretrained = Some(pm);
+                }
+            }
+            let shared = crate::train::inter::SharedInter {
+                refs,
+                global_flow: global_flow.clone(),
+                warp_filter,
+                frame_type: fh.frame_type,
+            };
+            let wass = opt
+                .vgg
+                .as_ref()
+                .filter(|_| opt.tune == Tune::Wasserstein)
+                .map(|v| Wasserstein::new(v.clone(), &target, h, w));
+            fn mk_pb<'a>(
+                shape: &'a Shape,
+                target: &'a [f32],
+                fdt: crate::FrameDataType,
+                bitdepth: u32,
+                lambda: f32,
+                dist: Dist,
+                wass: Option<&'a Wasserstein>,
+            ) -> Problem<'a> {
+                Problem {
+                    shape,
+                    target,
+                    frame_data_type: fdt,
+                    bitdepth,
+                    lambda,
+                    gain: 16.0,
+                    dist,
+                    wass,
+                    inter: None,
+                    out_init: None,
+                }
+            }
+            let pb_r = mk_pb(
+                &s_r,
+                &target,
+                frame_data_type,
+                bitdepth as u32,
+                opt.lambda,
+                dist,
+                wass.as_ref(),
+            );
+            let pb_m = mk_pb(
+                &s_m,
+                &target,
+                frame_data_type,
+                bitdepth as u32,
+                opt.lambda,
+                dist,
+                wass.as_ref(),
+            );
+            let preset = Preset::inter(opt.lambda, opt.start_lr, opt.n_itr, itr_motion, dist);
+            let mut progress =
+                |it: usize, _t: &crate::train::LossTerms, v: Option<&crate::train::LossTerms>| {
+                    if let Some(v) = v {
+                        log(alloc::format!(
+                            "frame {} itr {it:>5}: psnr {:.3} dB, loss {:.6}",
+                            sf.display_order,
+                            -10.0 * libm::log10(v.mse),
+                            v.loss
+                        ));
+                    }
+                };
+            let (p_r, p_m, _l) = trainer::encode_training_pair(
+                &pb_r,
+                &pb_m,
+                &shared,
+                &t_r,
+                &t_m,
+                &preset,
+                pretrained.as_ref().map(|p| (p, 1.0f32)),
+                opt.seed ^ (sf.display_order as u64).wrapping_mul(0x9E37_79B9),
+                &mut progress,
+                stop,
+            )?;
+            // Upstream `quantize_model`/`rdoq_model` iterate residue then
+            // motion; each pass sees the partner's current parameters. The
+            // residue pass uses the trained motion's eval raw; the motion pass
+            // decodes the residue's just-written payload — the partner the
+            // decoder will actually see.
+            let mut pb_r = pb_r;
+            let mut pb_m = pb_m;
+            let raw_m = crate::train::eval::eval_raw(&s_m, &p_m, 16.0);
+            pb_r.inter = Some(crate::train::inter::InterCtx {
+                role: crate::train::inter::InterRole::Residue,
+                shared: &shared,
+                other_raw: &raw_m,
+            });
+            let mut h_r_q = h_r.clone();
+            let r_bytes = finish_cc(&pb_r, &p_r, &mut h_r_q, opt, log, stop)?;
+            let (raw_r, _g, _hy, _rest) = crate::decode::decode_coolchic(
+                &r_bytes,
+                &crate::Limits::default(),
+                &mut || Ok(()),
+            )?;
+            pb_m.inter = Some(crate::train::inter::InterCtx {
+                role: crate::train::inter::InterRole::Motion,
+                shared: &shared,
+                other_raw: &raw_r.data,
+            });
+            let mut h_m_q = h_m.clone();
+            let m_bytes = finish_cc(&pb_m, &p_m, &mut h_m_q, opt, log, stop)?;
+            fh.global_flow = global_flow.iter().flat_map(|&(x, y)| [x, y]).collect();
+            fh.warp_filter_size = Some(warp_filter);
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&r_bytes);
+            payload.extend_from_slice(&m_bytes);
+            let (frame, _aux, _rest) = crate::decode::decode_inter(
+                &fh,
+                &sf.index_references,
+                &payload,
+                &decoded,
+                &crate::Limits::default(),
+                &mut || Ok(()),
+            )?;
+            decoded[sf.display_order as usize] = Some(frame);
+            alloc::vec![r_bytes, m_bytes]
+        };
+        // PSNR of the stored reconstruction on the stored planes — the same
+        // samples upstream evaluates on (420 chroma at half resolution).
+        let f = decoded[sf.display_order as usize].as_ref().unwrap();
+        let stored = f.stored_planes();
+        let mut num = 0.0f64;
+        let mut cnt = 0usize;
+        for (p, q) in stored.iter().zip(norm.iter()) {
+            for (a, b) in p.iter().zip(q.iter()) {
+                let d = f64::from(*a - *b);
+                num += d * d;
+            }
+            cnt += p.len();
+        }
+        let mse = num / cnt.max(1) as f64;
+        reports.push(VideoFrameReport {
+            display_index: sf.display_order,
+            frame_type: fh.frame_type,
+            header: fh.clone(),
+            psnr_db: -10.0 * libm::log10(mse.max(1e-30)),
+        });
+        out.extend_from_slice(&crate::write::write_frame(&fh, &cc_bytes));
+    }
+    Ok(VideoReport {
+        frames: reports,
+        bitstream: out,
+    })
+}
+
 /// The last tuple element is the luma sample count — the rate/PSNR
 /// normalization (upstream `n_pixels`).
 type Setup = (
@@ -733,6 +1203,89 @@ mod tests {
         assert_eq!(fh.bitdepth, 10);
         let pic = crate::decode(&report.bitstream, &crate::Limits::default()).unwrap();
         assert_eq!((pic.width, pic.height), (w as u32, h as u32));
+    }
+
+    /// A three-frame video (I0, B1, P2 — the minimal GOP exercising every frame
+    /// type) encodes to a stream the decoder accepts in coding order: the B
+    /// frame trains against both decoded references and writes two payloads.
+    #[test]
+    fn video_ibp_encodes_and_decodes() {
+        let (w, h) = (16usize, 16usize);
+        let data: Vec<Vec<u16>> = (0..3)
+            .map(|shift| {
+                (0..3 * w * h)
+                    .map(|i| ((i * 5 + shift * 41) % 256) as u16)
+                    .collect()
+            })
+            .collect();
+        let frames: Vec<Vec<Plane>> = data
+            .iter()
+            .map(|d| {
+                (0..3)
+                    .map(|c| Plane {
+                        width: w as u32,
+                        height: h as u32,
+                        samples: &d[c * w * h..(c + 1) * w * h],
+                    })
+                    .collect()
+            })
+            .collect();
+        let views: Vec<&[Plane]> = frames.iter().map(|f| f.as_slice()).collect();
+        let opt = TrainOptions {
+            arch: 3,
+            n_itr: 2000,
+            rdoq: false,
+            ..Default::default()
+        };
+        let report = encode_video(
+            crate::FrameDataType::Rgb,
+            8,
+            &views,
+            &[0],
+            &[2],
+            &opt,
+            &mut VideoOptions::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        // Coding order is I0, P2, B1.
+        assert_eq!(
+            report
+                .frames
+                .iter()
+                .map(|f| (f.display_index, f.frame_type))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, crate::header::FrameType::I),
+                (2, crate::header::FrameType::P),
+                (1, crate::header::FrameType::B)
+            ]
+        );
+        let decoded = crate::decode_video(
+            &report.bitstream,
+            &crate::Limits {
+                max_frames: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded.len(), 3);
+        // Headers: the B frame carries two references, two global flows and the
+        // warp filter size; the P frame one of each.
+        let b = &report.frames[2].header;
+        let p = &report.frames[1].header;
+        assert_eq!(b.frame_type, crate::header::FrameType::B);
+        assert_eq!(b.index_references, [0, 2]);
+        assert_eq!(b.global_flow.len(), 4);
+        assert_eq!(b.warp_filter_size, Some(8));
+        assert_eq!(p.frame_type, crate::header::FrameType::P);
+        assert_eq!(p.index_references, [0]);
+        assert_eq!(p.global_flow.len(), 2);
+        assert!(
+            decoded
+                .iter()
+                .all(|f| f.width == w as u32 && f.height == h as u32)
+        );
     }
 
     /// Plane layout, dimension and sample-range violations are argument errors.

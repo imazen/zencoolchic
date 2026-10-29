@@ -113,6 +113,17 @@ pub(crate) fn synthesize(shape: &Shape, p: &Params, up: &[f32]) -> Vec<f32> {
     rescale_output(shape, &raw)
 }
 
+/// The eval-mode raw synthesis output (hard-round latents, image resolution):
+/// an inter-frame partner's `other_raw` during network quantization and RDOQ
+/// (upstream recomputes the joint forward per score; the partner's parameters
+/// are fixed within each pass, so one capture is equivalent).
+#[cfg_attr(not(feature = "encoder"), allow(dead_code))]
+pub(crate) fn eval_raw(shape: &Shape, p: &Params, gain: f32) -> Vec<f32> {
+    let q = quantize_hard(p, gain);
+    let up = upsample(shape, p, &q);
+    synthesize(shape, p, &up)
+}
+
 /// Upstream `rescale_output`: `F.interpolate(raw, size=img_size)` when the
 /// synthesis ran below image resolution; a copy otherwise.
 pub(crate) fn rescale_output(shape: &Shape, raw: &[f32]) -> Vec<f32> {

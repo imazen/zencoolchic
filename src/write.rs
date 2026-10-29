@@ -78,6 +78,34 @@ pub(crate) fn write_coolchic(
     Ok(out)
 }
 
+/// Serializes one cool-chic payload (header + expgolomb params + ARM-coded
+/// latents): the `write_image` inner step, shared with video frames.
+pub(crate) fn write_coolchic_full(
+    h: &CoolChicHeader,
+    params: &[i64],
+    grids: &[latent::Grid],
+) -> Result<Vec<u8>> {
+    let a = decode::arch(h)?;
+    let orders = decode::param_orders(h, &a)?;
+    // The fixed-point ARM is built from the integers exactly as the decoder will build it.
+    let (nn_bytes, pad) = expgolomb::encode(params, &orders);
+    let mut hh = h.clone();
+    hh.nn_n_bit_pad = pad;
+    let (nets, back) = decode::build_networks(&hh, &a, &nn_bytes)?;
+    debug_assert_eq!(back, params);
+    write_coolchic(h, &nets, params, grids)
+}
+
+/// Writes one video frame: frame header, residue payload, then the motion
+/// payload for inter frames (upstream `encode_frame`'s stream order).
+pub(crate) fn write_frame(fh: &FrameHeader, ccs: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = fh.to_bytes();
+    for cc in ccs {
+        out.extend_from_slice(cc);
+    }
+    out
+}
+
 /// Writes a single-image stream from quantized integers: `params` in stream order,
 /// `grids` finest first. The header's quantization fields must already be set.
 pub(crate) fn write_image(
@@ -87,19 +115,6 @@ pub(crate) fn write_image(
     params: &[i64],
     grids: &[latent::Grid],
 ) -> Result<Vec<u8>> {
-    let a = decode::arch(h)?;
-    let orders = decode::param_orders(h, &a)?;
-    if orders.len() != params.len() {
-        return Err(Error::Invalid(
-            "parameter count does not match the architecture",
-        ));
-    }
-    // The fixed-point ARM is built from the integers exactly as the decoder will build it.
-    let (nn_bytes, pad) = expgolomb::encode(params, &orders);
-    let mut hh = h.clone();
-    hh.nn_n_bit_pad = pad;
-    let (nets, back) = decode::build_networks(&hh, &a, &nn_bytes)?;
-    debug_assert_eq!(back, params);
     let vh = VideoHeader {
         n_frames: 1,
         intra_pos: alloc::vec![0],
@@ -116,7 +131,7 @@ pub(crate) fn write_image(
     };
     let mut out = vh.to_bytes();
     out.extend_from_slice(&fh.to_bytes());
-    out.extend_from_slice(&write_coolchic(h, &nets, params, grids)?);
+    out.extend_from_slice(&write_coolchic_full(h, params, grids)?);
     Ok(out)
 }
 

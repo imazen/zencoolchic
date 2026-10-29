@@ -588,7 +588,7 @@ fn synthesize(h: &CoolChicHeader, a: &Arch, nets: &Networks, grids: &[Grid]) -> 
 /// Synthesis output, decoded grids, hyperlatent flags, remaining bytes.
 type CoolChicOut<'a> = (Planes, Vec<Grid>, Vec<bool>, &'a [u8]);
 
-fn decode_coolchic<'a>(
+pub(crate) fn decode_coolchic<'a>(
     data: &'a [u8],
     limits: &Limits,
     check: &mut dyn FnMut() -> Result<()>,
@@ -626,7 +626,7 @@ fn quantize(v: f32, max: f32) -> f32 {
 
 /// A decoded frame kept for output and later as a warping reference: float planes
 /// at their stored resolution, quantized to the bitdepth grid (upstream `FrameData`).
-struct DecodedFrame {
+pub(crate) struct DecodedFrame {
     planes: Vec<Vec<f32>>,
     plane_dims: Vec<(u32, u32)>,
     bitdepth: u32,
@@ -637,24 +637,43 @@ impl DecodedFrame {
     /// The frame as a 3-channel full-resolution tensor — upstream converts
     /// 4:2:0 references to 4:4:4 with a `scale_factor=2` nearest upsample
     /// before warping (`convert_420_to_444`).
-    fn as_444(&self) -> Result<Planes> {
-        let (w, h) = self.plane_dims[0];
+    pub(crate) fn as_444(&self) -> Result<Planes> {
+        planes_to_444(&self.planes, &self.plane_dims, self.data_type)
+    }
+
+    /// The reconstruction at its stored resolution — the same samples upstream
+    /// evaluates PSNR on (for 4:2:0, luma plus half-resolution chroma).
+    #[cfg_attr(not(feature = "encoder"), allow(dead_code))]
+    pub(crate) fn stored_planes(&self) -> &[Vec<f32>] {
+        &self.planes
+    }
+}
+
+/// `DecodedFrame::as_444` lifted onto loose planes: the frame as a 3-channel
+/// full-resolution tensor (upstream `convert_420_to_444`).
+pub(crate) fn planes_to_444(
+    planes: &[Vec<f32>],
+    plane_dims: &[(u32, u32)],
+    data_type: FrameDataType,
+) -> Result<Planes> {
+    {
+        let (w, h) = plane_dims[0];
         let (w, h) = (w as usize, h as usize);
-        match self.data_type {
+        match data_type {
             FrameDataType::Rgb | FrameDataType::Yuv444 => Ok(Planes {
                 c: 3,
                 h,
                 w,
-                data: self.planes.concat(),
+                data: planes.concat(),
             }),
             FrameDataType::Yuv420 => {
-                let (cw, ch) = (self.plane_dims[1].0 as usize, self.plane_dims[1].1 as usize);
+                let (cw, ch) = (plane_dims[1].0 as usize, plane_dims[1].1 as usize);
                 if 2 * cw != w || 2 * ch != h {
                     return Err(Error::Invalid("4:2:0 chroma/luma size mismatch"));
                 }
                 let mut data = Vec::with_capacity(3 * h * w);
-                data.extend_from_slice(&self.planes[0]);
-                for p in &self.planes[1..3] {
+                data.extend_from_slice(&planes[0]);
+                for p in &planes[1..3] {
                     for y in 0..h {
                         let row = &p[(y / 2) * cw..(y / 2) * cw + cw];
                         for x in 0..w {
@@ -668,7 +687,9 @@ impl DecodedFrame {
             FrameDataType::Flow => Err(Error::Invalid("flow reference frame")),
         }
     }
+}
 
+impl DecodedFrame {
     /// Integer samples (`round(x · (2^b - 1))`), one plane per channel.
     fn to_picture(&self) -> Picture {
         let max = ((1u32 << self.bitdepth) - 1) as f32;
@@ -689,7 +710,7 @@ impl DecodedFrame {
 
 /// Cool-chic internals of one frame's network, kept for oracle inspection
 /// (upstream drops them).
-struct CcAux {
+pub(crate) struct CcAux {
     grids: Vec<Grid>,
     is_hyperlatent: Vec<bool>,
     /// Synthesis output before the reconstruction tail, `[c][h][w]`.
@@ -698,7 +719,7 @@ struct CcAux {
 
 /// Per-frame internals: the residue network always, plus the motion network
 /// for inter frames.
-struct FrameAux {
+pub(crate) struct FrameAux {
     residue: CcAux,
     /// Only oracle tests read the motion network's internals.
     #[cfg_attr(not(all(test, feature = "oracle")), allow(dead_code))]
@@ -708,7 +729,7 @@ struct FrameAux {
 /// The shared reconstruction tail of upstream `decode_frame`: quantize the
 /// synthesized image to the bitdepth grid, downsample to 4:2:0 when asked,
 /// clamp, quantize once more — the stored `FrameData`.
-fn finish_frame(decoded: &Planes, fh: &FrameHeader) -> Result<DecodedFrame> {
+pub(crate) fn finish_frame(decoded: &Planes, fh: &FrameHeader) -> Result<DecodedFrame> {
     if decoded.c < 3 {
         return Err(Error::Invalid("synthesis has fewer than 3 output channels"));
     }
@@ -776,7 +797,7 @@ fn finish_frame(decoded: &Planes, fh: &FrameHeader) -> Result<DecodedFrame> {
 /// Decodes one P or B frame: residue + motion Cool-chic payloads, globally
 /// shifted references, warping and alpha/beta compositing — the inter branch of
 /// upstream `decode_frame`. Returns the frame and the remaining bytes.
-fn decode_inter<'a>(
+pub(crate) fn decode_inter<'a>(
     fh: &FrameHeader,
     index_references: &[u32],
     data: &'a [u8],

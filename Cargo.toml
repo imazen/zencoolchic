@@ -68,3 +68,7 @@ required-features = ["encoder"]
 [[example]]
 name = "codec_encode"
 required-features = ["encoder", "zencodec"]
+
+[[example]]
+name = "encvideo"
+required-features = ["encoder"]

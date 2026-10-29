@@ -26,35 +26,53 @@ fn layer(out_ft: u32, k_size: u32, residual: bool, relu: bool) -> SynLayer {
     }
 }
 
-/// Upstream's inter-frame residue header: `header()` with `change_n_out_synth`
-/// applied — every `X` layer (all but the first in the preset strings) takes
-/// `n_out` output features (4 for a P residue, 5 for a B residue).
+/// Upstream's inter-frame residue header (`cfg/dec/residue/*.cfg`, **not** the
+/// intra cfgs — different ARM width, IFCE and synthesis): `X` layers take
+/// `n_out` output features (4 for a P residue, 5 for a B residue). Latent and
+/// hyperlatent resolutions are "auto" like the intra header.
 #[cfg_attr(not(feature = "encoder"), allow(dead_code))]
 pub(crate) fn header_inter(arch: Arch, h: u32, w: u32, n_out: u32) -> CoolChicHeader {
+    // (ctx, hidden, ifce, first) per cfg/dec/residue/{hop,mop,lop,vlop}.cfg.
+    // There is no vhop residue: VeryHigh maps to hop, the biggest offered.
+    let (ctx, hidden, ifce, first) = match arch {
+        Arch::VeryHigh | Arch::High => (10, 2, 4, 48),
+        Arch::Medium => (10, 2, 2, 16),
+        Arch::Low => (6, 2, 0, 16),
+    };
     let mut hdr = header(arch, h, w);
-    for l in hdr.layers_synthesis.iter_mut().skip(1) {
-        l.out_ft = n_out;
-    }
+    hdr.spatial_context_arm = ctx;
+    hdr.n_hidden_layers_arm = hidden;
+    hdr.output_feature_ifce = ifce;
+    hdr.ifce_resolution = if ifce == 0 { None } else { Some([0, 2]) };
+    hdr.layers_synthesis = alloc::vec![
+        layer(first, 1, false, true),
+        layer(n_out, 1, false, false),
+        layer(n_out, 3, true, false),
+    ];
     hdr
 }
 
-/// Upstream's default motion Cool-chic (`--arm_motion 6,2/stabiliser`,
-/// `--layers_synthesis_motion 16-1-linear-relu,X-1-linear-none/stabiliser`,
-/// `--latent_resolution_motion 2-6`, `--hyperlatent_resolution_motion no`,
-/// `--ifce_resolution_motion 2-2`, `--output_feature_ifce_motion 6`,
-/// `--ups_k_size_motion 8`, `--ups_preconcat_k_size_motion 7`): a fixed latent
+/// Upstream's motion Cool-chic (`cfg/dec/motion/{mop,lop}.cfg`): a fixed latent
 /// range of 2-6, no hyperlatent and **nearest** final upsampling (blocks of
-/// constant flow). `n_out` is 2 for a P frame, 4 for a B frame.
+/// constant flow). `n_out` is 2 for a P frame, 4 for a B frame. `Low` uses the
+/// lop motion cfg (`arm 6,1`, no IFCE, `8-1-linear-relu` stem); the other archs
+/// use mop (`arm 6,2`, IFCE 2 at `2-2`, `16-1-linear-relu` stem).
 #[cfg_attr(not(feature = "encoder"), allow(dead_code))]
-pub(crate) fn header_motion(h: u32, w: u32, n_out: u32) -> CoolChicHeader {
+pub(crate) fn header_motion(arch: Arch, h: u32, w: u32, n_out: u32) -> CoolChicHeader {
+    let (hidden, first, ifce) = match arch {
+        // lop.cfg: `arm_motion 6,1`, `ifce_resolution_motion no` (→ ifce out 0).
+        Arch::Low => (1, 8, 0),
+        // mop.cfg: `arm_motion 6,2`, `output_feature_ifce_motion 2` at `2-2`.
+        _ => (2, 16, 2),
+    };
     CoolChicHeader {
         linear_stabiliser_synth: true,
         ups_k_size: 8,
         ups_preconcat_k_size: 7,
-        output_feature_ifce: 6,
+        output_feature_ifce: ifce,
         spatial_context_arm: 6,
         linear_stabiliser_arm: true,
-        n_hidden_layers_arm: 2,
+        n_hidden_layers_arm: hidden,
         img_size: [h, w],
         latent_resolution: [2, 6],
         n_latent_grids: 5,
@@ -81,9 +99,9 @@ pub(crate) fn header_motion(h: u32, w: u32, n_out: u32) -> CoolChicHeader {
         nn_n_bytes: 0,
         nn_n_bit_pad: 0,
         n_bytes_latent: 0,
-        ifce_resolution: Some([2, 2]),
+        ifce_resolution: if ifce == 0 { None } else { Some([2, 2]) },
         hyperlatent_resolution: None,
-        layers_synthesis: alloc::vec![layer(16, 1, false, true), layer(n_out, 1, false, false)],
+        layers_synthesis: alloc::vec![layer(first, 1, false, true), layer(n_out, 1, false, false)],
     }
 }
 
