@@ -140,10 +140,11 @@ transients, f32 latents and backward activations, retained references), checked
 once frame dimensions are known — at `encode()` for stills and `finish()` for
 animations. Still refused: YUV output (`PixelDescriptor` has no YCbCr layout or
 subsampling carrier). RGB streams have no
-color metadata carrier; the bridge assumes sRGB. Fallible allocation coverage and
-finer cancellation granularity remain engineering work. Current cancellation checks
-are per grid/stage or training/quantization/RDOQ iteration; an entire convolution is
-not interruptible.
+color metadata carrier; the bridge assumes sRGB. Fallible allocation coverage
+remains engineering work. Decode cancellation is checked per ARM raster diagonal,
+per upsampling step and per synthesis output channel; encode checks each training
+iteration, quantization candidate and RDOQ candidate — a single candidate
+forward/backward is the finest uninterruptible span.
 
 Training uses a CPU backend. Upstream GPU/torch compilation machinery, general
 training checkpoint/resume and PyTorch `.pt` checkpoint import/export are not
