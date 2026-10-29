@@ -803,6 +803,78 @@
       "compressed_sha256": "88800d41f55fe0b77ca1b8abb7499e8629164744facf132f7a4ec898d5b2f987"
     },
     {
+      "path": "warp/comp.dmot.f32",
+      "bytes": 7680,
+      "sha256": "309bc1b1419cbf586389e3f808b067fdcafc9d89f1267d65d9e781cff744198e",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 5768,
+      "compressed_sha256": "675d9a3867ef6f554e5770f9e976744e58f8c70838af609db6b51d71e87ee18f"
+    },
+    {
+      "path": "warp/comp.dres.f32",
+      "bytes": 9600,
+      "sha256": "4a916fb673423207cd3246ebeb10676cbbdad87b5d10ba4295807dd97cb4acaf",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 6557,
+      "compressed_sha256": "e47ab680fa4f5beed036a56eda69b632c39df64b2dbf54209a61ad78b3270c24"
+    },
+    {
+      "path": "warp/comp.img.f32",
+      "bytes": 5760,
+      "sha256": "f7ffe9e24833499a76f6670e13a3d9047a924f708d94c1caae6beafd351a678c",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 5014,
+      "compressed_sha256": "abc3018c7244347e48bb287ccec45d24888e8be3c452eab4f54f31fc2eb0de9f"
+    },
+    {
+      "path": "warp/comp.json",
+      "bytes": 88,
+      "sha256": "218c88b225dde041537689c9b2d9a6e611d1c56692ade747ad3df61312a5a901",
+      "shuffle_word_bytes": 1,
+      "compressed_bytes": 96,
+      "compressed_sha256": "7543a5619c40c7f2f9a881ab07e0f9a5fcfb0fd003278f8cae2b4621d29a95cf"
+    },
+    {
+      "path": "warp/comp.mot.f32",
+      "bytes": 7680,
+      "sha256": "aab93867a61572be4601dfda66fac11bc958a4d7cd731b07e685022c9d708827",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 6730,
+      "compressed_sha256": "e36b1d56090e996057cc4f259327c8274efb8487e9c158e1fefaf7be3d7457a0"
+    },
+    {
+      "path": "warp/comp.ref0.f32",
+      "bytes": 5760,
+      "sha256": "130763fbabc05472d5822f2502025e6cd6dba62dce5088e8829a3adfbddbca10",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 4738,
+      "compressed_sha256": "a77b9e47fd4e5ee059d63fe10ec70d08000e6cef8eb9f965c211a63ee36c3d2d"
+    },
+    {
+      "path": "warp/comp.ref1.f32",
+      "bytes": 5760,
+      "sha256": "901ce094105532767c475a19f1f0f6b51c687a179c0999f6c1e4e40c27465a73",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 4750,
+      "compressed_sha256": "66a24c5a39af7ef3f4c797f748b6b07650eb358884bf63185202e9fe5d56cf84"
+    },
+    {
+      "path": "warp/comp.res.f32",
+      "bytes": 9600,
+      "sha256": "0f5e20590fb8245b14cc7df18c664da4847f4a7f997c265babc03ac4409ddbb3",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 8358,
+      "compressed_sha256": "7dfdfc71453df3a64d7d17814a910feeff41cf6351e776fcfa900f65fa412d66"
+    },
+    {
+      "path": "warp/comp.tgt.f32",
+      "bytes": 5760,
+      "sha256": "591be776826a5a13eb2ea3ac55134bf105f34094451ebb38799da2e2867f40b8",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 4737,
+      "compressed_sha256": "24c66f69b0db55132322a1dc2b9bdee10936c5b9049e2a208ce778993f7dce8d"
+    },
+    {
       "path": "warp/vec.dflow12.f32",
       "bytes": 3840,
       "sha256": "86e81e93dc828a54d19e608ba86a3579d36ea970d6b99176209507cb10d64e55",
@@ -929,6 +1001,70 @@
       "shuffle_word_bytes": 4,
       "compressed_bytes": 931,
       "compressed_sha256": "24c39cc1c84dd251a5df41d74c504f6a15e3ac828f82a405327ee08cc261dc2e"
+    },
+    {
+      "path": "warp/compp.json",
+      "bytes": 88,
+      "sha256": "d1a746ceda6fca89724c86dbb71a888004cf6466ebab0c7acd040797a9747208",
+      "shuffle_word_bytes": 1,
+      "compressed_bytes": 97,
+      "compressed_sha256": "e93614ac660c7e509fd08bb09d3b6aaac528030d74a2982089edcc163987b71e"
+    },
+    {
+      "path": "warp/compp.res.f32",
+      "bytes": 7680,
+      "sha256": "73c18ba9c5abf5558ad7e2d6bfb6dd2cfb2041c889ba6a8742ee46d77a5d7028",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 6710,
+      "compressed_sha256": "36de6da0e92de48a3636b8ee22d7741af4cbd8a861c7c8ea40d641071121bd2a"
+    },
+    {
+      "path": "warp/compp.mot.f32",
+      "bytes": 3840,
+      "sha256": "160ed55c0d2b56c582ce392d707051c300932eb006cb048d0134d0d4ccd2ee86",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 3399,
+      "compressed_sha256": "5a45383f84de128ad01fc90ebafe94159ca94d8d5759033e8c51cf1eb48e62f6"
+    },
+    {
+      "path": "warp/compp.ref0.f32",
+      "bytes": 5760,
+      "sha256": "130763fbabc05472d5822f2502025e6cd6dba62dce5088e8829a3adfbddbca10",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 4738,
+      "compressed_sha256": "a77b9e47fd4e5ee059d63fe10ec70d08000e6cef8eb9f965c211a63ee36c3d2d"
+    },
+    {
+      "path": "warp/compp.tgt.f32",
+      "bytes": 5760,
+      "sha256": "591be776826a5a13eb2ea3ac55134bf105f34094451ebb38799da2e2867f40b8",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 4737,
+      "compressed_sha256": "24c66f69b0db55132322a1dc2b9bdee10936c5b9049e2a208ce778993f7dce8d"
+    },
+    {
+      "path": "warp/compp.img.f32",
+      "bytes": 5760,
+      "sha256": "f408eab425dc433685c3b716dfd16bce87dbf5d7826b0dd72272ff9f687752e3",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 5021,
+      "compressed_sha256": "ce32544fbc26cdf99ba84aa4446a7f08929117545500c9171184baadd3833662"
+    },
+    {
+      "path": "warp/compp.dres.f32",
+      "bytes": 7680,
+      "sha256": "44c3f35915a172fe71615735b9464c851ca6d141029a59c2470e619dfc9026d4",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 5206,
+      "compressed_sha256": "16f0ec9cde846801a6e2fc95cdbb4ab8fae00443e1c1acfd55a053073625dafe"
+    },
+    {
+      "path": "warp/compp.dmot.f32",
+      "bytes": 3840,
+      "sha256": "9b03a7ceee7d387acabfc4debb97313f76ba4fc37efc2b9093f50658eb327239",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 3232,
+      "compressed_sha256": "11c7ed61d010ffcaf19bf3d98400c6526d1843939f6bf967e6bbb1cd6aa8cbdd"
     }
   ],
   "schema_version": 1,
@@ -985,6 +1121,31 @@
         "shift",
         "target",
         "target2"
+      ]
+    },
+    {
+      "name": "comp",
+      "raw": [
+        "res",
+        "mot",
+        "ref0",
+        "ref1",
+        "tgt",
+        "img",
+        "dres",
+        "dmot"
+      ]
+    },
+    {
+      "name": "compp",
+      "raw": [
+        "res",
+        "mot",
+        "ref0",
+        "tgt",
+        "img",
+        "dres",
+        "dmot"
       ]
     }
   ]

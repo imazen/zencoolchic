@@ -32,7 +32,7 @@ const GRADIENTS: &[&str] = &[
     "small64_flow",
 ];
 const VIDEO: &[&str] = &["multi_i", "pb_128"];
-const WARP: &[&str] = &["vec"];
+const WARP: &[&str] = &["vec", "comp", "compp"];
 
 fn manifest() -> &'static serde_json::Value {
     static MANIFEST: OnceLock<serde_json::Value> = OnceLock::new();
