@@ -164,10 +164,15 @@ pub(crate) struct Upsampling {
 }
 
 impl Upsampling {
-    pub(crate) fn forward(&self, latents: &[Planes]) -> Planes {
+    pub(crate) fn forward(
+        &self,
+        latents: &[Planes],
+        check: &mut dyn FnMut() -> crate::Result<()>,
+    ) -> crate::Result<Planes> {
         let n = latents.len();
         let mut up = latents[n - 1].clone();
         for (idx, target) in latents[..n - 1].iter().rev().enumerate() {
+            check()?;
             if target.c == 0 {
                 break;
             }
@@ -188,7 +193,7 @@ impl Upsampling {
             }
             up = next;
         }
-        up
+        Ok(up)
     }
 }
 
@@ -204,7 +209,11 @@ pub(crate) struct Conv {
 }
 
 impl Conv {
-    pub(crate) fn forward(&self, x: &Planes) -> Planes {
+    pub(crate) fn forward(
+        &self,
+        x: &Planes,
+        check: &mut dyn FnMut() -> crate::Result<()>,
+    ) -> crate::Result<Planes> {
         debug_assert_eq!(x.c, self.c_in);
         let (h, w, k) = (x.h, x.w, self.k);
         // Upstream `SynthesisConv2d` pads by `(k-1)//2`, so an even kernel shrinks
@@ -222,6 +231,7 @@ impl Conv {
         };
         let mut out = Planes::zeros(self.c_out, oh, ow);
         for o in 0..self.c_out {
+            check()?;
             let dst = &mut out.data[o * oh * ow..(o + 1) * oh * ow];
             dst.fill(self.bias[o]);
             for i in 0..self.c_in {
@@ -248,7 +258,7 @@ impl Conv {
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -259,10 +269,14 @@ pub(crate) struct Synthesis {
 }
 
 impl Synthesis {
-    pub(crate) fn forward(&self, x: &Planes) -> Planes {
+    pub(crate) fn forward(
+        &self,
+        x: &Planes,
+        check: &mut dyn FnMut() -> crate::Result<()>,
+    ) -> crate::Result<Planes> {
         let mut cur = x.clone();
         for (conv, relu) in &self.layers {
-            cur = conv.forward(&cur);
+            cur = conv.forward(&cur, check)?;
             if *relu {
                 for v in &mut cur.data {
                     *v = v.max(0.0);
@@ -276,7 +290,7 @@ impl Synthesis {
                 w: x.w,
                 data: x.data[..n_in * x.h * x.w].to_vec(),
             };
-            let s = st.forward(&sub);
+            let s = st.forward(&sub, check)?;
             // The 1×1 stabiliser keeps input size: it can only be added when no
             // layer shrank the stack (even kernels are refused with a stabiliser).
             debug_assert_eq!(s.data.len(), cur.data.len());
@@ -284,7 +298,7 @@ impl Synthesis {
                 *d += *v;
             }
         }
-        self.output_transform.forward(&cur)
+        self.output_transform.forward(&cur, check)
     }
 }
 
@@ -638,7 +652,7 @@ mod tests {
             w: 3,
             data: (1..=9).map(|v| v as f32).collect(),
         };
-        let out = c.forward(&x);
+        let out = c.forward(&x, &mut || Ok(())).unwrap();
         assert_eq!((out.h, out.w), (2, 2));
         assert_eq!(out.data, vec![12.0, 16.0, 24.0, 28.0]);
     }
@@ -660,9 +674,44 @@ mod tests {
             w: 3,
             data: (1..=9).map(|v| v as f32).collect(),
         };
-        let out = c.forward(&x);
+        let out = c.forward(&x, &mut || Ok(())).unwrap();
         assert_eq!((out.h, out.w), (2, 2));
         // Hand-computed sums of the 4×4 windows over the replicate-padded input.
         assert_eq!(out.data, vec![64.0, 72.0, 88.0, 96.0]);
+    }
+
+    #[test]
+    fn conv_forward_polls_check_per_output_channel() {
+        // Cancellation reaches inside a convolution: one poll per output
+        // channel, so a stop aborts mid-layer instead of after it.
+        let c = Conv {
+            c_in: 1,
+            c_out: 5,
+            k: 1,
+            weight: vec![1.0; 5],
+            bias: vec![0.0; 5],
+            residual: false,
+        };
+        let x = Planes {
+            c: 1,
+            h: 4,
+            w: 4,
+            data: vec![1.0; 16],
+        };
+        let mut polls = 0;
+        let mut check = || {
+            polls += 1;
+            if polls > 3 {
+                Err(crate::Error::Invalid("stop"))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(c.forward(&x, &mut check).is_err());
+        assert_eq!(polls, 4);
+        assert_eq!(
+            c.forward(&x, &mut || Ok(())).unwrap().data,
+            vec![1.0; 5 * 16]
+        );
     }
 }

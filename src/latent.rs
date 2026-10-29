@@ -170,6 +170,7 @@ pub(crate) fn code_grid(
     inter: Option<&InterContext>,
     h: usize,
     w: usize,
+    check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Grid> {
     let n_spatial = window.len();
     let n_inter = inter.map_or(0, |c| c.c);
@@ -212,6 +213,7 @@ pub(crate) fn code_grid(
 
     if w <= MASK_SIZE {
         for y in 0..h {
+            check()?;
             for x in 0..w {
                 decode_at(y, x, &mut padded)?;
             }
@@ -220,6 +222,7 @@ pub(crate) fn code_grid(
         let step = MASK_SIZE + 1;
         let max_t = (w - 1) + step * (h - 1);
         for t in 0..=max_t {
+            check()?;
             // Smallest y with x = t - step*y <= w - 1.
             let y0 = if t >= w { (t - w) / step + 1 } else { 0 };
             let mut y = y0;

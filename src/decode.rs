@@ -483,6 +483,7 @@ pub(crate) trait GridCoder {
         window: &[usize],
         inter: Option<&latent::InterContext>,
         hw: (usize, usize),
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Grid>;
 }
 
@@ -494,8 +495,9 @@ impl GridCoder for RangeDecoder<'_> {
         window: &[usize],
         inter: Option<&latent::InterContext>,
         (h, w): (usize, usize),
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Grid> {
-        latent::code_grid(self, arm, window, inter, h, w)
+        latent::code_grid(self, arm, window, inter, h, w, check)
     }
 }
 
@@ -549,12 +551,18 @@ fn code_latents_checked(
         } else {
             None
         };
-        grids[idx] = Some(rc.grid(idx, &nets.arm, &window, inter.as_ref(), (gh, gw))?);
+        grids[idx] = Some(rc.grid(idx, &nets.arm, &window, inter.as_ref(), (gh, gw), check)?);
     }
     Ok(grids.into_iter().map(|g| g.unwrap()).collect())
 }
 
-fn synthesize(h: &CoolChicHeader, a: &Arch, nets: &Networks, grids: &[Grid]) -> Result<Planes> {
+fn synthesize(
+    h: &CoolChicHeader,
+    a: &Arch,
+    nets: &Networks,
+    grids: &[Grid],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Planes> {
     let latents: Vec<Planes> = grids
         .iter()
         .zip(&a.is_hyperlatent)
@@ -566,7 +574,7 @@ fn synthesize(h: &CoolChicHeader, a: &Arch, nets: &Networks, grids: &[Grid]) -> 
             data: g.data.iter().map(|&v| v as f32).collect(),
         })
         .collect();
-    let mut syn_in = nets.upsampling.forward(&latents);
+    let mut syn_in = nets.upsampling.forward(&latents, check)?;
     let [ih, iw] = h.img_size.map(|v| v as usize);
     if h.flag_common_randomness {
         let mut noise = CommonNoise::new();
@@ -596,7 +604,7 @@ fn synthesize(h: &CoolChicHeader, a: &Arch, nets: &Networks, grids: &[Grid]) -> 
             "even synthesis kernels shrink image below one pixel",
         ));
     }
-    let out = nets.synthesis.forward(&syn_in);
+    let out = nets.synthesis.forward(&syn_in, check)?;
     Ok(nn::resize(&out, ih, iw, h.final_upsampling, Scale::Size))
 }
 
@@ -631,7 +639,7 @@ pub(crate) fn decode_coolchic<'a>(
     check()?;
     let grids = decode_latents(&h, &a, &nets, lat_bytes, check)?;
     check()?;
-    let out = synthesize(&h, &a, &nets, &grids)?;
+    let out = synthesize(&h, &a, &nets, &grids, check)?;
     check()?;
     Ok((out, grids, a.is_hyperlatent, rest))
 }

@@ -23,9 +23,10 @@
 //! video on `finish` with upstream's `intra_pos 0`, `p_pos <last>` GOP;
 //! durations are dropped (the stream has no timing field). Metadata has no
 //! carrier; the encoder bakes its orientation into pixels and drops the rest.
-//! Decode cancellation is checked between latent grids and network stages; an individual
-//! grid or convolution is not interruptible. Encode checks each training iteration,
-//! quantization candidate and RDOQ candidate, on problem-sized rayon pools.
+//! Decode cancellation is checked per ARM raster diagonal inside each latent grid,
+//! per upsampling step and per synthesis output channel. Encode checks each
+//! training iteration, quantization candidate and RDOQ candidate, on
+//! problem-sized rayon pools.
 //!
 //! Dimension, pixel, frame, input and output caps are enforced. Decode honors
 //! `max_memory_bytes` via a pre-flight working-set estimate (params, latents and

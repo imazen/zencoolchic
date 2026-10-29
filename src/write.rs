@@ -25,6 +25,7 @@ impl GridCoder for LatentsEncoder<'_> {
         window: &[usize],
         inter: Option<&InterContext>,
         (h, w): (usize, usize),
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<latent::Grid> {
         let g = &self.source[idx];
         if (g.h, g.w) != (h, w) {
@@ -35,7 +36,7 @@ impl GridCoder for LatentsEncoder<'_> {
             values: &g.data,
             w,
         };
-        latent::code_grid(&mut enc, arm, window, inter, h, w)
+        latent::code_grid(&mut enc, arm, window, inter, h, w, check)
     }
 }
 
