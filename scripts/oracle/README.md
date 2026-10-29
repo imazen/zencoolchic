@@ -30,7 +30,10 @@ same bytes across Python/torch versions, devices or random generators.
   small networks against the input downsampled to a 4:2:0 dict
   (`convert_444_to_420` + `yuv_dict_clamp` + the per-plane-sample-weighted
   `_compute_mse`) so the encode-side YUV loss and its chroma-average backward
-  are checked against float64 autograd. Wasserstein dumps also store the
+  are checked against float64 autograd. The `lop` config uses
+  `latent_resolution (2, 4)` — synthesis at quarter resolution with the
+  bicubic `rescale_output` — so the final `F.interpolate` forward and backward
+  are checked too. Wasserstein dumps also store the
   clamped `decoded` image, `tap{i}` features, `gtap{i}` tap gradients,
   `grad_dec` (`d wasserstein/d decoded`), `wasserstein_per_tap` and
   `dist_weight`.

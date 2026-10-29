@@ -1,9 +1,9 @@
 # Frozen Cool-chic 5 regression references
 
-These 101 zstd payloads preserve every original reference byte: 12 decoder/writer
-cases, five gradient cases, two video cases, a warper vector case, and the SOAP
-optimizer reference. Original payloads total 16,622,521 bytes; compressed payloads
-total 6,850,678 bytes. No Python
+These 103 zstd payloads preserve every original reference byte: 12 decoder/writer
+cases, six gradient cases, two video cases, a warper vector case, and the SOAP
+optimizer reference. Original payloads total 16,688,557 bytes; compressed payloads
+total 6,887,395 bytes. No Python
 environment, external executable, download or shared storage is needed to run:
 
 ```sh
@@ -46,6 +46,9 @@ gradient seed is 1234 and SOAP seed is 7. Decoder metadata retains shapes and th
 torch version. `small64_yuv420` exercises the 4:2:0 training loss: the target is
 upstream's `convert_444_to_420(img)` dict and the distortion is the
 per-plane-sample-weighted MSE over the downsampled-clamped decode.
+`small64_lop` exercises below-full-resolution latents (`latent_resolution`
+(2,4)): the synthesis runs at quarter resolution and `rescale_output`
+bicubically interpolates back to the image size.
 `small64_miniwass` exercises the Wasserstein distortion path with
 common randomness; its feature extractor is a deterministic ten-convolution
 miniature (seed 4242, embedded in the dump as `vgg`/`vgg_dims`) rather than

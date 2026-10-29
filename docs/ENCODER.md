@@ -16,7 +16,14 @@ full-resolution luma and half-resolution chroma (even luma dimensions), at 8–1
 bits per sample. The 4:2:0 loss reproduces upstream's downsample-then-clamp tail
 and per-plane-sample MSE weighting; `Tune::Wasserstein` rejects 4:2:0 the way
 upstream's VGG path requires a full-resolution three-channel tensor.
-It does not encode sub-full-resolution starting latents or video.
+`TrainOptions::latent_res = Some((lo, hi))` starts the latent grids below full
+resolution (upstream `--latent_residue lo-hi`); synthesis then runs at the
+finest grid size and the output is interpolated to the image with the
+`final_upsampling` mode written into the stream. Common randomness
+(`Tune::Wasserstein`) cannot run below full resolution — upstream cannot
+concatenate its full-resolution noise planes there either — so that
+combination is rejected.
+It does not encode video.
 The decoder supports more stream tools than the encoder creates; see
 [the porting table](../PORTING.md#decoder).
 
