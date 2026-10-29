@@ -1362,6 +1362,62 @@ mod tests {
         assert_eq!(decoded[0].plane_dims[1], (cw as u32, ch as u32));
     }
 
+    /// RDOQ scores each candidate through the inter composite (the partner
+    /// model's raw output, quantized flow) rather than the model's own raw
+    /// planes — this exercises that path end to end on an I/P stream.
+    #[test]
+    fn video_ip_rdoq() {
+        let (w, h) = (16usize, 16usize);
+        let data: Vec<Vec<u16>> = (0..2)
+            .map(|shift| {
+                (0..3 * w * h)
+                    .map(|i| ((i * 7 + shift * 53) % 256) as u16)
+                    .collect()
+            })
+            .collect();
+        let frames: Vec<Vec<Plane>> = data
+            .iter()
+            .map(|d| {
+                (0..3)
+                    .map(|c| Plane {
+                        width: w as u32,
+                        height: h as u32,
+                        samples: &d[c * w * h..(c + 1) * w * h],
+                    })
+                    .collect()
+            })
+            .collect();
+        let views: Vec<&[Plane]> = frames.iter().map(|f| f.as_slice()).collect();
+        let opt = TrainOptions {
+            arch: 3,
+            n_itr: 2000,
+            rdoq: true,
+            ..Default::default()
+        };
+        let report = encode_video(
+            crate::FrameDataType::Rgb,
+            8,
+            &views,
+            &[0],
+            &[1],
+            &opt,
+            &mut VideoOptions::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.frames.len(), 2);
+        assert!(report.frames.iter().all(|f| f.psnr_db.is_finite()));
+        let decoded = crate::decode_video(
+            &report.bitstream,
+            &crate::Limits {
+                max_frames: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded.len(), 2);
+    }
+
     /// An external flow field is learned through the `flow` objective and
     /// injected into odd warm-up candidates (upstream
     /// `guided_motion_pretraining`); the callback sees each inter frame's
