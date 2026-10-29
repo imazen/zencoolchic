@@ -6,7 +6,9 @@ config: "hop" (default), "small" (tiny networks, fast), "wass" (common randomnes
   replaced by a tiny seeded conv stack with the same tap/pool positions; the weights
   ride along in the dump so no external file is needed), "yuv420" (small networks;
   the target is the input downsampled to a 4:2:0 dict, and the loss is upstream's
-  per-plane-sample-weighted MSE).
+  per-plane-sample-weighted MSE), "lop" (small networks, latent_resolution
+  (2, 4): synthesis runs at 1/4 image resolution and `rescale_output`
+  bicubically interpolates it back to img_size).
 
 Latents and all network weights get seeded random values (upstream initializes latents to
 zero, which would make most gradients trivially zero). The pass is deterministic: the
@@ -49,11 +51,14 @@ if config == "hop":
     hyper = (4, 6)
     lat = (0, 6)
 else:
-    # "small", "wass" and "miniwass" share the tiny networks.
+    # "small", "wass", "miniwass" and "lop" share the tiny networks.
     layers = ["8-1-linear-relu", "3-1-linear-none", "3-3-residual-none"]
     arm = dict(spatial_context_arm=6, n_hidden_layers_arm=1, output_feature_ifce=2)
     hyper = (3, 4)
-    lat = (0, 4)
+    # "lop" starts latents below full resolution (upstream --latent_residue):
+    # the finest grid is 1/4 image size and rescale_output bicubically
+    # interpolates the synthesis output back to img_size.
+    lat = (2, 4) if config == "lop" else (0, 4)
 param = CoolChicEncoderParameter(
     layers_synthesis=layers,
     linear_stabiliser_synth=True,

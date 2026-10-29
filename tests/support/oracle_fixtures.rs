@@ -28,6 +28,7 @@ const GRADIENTS: &[&str] = &[
     "small64_miniwass",
     "small64_small",
     "small64_yuv420",
+    "small64_lop",
 ];
 const VIDEO: &[&str] = &["multi_i", "pb_128"];
 const WARP: &[&str] = &["vec"];

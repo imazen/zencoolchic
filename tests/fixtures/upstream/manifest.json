@@ -21,7 +21,8 @@
     "small64_hop",
     "small64_miniwass",
     "small64_small",
-    "small64_yuv420"
+    "small64_yuv420",
+    "small64_lop"
   ],
   "files": [
     {
@@ -831,6 +832,22 @@
       "shuffle_word_bytes": 1,
       "compressed_bytes": 1053,
       "compressed_sha256": "71b7d865bc65a9a1292a9490a29225fd041a10805cc22261c8c1ba028a16bbf1"
+    },
+    {
+      "path": "gradients/small64_lop.bin",
+      "bytes": 56744,
+      "sha256": "251bcea1caafbc637b3357c4e0a37d182b0c71fcc0cfc1a7287de76012e3d5bb",
+      "shuffle_word_bytes": 4,
+      "compressed_bytes": 35719,
+      "compressed_sha256": "2905944b78e56ac8ef7502dc93661a0d0b14cfa7ee356abf207ffca942187c60"
+    },
+    {
+      "path": "gradients/small64_lop.json",
+      "bytes": 9292,
+      "sha256": "08988d35069a462490fcff440c4c0e81a3d0da5a2527daa03c3dd5822fc3cf89",
+      "shuffle_word_bytes": 1,
+      "compressed_bytes": 998,
+      "compressed_sha256": "53156835471517453c5afe30d7a631bc9a91c26f18e468f62f6584849f0ef495"
     }
   ],
   "schema_version": 1,
