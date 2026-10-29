@@ -401,6 +401,14 @@ impl Decode for CoolChicDecoder<'_> {
             .as_ref()
             .map(|s| s as &dyn Stop)
             .unwrap_or(&enough::Unstoppable);
+        // Sequential threading policy → wavefront evaluation on this thread
+        // only (identical output; the range coder is serial regardless).
+        #[cfg(feature = "std")]
+        let _seq = if self.job.limits.threading.is_parallel() {
+            None
+        } else {
+            Some(crate::latent::SequentialDecode::install())
+        };
         let picture = crate::decode::decode_checked(
             &self.data,
             &crate::Limits {
@@ -528,6 +536,12 @@ impl zencodec::decode::AnimationFrameDecoder for CoolChicAnimationDecoder {
                 s.check().map_err(Error::from)?;
             }
             Ok(())
+        };
+        #[cfg(feature = "std")]
+        let _seq = if self.job.limits.threading.is_parallel() {
+            None
+        } else {
+            Some(crate::latent::SequentialDecode::install())
         };
         self.dec.pull_display(i, &mut check)?;
         let frame = self

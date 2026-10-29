@@ -9,8 +9,9 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicI8, Ordering};
 
-use crate::arm::{FixedArm, N_FRAC_BIT_INTER_FT_CTX, N_FRAC_BIT_MU_SCALE, WEIGHT_SHIFT};
+use crate::arm::{FixedArm, MAX_WIDTH, N_FRAC_BIT_INTER_FT_CTX, N_FRAC_BIT_MU_SCALE, WEIGHT_SHIFT};
 use crate::error::{Error, Result};
 #[cfg(feature = "encoder")]
 use crate::rangecoder::RangeEncoder;
@@ -107,11 +108,13 @@ pub(crate) fn inter_context(
     let mut small = vec![0i64; uh * uw * n_out];
     if let Some(arm) = ifce {
         let shift = 2 * WEIGHT_SHIFT - N_FRAC_BIT_INTER_FT_CTX;
+        let mut scratch = [[0i64; MAX_WIDTH]; 2];
         for p in 0..uh * uw {
             arm.forward(
                 &stacked[p * uc..(p + 1) * uc],
                 shift,
                 &mut small[p * n_out..(p + 1) * n_out],
+                &mut scratch,
             );
         }
     }
@@ -162,6 +165,228 @@ impl SymbolCoder for GridEncoder<'_> {
     }
 }
 
+const MU_SHIFT: u32 = 2 * WEIGHT_SHIFT - N_FRAC_BIT_MU_SCALE;
+const MU_MIN_FP: i64 = -64 << N_FRAC_BIT_MU_SCALE;
+const LOG_SCALE_MIN_FP: i64 = -5 << N_FRAC_BIT_MU_SCALE;
+
+/// Shared read-only state for one grid's ARM evaluation.
+struct GridCtx<'a> {
+    arm: &'a FixedArm,
+    /// Padded raster of already-coded symbols: `i8` atomics because the
+    /// wavefront workers read it while only the serial phase writes (the
+    /// diagonal barrier provides the happens-before, so Relaxed suffices).
+    padded: &'a [AtomicI8],
+    offsets: &'a [isize],
+    inter: Option<&'a InterContext>,
+    w: usize,
+    h: usize,
+    pw: usize,
+    n_spatial: usize,
+}
+
+/// ARM evaluation for one pixel: model index `(idx_mu, idx_scale)`.
+/// Pure function of the already-coded neighbourhood — safe to run on any thread.
+#[inline]
+fn eval_px(
+    g: &GridCtx,
+    ctx: &mut [i64],
+    scratch: &mut [[i64; MAX_WIDTH]; 2],
+    y: usize,
+    x: usize,
+) -> (usize, usize) {
+    let centre = (y + PAD) * g.pw + x + PAD;
+    for (c, &off) in ctx.iter_mut().zip(g.offsets) {
+        *c = g.padded[(centre as isize + off) as usize].load(Ordering::Relaxed) as i64;
+    }
+    if let Some(ic) = g.inter {
+        let p = (y * g.w + x) * ic.c;
+        ctx[g.n_spatial..].copy_from_slice(&ic.data[p..p + ic.c]);
+    }
+    let mut out = [0i64; 2];
+    g.arm.forward(ctx, MU_SHIFT, &mut out, scratch);
+    let im = (out[0] - MU_MIN_FP).clamp(0, N_MU as i64 - 1) as usize;
+    let is = (out[1] - LOG_SCALE_MIN_FP).clamp(0, N_SCALE_IDX as i64 - 1) as usize;
+    (im, is)
+}
+
+/// Serial diagonal traversal: upstream's symbol order for wide grids.
+fn serial_diagonals(
+    g: &GridCtx,
+    rc: &mut impl SymbolCoder,
+    step: usize,
+    max_t: usize,
+    ctx: &mut [i64],
+    scratch: &mut [[i64; MAX_WIDTH]; 2],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    for t in 0..=max_t {
+        check()?;
+        // Smallest y with x = t - step*y <= w - 1.
+        let y0 = if t >= g.w { (t - g.w) / step + 1 } else { 0 };
+        let mut y = y0;
+        while y < g.h && step * y <= t {
+            let x = t - step * y;
+            let (im, is) = eval_px(g, ctx, scratch, y, x);
+            let sym = rc.code(y, x, im, is)?;
+            g.padded[(y + PAD) * g.pw + x + PAD].store(sym as i8, Ordering::Relaxed);
+            y += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Parallel variant of [`serial_diagonals`]: within one diagonal every ARM
+/// evaluation reads only earlier diagonals, so workers compute the model
+/// indices while the range coder runs serially in upstream order on the
+/// calling thread. Output is identical to the serial traversal — only the
+/// thread that evaluates the ARM differs. Returns `false` (having run
+/// nothing) when the grid is small, one thread is available, or the zencodec
+/// sequential policy is installed.
+#[cfg(feature = "std")]
+fn wave_diagonals(
+    g: &GridCtx,
+    rc: &mut impl SymbolCoder,
+    step: usize,
+    max_t: usize,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<bool> {
+    use core::sync::atomic::{AtomicU32, AtomicUsize};
+    use std::thread;
+
+    // Barriers cost ~1µs per diagonal, so parallelize only when diagonals
+    // carry enough work (~32+ pixels) and the grid is worth spawning for.
+    // Measured: −1 ms at 256² (26 px/diagonal), −35% at 384²/512² (38–51 px).
+    const MIN_DIAG: usize = 32;
+    const MIN_PX: u64 = 65_536;
+    if (g.w as u64) * (g.h as u64) < MIN_PX || g.h.min(g.w / step + 1) < MIN_DIAG {
+        return Ok(false);
+    }
+    let threads = wave_threads();
+    if threads < 2 {
+        return Ok(false);
+    }
+    let n_ctx = g.n_spatial + g.inter.map_or(0, |c| c.c);
+
+    // Per-diagonal job slots: `h` is the largest possible diagonal.
+    let diag_px: Vec<AtomicU32> = (0..g.h).map(|_| AtomicU32::new(0)).collect();
+    let out_idx: Vec<AtomicU32> = (0..g.h).map(|_| AtomicU32::new(0)).collect();
+    let diag_len = AtomicUsize::new(0);
+    // Diagonal currently offered for evaluation (t + 1); `usize::MAX` quits.
+    let epoch = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+
+    let eval = |id: usize, n: usize, ctx: &mut [i64], scratch: &mut [[i64; MAX_WIDTH]; 2]| {
+        let mut i = id;
+        while i < n {
+            let p = diag_px[i].load(Ordering::Relaxed);
+            let (im, is) = eval_px(g, ctx, scratch, (p >> 16) as usize, (p & 0xffff) as usize);
+            out_idx[i].store((im as u32) << 16 | is as u32, Ordering::Relaxed);
+            i += threads;
+        }
+    };
+
+    thread::scope(|s| {
+        for id in 1..threads {
+            let (eval, epoch, done, diag_len) = (&eval, &epoch, &done, &diag_len);
+            s.spawn(move || {
+                let mut ctx = vec![0i64; n_ctx];
+                let mut scratch = [[0i64; MAX_WIDTH]; 2];
+                let mut last = 0usize;
+                loop {
+                    let e = epoch.load(Ordering::Acquire);
+                    if e == last {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    if e == usize::MAX {
+                        return;
+                    }
+                    last = e;
+                    eval(id, diag_len.load(Ordering::Relaxed), &mut ctx, &mut scratch);
+                    done.fetch_add(1, Ordering::Release);
+                }
+            });
+        }
+
+        let mut ctx = vec![0i64; n_ctx];
+        let mut scratch = [[0i64; MAX_WIDTH]; 2];
+        let result = (|| -> Result<()> {
+            for t in 0..=max_t {
+                check()?;
+                let mut n = 0;
+                let y0 = if t >= g.w { (t - g.w) / step + 1 } else { 0 };
+                let mut y = y0;
+                while y < g.h && step * y <= t {
+                    diag_px[n].store((y as u32) << 16 | (t - step * y) as u32, Ordering::Relaxed);
+                    n += 1;
+                    y += 1;
+                }
+                diag_len.store(n, Ordering::Relaxed);
+                done.store(0, Ordering::Relaxed);
+                epoch.store(t + 1, Ordering::Release);
+                eval(0, n, &mut ctx, &mut scratch);
+                while done.load(Ordering::Acquire) + 1 < threads {
+                    core::hint::spin_loop();
+                }
+                for i in 0..n {
+                    let p = diag_px[i].load(Ordering::Relaxed);
+                    let o = out_idx[i].load(Ordering::Relaxed);
+                    let (y, x) = ((p >> 16) as usize, (p & 0xffff) as usize);
+                    let sym = rc.code(y, x, (o >> 16) as usize, (o & 0xffff) as usize)?;
+                    g.padded[(y + PAD) * g.pw + x + PAD].store(sym as i8, Ordering::Relaxed);
+                }
+            }
+            Ok(())
+        })();
+        epoch.store(usize::MAX, Ordering::Release);
+        result
+    })?;
+    Ok(true)
+}
+
+/// Scoped install of a sequential-threading policy for decode (the zencodec
+/// `Sequential`/`SingleThread` limit): [`wave_threads`] yields 1 while the
+/// guard lives, so the wavefront diagonal evaluation runs on the calling
+/// thread only (identical output).
+#[cfg(feature = "std")]
+mod decode_seq {
+    std::thread_local! {
+        static SEQ: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    }
+    pub(crate) fn is_sequential() -> bool {
+        SEQ.with(|c| c.get())
+    }
+    pub(crate) struct SequentialDecode(());
+    impl SequentialDecode {
+        /// Dead in builds that decode but never install a threading policy.
+        #[allow(dead_code)]
+        pub(crate) fn install() -> Self {
+            SEQ.with(|c| c.set(true));
+            Self(())
+        }
+    }
+    impl Drop for SequentialDecode {
+        fn drop(&mut self) {
+            SEQ.with(|c| c.set(false));
+        }
+    }
+}
+#[cfg(feature = "std")]
+#[allow(unused_imports)]
+pub(crate) use decode_seq::SequentialDecode;
+#[cfg(feature = "std")]
+use decode_seq::is_sequential;
+
+/// Threads for the wavefront diagonal evaluation: available parallelism
+/// capped at 8 (diagonals are short), 1 under the sequential policy.
+#[cfg(feature = "std")]
+fn wave_threads() -> usize {
+    let n = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
+    if is_sequential() { 1 } else { n }
+}
+
 /// Decodes (or, with a [`GridEncoder`], encodes) one `h × w` grid in upstream's symbol order.
 pub(crate) fn code_grid(
     rc: &mut impl SymbolCoder,
@@ -178,7 +403,7 @@ pub(crate) fn code_grid(
         return Err(Error::Invalid("ARM dimensions do not match its contexts"));
     }
     let pw = w + 2 * PAD;
-    let mut padded = vec![0i64; (h + 2 * PAD) * pw];
+    let padded: Vec<AtomicI8> = (0..(h + 2 * PAD) * pw).map(|_| AtomicI8::new(0)).collect();
     // Offsets (in padded raster order) from the decoded value to each context cell.
     let offsets: Vec<isize> = window
         .iter()
@@ -188,56 +413,124 @@ pub(crate) fn code_grid(
             dy * pw as isize + dx
         })
         .collect();
+    let g = GridCtx {
+        arm,
+        padded: &padded,
+        offsets: &offsets,
+        inter,
+        w,
+        h,
+        pw,
+        n_spatial,
+    };
 
     let mut ctx = vec![0i64; n_spatial + n_inter];
-    let mut out = [0i64; 2];
-    let shift = 2 * WEIGHT_SHIFT - N_FRAC_BIT_MU_SCALE;
-    let mu_min_fp: i64 = -64 << N_FRAC_BIT_MU_SCALE;
-    let log_scale_min_fp: i64 = -5 << N_FRAC_BIT_MU_SCALE;
-
-    let mut decode_at = |y: usize, x: usize, padded: &mut Vec<i64>| -> Result<()> {
-        let centre = (y + PAD) * pw + x + PAD;
-        for (c, &off) in ctx.iter_mut().zip(&offsets) {
-            *c = padded[(centre as isize + off) as usize];
-        }
-        if let Some(ic) = inter {
-            let p = (y * w + x) * ic.c;
-            ctx[n_spatial..].copy_from_slice(&ic.data[p..p + ic.c]);
-        }
-        arm.forward(&ctx, shift, &mut out);
-        let im = (out[0] - mu_min_fp).clamp(0, N_MU as i64 - 1) as usize;
-        let is = (out[1] - log_scale_min_fp).clamp(0, N_SCALE_IDX as i64 - 1) as usize;
-        padded[centre] = rc.code(y, x, im, is)? as i64;
-        Ok(())
-    };
+    let mut scratch = [[0i64; MAX_WIDTH]; 2];
 
     if w <= MASK_SIZE {
         for y in 0..h {
             check()?;
             for x in 0..w {
-                decode_at(y, x, &mut padded)?;
+                let (im, is) = eval_px(&g, &mut ctx, &mut scratch, y, x);
+                let sym = rc.code(y, x, im, is)?;
+                g.padded[(y + PAD) * pw + x + PAD].store(sym as i8, Ordering::Relaxed);
             }
         }
     } else if h > 0 {
         let step = MASK_SIZE + 1;
         let max_t = (w - 1) + step * (h - 1);
-        for t in 0..=max_t {
-            check()?;
-            // Smallest y with x = t - step*y <= w - 1.
-            let y0 = if t >= w { (t - w) / step + 1 } else { 0 };
-            let mut y = y0;
-            while y < h && step * y <= t {
-                let x = t - step * y;
-                decode_at(y, x, &mut padded)?;
-                y += 1;
-            }
+        #[cfg(feature = "std")]
+        let serial = !wave_diagonals(&g, rc, step, max_t, check)?;
+        #[cfg(not(feature = "std"))]
+        let serial = true;
+        if serial {
+            serial_diagonals(&g, rc, step, max_t, &mut ctx, &mut scratch, check)?;
         }
     }
 
     let mut data = vec![0i64; h * w];
     for y in 0..h {
-        data[y * w..(y + 1) * w]
-            .copy_from_slice(&padded[(y + PAD) * pw + PAD..(y + PAD) * pw + PAD + w]);
+        let row = &padded[(y + PAD) * pw + PAD..(y + PAD) * pw + PAD + w];
+        for (d, a) in data[y * w..(y + 1) * w].iter_mut().zip(row) {
+            *d = a.load(Ordering::Relaxed) as i64;
+        }
     }
     Ok(Grid { h, w, data })
+}
+
+#[cfg(all(test, feature = "std", feature = "encoder"))]
+mod tests {
+    use super::*;
+    use crate::arm::FixedLinear;
+    use crate::rangecoder::RangeEncoder;
+
+    /// 6-in ARM with one hidden layer — dims don't matter for the round trip,
+    /// only that both coding directions run the same traversal.
+    fn test_arm() -> FixedArm {
+        let layer = |n_in, n_out, seed| FixedLinear {
+            n_in,
+            n_out,
+            w: (0..n_in * n_out)
+                .map(|i| (((i + seed) % 11) as i64 - 5) << 10)
+                .collect(),
+            b: (0..n_out).map(|i| ((i + seed) % 7) as i64 - 3).collect(),
+        };
+        FixedArm {
+            layers: vec![layer(6, 6, 0), layer(6, 2, 1)],
+            stabiliser: layer(6, 2, 2),
+        }
+    }
+
+    /// The wavefront traversal (>= 32 px per diagonal under `std`) must produce
+    /// the same bytes and grid as the serial traversal. 512×128 hits the gate.
+    #[test]
+    fn wavefront_matches_serial() {
+        let (h, w) = (128usize, 512usize);
+        let arm = test_arm();
+        let window = context_window_indices(6).unwrap();
+        let values: Vec<i64> = (0..h * w)
+            .map(|i| ((i * 31 + 7) % 127) as i64 - 63)
+            .collect();
+        let mut check = || -> Result<()> { Ok(()) };
+
+        // Sequential policy → serial traversal for both directions.
+        let (bytes_seq, grid_seq);
+        {
+            let _seq = SequentialDecode::install();
+            let mut enc = RangeEncoder::new();
+            {
+                let mut ge = GridEncoder {
+                    rc: &mut enc,
+                    values: &values,
+                    w,
+                };
+                grid_seq = code_grid(&mut ge, &arm, &window, None, h, w, &mut check).unwrap();
+            }
+            bytes_seq = enc.finish();
+        }
+        // Default policy → wavefront: identical bitstream and grid.
+        let mut enc = RangeEncoder::new();
+        {
+            let mut ge = GridEncoder {
+                rc: &mut enc,
+                values: &values,
+                w,
+            };
+            let grid_par = code_grid(&mut ge, &arm, &window, None, h, w, &mut check).unwrap();
+            assert_eq!(grid_seq.data, grid_par.data);
+        }
+        let bytes_par = enc.finish();
+        assert_eq!(
+            bytes_seq, bytes_par,
+            "parallel encode changed the bitstream"
+        );
+
+        // Decode either stream under either policy: identical grid.
+        for (bytes, seq) in [(&bytes_seq, true), (&bytes_par, false), (&bytes_par, true)] {
+            let _seq = seq.then(SequentialDecode::install);
+            let mut dec = RangeDecoder::new(bytes).unwrap();
+            let g = code_grid(&mut dec, &arm, &window, None, h, w, &mut check).unwrap();
+            assert_eq!(g.data, values);
+        }
+    }
 }

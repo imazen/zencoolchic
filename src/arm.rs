@@ -155,44 +155,92 @@ impl FixedArm {
     }
 
     /// `fixed_point_arm` for one context vector: writes `n_out` values to `out`.
-    pub(crate) fn forward(&self, ctx: &[i64], output_shift: u32, out: &mut [i64]) {
+    ///
+    /// `scratch` holds the hidden-layer ping-pong buffers; only slots a layer
+    /// writes are ever read, so callers can allocate it once per grid instead
+    /// of resetting it between contexts.
+    pub(crate) fn forward(
+        &self,
+        ctx: &[i64],
+        output_shift: u32,
+        out: &mut [i64],
+        scratch: &mut [[i64; MAX_WIDTH]; 2],
+    ) {
         let n_in = self.n_in();
         debug_assert_eq!(ctx.len(), n_in);
-        let mut buf_a = [0i64; MAX_WIDTH];
-        let mut buf_b = [0i64; MAX_WIDTH];
-        for (c, &x) in buf_a.iter_mut().zip(ctx) {
-            *c = x.wrapping_shl(WEIGHT_SHIFT);
-        }
-        let x0 = &buf_a[..n_in];
 
-        // Stabiliser from the shifted input, then the trunk.
+        // The stabiliser and the trunk's first layer read `ctx << WEIGHT_SHIFT`.
+        // `dot(w, ctx << s) == dot(w, ctx) << s` for wrapping i64 mul/add, so
+        // the shifted copy folds into the dot and `ctx` is used directly.
         let st = &self.stabiliser;
         for ((o, row), &b) in out.iter_mut().zip(st.w.chunks_exact(n_in)).zip(&st.b) {
-            *o = dot(row, x0).wrapping_add(b);
+            *o = dot_shifted(row, ctx).wrapping_add(b);
         }
 
         let (last, hidden) = self.layers.split_last().expect("ARM has a last layer");
-        let (mut cur, mut next) = (&mut buf_a, &mut buf_b);
+        // Index of the scratch buffer holding the previous layer's output;
+        // `usize::MAX` means the layer reads `ctx` through the folded dot.
+        let mut src = usize::MAX;
         for l in hidden {
-            let x = &cur[..l.n_in];
-            for ((y, row), &b) in next.iter_mut().zip(l.w.chunks_exact(l.n_in)).zip(&l.b) {
-                *y = dot(row, x).wrapping_add(b).max(0) >> WEIGHT_SHIFT;
+            let (lo, hi) = scratch.split_at_mut(1);
+            let (a, b) = (&mut lo[0][..], &mut hi[0][..]);
+            match src {
+                usize::MAX => {
+                    layer_relu(&mut a[..l.n_out], l, ctx, true);
+                    src = 0;
+                }
+                0 => {
+                    layer_relu(&mut b[..l.n_out], l, &a[..l.n_in], false);
+                    src = 1;
+                }
+                _ => {
+                    layer_relu(&mut a[..l.n_out], l, &b[..l.n_in], false);
+                    src = 0;
+                }
             }
-            core::mem::swap(&mut cur, &mut next);
         }
-        let x = &cur[..last.n_in];
+        let (x, folded): (&[i64], bool) = match src {
+            usize::MAX => (ctx, true),
+            i => (&scratch[i][..last.n_in], false),
+        };
         for ((o, row), &b) in out
             .iter_mut()
             .zip(last.w.chunks_exact(last.n_in))
             .zip(&last.b)
         {
-            *o = dot(row, x).wrapping_add(b).wrapping_add(*o) >> output_shift;
+            let acc = if folded {
+                dot_shifted(row, x)
+            } else {
+                dot(row, x)
+            };
+            *o = acc.wrapping_add(b).wrapping_add(*o) >> output_shift;
         }
     }
 }
 
 /// Widest layer the fixed-point MLPs can have: 40 spatial contexts + 31 IFCE features.
 pub(crate) const MAX_WIDTH: usize = 72;
+
+/// One hidden layer into `dst`: `relu(dot(w, x) + b) >> WEIGHT_SHIFT` per output.
+/// `x_is_ctx` folds the layer-0 input shift into the dot (see `dot_shifted`).
+#[inline(always)]
+fn layer_relu(dst: &mut [i64], l: &FixedLinear, x: &[i64], x_is_ctx: bool) {
+    for ((y, row), &b) in dst.iter_mut().zip(l.w.chunks_exact(l.n_in)).zip(&l.b) {
+        let acc = if x_is_ctx {
+            dot_shifted(row, x)
+        } else {
+            dot(row, x)
+        };
+        *y = acc.wrapping_add(b).max(0) >> WEIGHT_SHIFT;
+    }
+}
+
+/// `dot(a, b << WEIGHT_SHIFT)` without materializing the shifted operand:
+/// wrapping i64 mul and add both commute with the shift, so this is exact.
+#[inline(always)]
+fn dot_shifted(a: &[i64], b: &[i64]) -> i64 {
+    dot(a, b).wrapping_shl(WEIGHT_SHIFT)
+}
 
 /// Wrapping i64 dot product (order-independent: integer addition is associative).
 #[inline(always)]
