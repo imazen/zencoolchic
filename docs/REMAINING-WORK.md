@@ -82,9 +82,19 @@ headers.
 - RNG initialization differs from torch. Complete training trajectories are
   not torch-identical. There are step-level and complete tiny-stream thread-count
   identity tests, but no measured cross-platform full-training identity guarantee.
-- No multi-image/multi-seed rate-distortion calibration exists. The generic quality
-  mapping is explicitly uncalibrated. Historical one-image/one-seed benchmarks do
-  not establish a general quality or speed ranking.
+- The rayon pool bands are validated cross-host: `train::pool` picks 4 / 8 /
+  min(12, ncpu) threads in three pixel-count bands measured on Zen 5 X3D,
+  Zen 4 (7900X) and Arrow Lake (265K); the previous >131072→4 rule was an
+  asymmetric-L3 X3D artifact costing 30-38% elsewhere. The full test suite
+  (71 oracle/zencodec tests, fuzz replay, upstream oracle) also passes on
+  aarch64 (Hetzner Neoverse-N1), confirming the integer decode path is
+  bit-exact off x86.
+- A multi-image rate-distortion sweep is in progress (6 CID22-512 validation
+  images at 256², q ∈ {10,30,50,70,90} → λ = 10^(−1−4q/100), upstream
+  defaults n_itr=10000/arch=hop, run-heavy on the 7900X). Until it lands the
+  generic quality mapping remains explicitly uncalibrated: historical
+  one-image/one-seed benchmarks do not establish a general ranking, and
+  multi-seed variance is still unmeasured.
 - Two libFuzzer targets cover the public decode entry points
   ([fuzz/fuzz_targets](../fuzz/fuzz_targets/)), with real-stream seeds under
   [fuzz/seeds](../fuzz/seeds/), a minimized crash corpus under
