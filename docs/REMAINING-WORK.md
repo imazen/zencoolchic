@@ -125,12 +125,18 @@ The trait bridge now decodes video through `AnimationFrameDecoder` (lazy coding-
 decode via `decode::VideoDecoder`, display-order RGB frames, references retained),
 serves pull streaming as one-shot decode plus ≤64-row batches, and honors a sequential
 encode threading policy with a scoped single-thread pool (identical stream bytes).
+Decode-side `max_memory_bytes` is honored via a pre-flight working-set estimate
+(`decode::estimate_decode_bytes`: network parameters, latent grids and ARM/IFCE
+contexts, upsample/synthesis conv buffers, stored reference frames, output canvas —
+padded above the true peak, so passing decodes fit while rejected ones may only
+have been near their budget).
 Still refused: YUV output (`PixelDescriptor` has no YCbCr layout or subsampling carrier),
-finite working-memory budgets (no estimate yet) and animation encode. RGB streams have no
-color metadata carrier; the bridge assumes sRGB. Memory estimates/accounting,
-fallible allocation coverage and finer cancellation granularity remain engineering
-work. Current cancellation checks are per grid/stage or training/quantization/RDOQ
-iteration; an entire convolution is not interruptible.
+animation encode, and encode-side memory budgets (the trainer peak — SOAP
+preconditioners, gradients, activations — is not bounded yet). RGB streams have no
+color metadata carrier; the bridge assumes sRGB. Fallible allocation coverage and
+finer cancellation granularity remain engineering work. Current cancellation checks
+are per grid/stage or training/quantization/RDOQ iteration; an entire convolution is
+not interruptible.
 
 Training uses a CPU backend. Upstream GPU/torch compilation machinery, general
 training checkpoint/resume and PyTorch `.pt` checkpoint import/export are not
