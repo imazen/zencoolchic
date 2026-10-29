@@ -52,6 +52,15 @@ kodim14.cool --repeat 5`, best of 5; commit 9ee5fa7). Upstream's decoder reports
 `Decoding frame 0 time = 0.46 seconds` for the same stream on the same machine (torch 2.14.1
 CPU, its own timer, model construction included).
 
+Decode threading: `code_grid` evaluates the per-diagonal ARM contexts on up to 8
+scoped worker threads while the range coder stays serial on the calling thread
+(output is identical — evaluations are pure functions of earlier diagonals).
+The gate needs ~32 px per diagonal, so it activates around 320²+ image sizes:
+measured best-of-5 on this host, `examples/decode`, lop encodes — 512² **124 ms**
+vs 192 ms serial; 384² **63 ms** vs 99 ms; 256² stays serial (26 px/diagonal loses
+~1 ms to barrier overhead). The zencodec `Sequential`/`SingleThread` policy and
+no-`std` builds keep the serial traversal.
+
 ### Bit-exactness risks
 
 - The leaky Laplace CDF calls `exp` in f64. Upstream gets it from the platform libm through
