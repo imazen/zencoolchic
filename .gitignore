@@ -1,3 +1,9 @@
 /target
 /tools/fixture-compression/target
 .workongoing
+
+# cargo-fuzz artifacts (corpus lives on block storage via fuzz-sync)
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/
+!fuzz/Cargo.lock

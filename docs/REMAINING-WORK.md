@@ -80,8 +80,14 @@ headers.
 - No multi-image/multi-seed rate-distortion calibration exists. The generic quality
   mapping is explicitly uncalibrated. Historical one-image/one-seed benchmarks do
   not establish a general quality or speed ranking.
-- No fuzz targets are currently checked in. Malformed-input limits and truncation
-  have unit/trait coverage; a dedicated fuzzing/regression corpus is further work.
+- Two libFuzzer targets cover the public decode entry points
+  ([fuzz/fuzz_targets](../fuzz/fuzz_targets/)), with real-stream seeds under
+  [fuzz/seeds](../fuzz/seeds/), a minimized crash corpus under
+  [fuzz/regression](../fuzz/regression/), and stable replay in
+  [tests/fuzz_regression.rs](../tests/fuzz_regression.rs). The live corpus is on
+  block storage at `/mnt/v/fuzzes/zencoolchic/` (see the workspace fuzz rules).
+  The first session found and fixed a `bits(n>32)` panic in exp-Golomb decode;
+  deeper runs remain worthwhile.
 
 ## Performance and integration work
 

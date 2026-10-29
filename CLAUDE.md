@@ -37,3 +37,7 @@ Then read `docs/REMAINING-WORK.md` for missing behavior, source entry points and
 - Fixed validation gap (2026-10-18): the decoder oracle printed reconstruction errors
   without asserting the recorded bounds and could overlook a missing whole case. The
   frozen inventory, lengths, shapes, hashes, raw bound and sample bound are now enforced.
+- Fixed fuzz find (2026-10-29): `BitReader::bits` asserted `n <= 32` but exp-Golomb
+  allowed unary prefixes up to 40 zeros — debug builds panicked, release builds
+  silently truncated. `bits64` now serves the >32-bit reads; the crash is in
+  `fuzz/regression/` and covered by `expgolomb::tests::decodes_prefix_up_to_forty_zeros`.
