@@ -33,7 +33,10 @@ same bytes across Python/torch versions, devices or random generators.
   are checked against float64 autograd. The `lop` config uses
   `latent_resolution (2, 4)` — synthesis at quarter resolution with the
   bicubic `rescale_output` — so the final `F.interpolate` forward and backward
-  are checked too. Wasserstein dumps also store the
+  are checked too. The `flow` config emits a two-channel dense output trained
+  against a seeded flow target with upstream's `flow` frame data type (no
+  output clamp, flat unclamped MSE), the objective behind
+  `guided_motion_pretraining`. Wasserstein dumps also store the
   clamped `decoded` image, `tap{i}` features, `gtap{i}` tap gradients,
   `grad_dec` (`d wasserstein/d decoded`), `wasserstein_per_tap` and
   `dist_weight`.
@@ -57,9 +60,13 @@ same bytes across Python/torch versions, devices or random generators.
   filter size 8) on a synthetic four-frame 128×128 4:2:0 source with real
   motion, coded I→P→B→B.
 - `dump_warp.py <upstream> <out_prefix>`: writes a seeded input image, a flow
-  field, upstream `Warper` outputs at filter sizes 2/4/8/12 and a
-  `vanilla_warp_fn` nearest integer translation (`dx=3, dy=-2`). The frozen
-  `vec` warp case verifies every interpolation kernel path.
+  field, upstream `Warper` outputs at filter sizes 2/4/8/12, a seeded upstream
+  gradient `dout` with autograd `d(warp)/d(flow)` per filter size
+  (training-mode, unquantized flow), a `vanilla_warp_fn` nearest integer
+  translation (`dx=3, dy=-2`), and two translation-search pairs with upstream
+  `get_global_translation` answers. The frozen `vec` warp case verifies every
+  interpolation kernel path, the training-time flow gradients, and the
+  coarse-to-fine integer search — including its coarse-step quirks.
 
 ## Set up a fresh reference checkout
 

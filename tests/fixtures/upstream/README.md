@@ -1,9 +1,9 @@
 # Frozen Cool-chic 5 regression references
 
-These 103 zstd payloads preserve every original reference byte: 12 decoder/writer
-cases, six gradient cases, two video cases, a warper vector case, and the SOAP
-optimizer reference. Original payloads total 16,688,557 bytes; compressed payloads
-total 6,887,395 bytes. No Python
+These 113 zstd payloads preserve every original reference byte: 12 decoder/writer
+cases, seven gradient cases, two video cases, a warper vector case, and the SOAP
+optimizer reference. Original payloads total 16,839,098 bytes; compressed payloads
+total 7,000,148 bytes. No Python
 environment, external executable, download or shared storage is needed to run:
 
 ```sh
@@ -60,10 +60,15 @@ was encoded by upstream's `cc_encode.py` (`--debug` preset, warp filter size 8)
 on 2026-10-29 on Linux x86-64, Python 3.12, torch 2.15.0+cpu: a synthetic
 four-frame 128×128 4:2:0 source with real motion, coded I→P→B→B.
 `dump_video.py --decode` captured upstream's decoded planes plus the raw
-residue and motion synthesis outputs (`.f32`) for each frame. The `vec` warp
+residue and motion synthesis outputs (`.f32`) for each frame.
+`small64_flow` exercises the `flow` frame data type used by
+`guided_motion_pretraining`: a two-channel dense output trained against a
+seeded flow target with a flat unclamped MSE. The `vec` warp
 case holds `dump_warp.py` output: one seeded 20×24×3 input, its flow field,
-upstream `Warper` outputs at filter sizes 2/4/8/12 and a `vanilla_warp_fn`
-nearest translation (dx=3, dy=-2). Upstream's license
+upstream `Warper` outputs at filter sizes 2/4/8/12, the training-mode autograd
+flow gradients `d(warp)/d(flow)` per filter size, a `vanilla_warp_fn`
+nearest translation (dx=3, dy=-2), and two `get_global_translation`
+search pairs with upstream's answers. Upstream's license
 notice is retained in
 [upstream-notices](../../../upstream-notices/COOL-CHIC-LICENSE.txt).
 

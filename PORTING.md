@@ -85,6 +85,7 @@ Reuse plan (user, 2026-10-17: reuse owned code, relicensed): zensim-train-core /
 | RDOQ (greedy ±1..15-step moves with upstream's local scores) | `nnquant/rdoq.py` | done; per-module invariant caches, full affected-stage scoring; spatial incremental updates absent | small64 below |
 | Trained model → stream integers → bitstream | `bitstream/encode.py` | done | upstream's decoder reads this encoder's stream: small64 decodes to 33.828 dB in both decoders |
 | SIMD / threaded training kernels | — | implemented: AXPY/dot, batched ARM/IFCE, convolution forward/backward and work splitting; further tuning remains | `src/simd.rs`, `src/train/{ops,arm_batch,ifce}.rs`; step and tiny-stream identity with 1/4 threads |
+| Inter training primitives: training-mode warp flow gradient, global-translation search, `flow` frame data type | `component/intercoding/{warp,globalmotion}.py`, `component/frame.py` (`flow` skips the output clamp), `video.py::guided_motion_pretraining` | done; `src/warp.rs`, `src/train/{eval,ops}.rs` | `vec` warp case: `d(warp)/d(flow)` ≤ 1.3e-4 vs autograd at filter sizes 2/4/8/12; `get_global_translation` bit-equal on both dumped pairs (coarse-step quirks reproduced); `small64_flow` gradient case worst 8.4e-4 vs float64 |
 
 End to end on small64 (64×64, 2000 itr, λ 1e-3, hop; `examples/encode.rs`, 2026-10-17, one
 seed per side):
