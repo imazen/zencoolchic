@@ -6,7 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::arm_batch::arm_pass;
-use super::ops::{conv_forward, conv_t_forward, kron, sym_conv_forward};
+use super::ops::{conv_channel, conv_forward, conv_t_forward, kron, sym_conv_forward};
 use super::{Mlp, Params, Shape, WINDOW, full_kernel};
 
 const PAD: usize = (WINDOW - 1) / 2;
@@ -111,6 +111,229 @@ pub(crate) fn synthesize(shape: &Shape, p: &Params, up: &[f32]) -> Vec<f32> {
     }
     let raw = conv_forward(&p.out_transform, &cur, sh, sw);
     rescale_output(shape, &raw)
+}
+
+/// Which synthesis-module tensor a flat `module_values_mut` index mutates.
+/// Order matches `module_tensors_mut` for [`Module::Synthesis`](super::quantize::Module):
+/// output transform, optional stabiliser, then the layers.
+#[derive(Clone, Copy)]
+pub(crate) enum SynSel {
+    OutTransform,
+    Stabiliser,
+    Layer(usize),
+}
+
+/// Incremental synthesis forward for RDOQ candidate scoring. `outs[..fresh]` hold
+/// the accepted per-layer outputs (post-relu) and `cur`/`stab` the accepted
+/// stabiliser sum; a candidate only recomputes its touched channel plus the
+/// downstream suffix. Every conv output channel accumulates independently, so a
+/// channel-level recompute is bit-identical to the full [`synthesize`] pass.
+///
+/// Caches are only ever filled with accepted-state values: the lazily recomputed
+/// entries always sit upstream of the candidate's tensor, whose parameters are
+/// the only ones the candidate may have mutated. `invalidate` marks the entries
+/// a kept move affects; rejected candidates never write to the caches.
+pub(crate) struct SynInc {
+    /// `up` with common-randomness planes appended, fixed for the whole pass.
+    syn_in: Vec<f32>,
+    /// Per-layer post-relu outputs; `outs[..fresh]` matches the accepted `p`.
+    outs: Vec<Vec<f32>>,
+    fresh: usize,
+    /// Accepted stabiliser output (`syn_in`-driven, so layer moves keep it valid).
+    stab: Option<Vec<f32>>,
+    stab_fresh: bool,
+    /// Accepted `outs.last + stab` (or `syn_in` when there are no layers).
+    cur: Vec<f32>,
+    cur_fresh: bool,
+}
+
+impl SynInc {
+    pub(crate) fn new(shape: &Shape, p: &Params, up: &[f32]) -> Self {
+        let (sh, sw) = shape.syn_size;
+        let mut syn_in =
+            Vec::with_capacity(up.len() + shape.cr.as_ref().map_or(0, Vec::len));
+        syn_in.extend_from_slice(up);
+        if let Some(cr) = &shape.cr {
+            syn_in.extend_from_slice(cr);
+        }
+        let mut outs: Vec<Vec<f32>> = Vec::with_capacity(p.syn.len());
+        for (li, l) in p.syn.iter().enumerate() {
+            let x: &[f32] = if li == 0 { &syn_in } else { &outs[li - 1] };
+            let mut o = conv_forward(l, x, sh, sw);
+            if l.relu {
+                for v in &mut o {
+                    *v = v.max(0.0);
+                }
+            }
+            outs.push(o);
+        }
+        Self {
+            syn_in,
+            outs,
+            fresh: p.syn.len(),
+            stab: None,
+            stab_fresh: false,
+            cur: Vec::new(),
+            cur_fresh: false,
+        }
+    }
+
+    /// A parameter in `sel` moved to a new accepted value: drop the entries it
+    /// can affect (a layer move invalidates its own and downstream outputs).
+    pub(crate) fn invalidate(&mut self, sel: SynSel) {
+        match sel {
+            SynSel::Layer(l) => {
+                self.fresh = self.fresh.min(l);
+                self.cur_fresh = false;
+            }
+            SynSel::Stabiliser => {
+                self.stab_fresh = false;
+                self.cur_fresh = false;
+            }
+            SynSel::OutTransform => {}
+        }
+    }
+
+    /// Recompute stale `outs[..upto]` at the current `p`; only called with the
+    /// candidate's own tensor downstream of `upto`, so the values are accepted.
+    fn ensure_outs(&mut self, shape: &Shape, p: &Params, upto: usize) {
+        let (sh, sw) = shape.syn_size;
+        while self.fresh < upto {
+            let l = self.fresh;
+            let x: &[f32] = if l == 0 {
+                &self.syn_in
+            } else {
+                &self.outs[l - 1]
+            };
+            let mut o = conv_forward(&p.syn[l], x, sh, sw);
+            if p.syn[l].relu {
+                for v in &mut o {
+                    *v = v.max(0.0);
+                }
+            }
+            self.outs[l] = o;
+            self.fresh += 1;
+            self.cur_fresh = false;
+        }
+    }
+
+    /// Lazily (re)compute the accepted stabiliser output; only called when the
+    /// candidate's mutation is elsewhere, so `p.syn_stab` is the accepted value.
+    fn ensure_stab(&mut self, shape: &Shape, p: &Params) {
+        if self.stab_fresh {
+            return;
+        }
+        let (sh, sw) = shape.syn_size;
+        let n = sh * sw;
+        if let Some(st) = &p.syn_stab {
+            self.stab = Some(conv_forward(st, &self.syn_in[..st.c_in * n], sh, sw));
+        }
+        self.stab_fresh = true;
+    }
+
+    fn ensure_cur(&mut self, shape: &Shape, p: &Params) {
+        self.ensure_outs(shape, p, p.syn.len());
+        self.ensure_stab(shape, p);
+        if !self.cur_fresh {
+            self.cur = self.outs.last().cloned().unwrap_or_else(|| self.syn_in.clone());
+            if let Some(s) = &self.stab {
+                for (a, b) in self.cur.iter_mut().zip(s) {
+                    *a += *b;
+                }
+            }
+            self.cur_fresh = true;
+        }
+    }
+
+    /// The [`synthesize`] output at the current `p`, where the only parameter
+    /// that may differ from the accepted state is channel `o` of `sel`.
+    pub(crate) fn candidate(&mut self, shape: &Shape, p: &Params, sel: SynSel, o: usize) -> Vec<f32> {
+        let (sh, sw) = shape.syn_size;
+        let n = sh * sw;
+        let mut cur = match sel {
+            SynSel::OutTransform => {
+                self.ensure_cur(shape, p);
+                let raw = conv_forward(&p.out_transform, &self.cur, sh, sw);
+                return rescale_output(shape, &raw);
+            }
+            SynSel::Stabiliser => {
+                self.ensure_outs(shape, p, p.syn.len());
+                self.outs
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| self.syn_in.clone())
+            }
+            SynSel::Layer(l) => {
+                // Inputs to layer `l` are unaffected by its own parameters.
+                self.ensure_outs(shape, p, l);
+                let layer = &p.syn[l];
+                let x: &[f32] = if l == 0 {
+                    &self.syn_in
+                } else {
+                    &self.outs[l - 1]
+                };
+                let mut c = if self.fresh > l {
+                    // Channel `o` is the only one the candidate can change.
+                    let mut c = self.outs[l].clone();
+                    conv_channel(layer, x, sh, sw, o, &mut c[o * n..(o + 1) * n]);
+                    if layer.relu {
+                        for v in &mut c[o * n..(o + 1) * n] {
+                            *v = v.max(0.0);
+                        }
+                    }
+                    c
+                } else {
+                    let mut c = conv_forward(layer, x, sh, sw);
+                    if layer.relu {
+                        for v in &mut c {
+                            *v = v.max(0.0);
+                        }
+                    }
+                    c
+                };
+                for layer in &p.syn[l + 1..] {
+                    let mut nxt = conv_forward(layer, &c, sh, sw);
+                    if layer.relu {
+                        for v in &mut nxt {
+                            *v = v.max(0.0);
+                        }
+                    }
+                    c = nxt;
+                }
+                c
+            }
+        };
+        if p.syn_stab.is_some() {
+            match sel {
+                SynSel::Stabiliser => {
+                    let st = p.syn_stab.as_ref().expect("checked is_some");
+                    let s_in = &self.syn_in[..st.c_in * n];
+                    let s = if self.stab_fresh {
+                        // Only channel `o` differs from the accepted output.
+                        let mut s = self.stab.clone().expect("stab_fresh implies stab");
+                        conv_channel(st, s_in, sh, sw, o, &mut s[o * n..(o + 1) * n]);
+                        s
+                    } else {
+                        // On a stale cache the full forward evaluates channel
+                        // `o` at its candidate value like a complete pass.
+                        conv_forward(st, s_in, sh, sw)
+                    };
+                    for (a, b) in cur.iter_mut().zip(&s) {
+                        *a += *b;
+                    }
+                }
+                _ => {
+                    // Accepted stabiliser (the candidate's mutation is elsewhere).
+                    self.ensure_stab(shape, p);
+                    for (a, b) in cur.iter_mut().zip(self.stab.as_ref().unwrap()) {
+                        *a += *b;
+                    }
+                }
+            }
+        }
+        let raw = conv_forward(&p.out_transform, &cur, sh, sw);
+        rescale_output(shape, &raw)
+    }
 }
 
 /// The eval-mode raw synthesis output (hard-round latents, image resolution):

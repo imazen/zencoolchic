@@ -230,28 +230,48 @@ pub(crate) fn quantize_model(
 ) -> crate::Result<(Params, NnQuant)> {
     let mut q = NnQuant::default();
     let mut cur = fp.clone();
-    let mut scratch = fp.zeros_like();
+    let scratch = fp.zeros_like();
     for m in Module::SORTED {
         if m == Module::Ifce && !has_ifce {
             continue;
         }
         let (rw, rb) = m.shifts();
+        let steps: Vec<[i32; 2]> = rw
+            .clone()
+            .flat_map(|sw| rb.clone().map(move |sb| [sw, sb]))
+            .collect();
+        // The candidate evaluations are independent (`cur` is fixed during the
+        // sweep); run them on the problem-sized pool and select the first
+        // minimum in stream order afterwards, exactly like the sequential scan.
+        let n_pix = pb.shape.img.0 * pb.shape.img.1;
+        let losses: Vec<Option<(f64, [u32; 2])>> = super::pool(n_pix).install(|| {
+            use rayon::prelude::*;
+            steps
+                .par_iter()
+                .map_init(
+                    || scratch.clone(),
+                    |scratch, &[sw, sb]| -> crate::Result<Option<(f64, [u32; 2])>> {
+                        stop.check()?;
+                        let Some(cand) = quantize_module(&cur, m, [sw, sb]) else {
+                            return Ok(None);
+                        };
+                        let t = evaluate(pb, &cand, scratch);
+                        let eg = orders_for(&cand, m, [sw, sb]);
+                        let mut qq = q;
+                        qq.shift[m.slot()] = Some([sw, sb]);
+                        qq.expgol[m.slot()] = eg;
+                        Ok(Some((loss_with_nn(pb, &t, network_rate(&cand, &qq)), eg)))
+                    },
+                )
+                .collect::<crate::Result<Vec<_>>>()
+        })?;
         let mut best: Option<(f64, [i32; 2], [u32; 2])> = None;
-        for sw in rw.clone() {
-            for sb in rb.clone() {
-                stop.check()?;
-                let Some(cand) = quantize_module(&cur, m, [sw, sb]) else {
-                    continue;
-                };
-                let t = evaluate(pb, &cand, &mut scratch);
-                let eg = orders_for(&cand, m, [sw, sb]);
-                let mut qq = q;
-                qq.shift[m.slot()] = Some([sw, sb]);
-                qq.expgol[m.slot()] = eg;
-                let loss = loss_with_nn(pb, &t, network_rate(&cand, &qq));
-                if best.is_none_or(|b| loss < b.0) {
-                    best = Some((loss, [sw, sb], eg));
-                }
+        for (&[sw, sb], cand_loss) in steps.iter().zip(losses) {
+            let Some((loss, eg)) = cand_loss else {
+                continue;
+            };
+            if best.is_none_or(|b| loss < b.0) {
+                best = Some((loss, [sw, sb], eg));
             }
         }
         let (_, s, eg) = best.expect("at least one step fits 16 bits");

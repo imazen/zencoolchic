@@ -13,9 +13,10 @@
 use alloc::vec::Vec;
 
 use super::eval;
+use super::eval::SynSel;
 use super::quantize::{Module, NnQuant, module_values_mut, network_rate, nn_rate_of, step_of};
 use super::trainer::{Problem, Rng};
-use super::{Params, Shape};
+use super::{ConvLayer, Params, Shape};
 
 /// Weighted distortion of the bitdepth-quantized frame data, like upstream's
 /// `loss_function` on the eval image (`score_syn_image`).
@@ -78,6 +79,28 @@ struct Fixed {
     syn_in: Vec<f32>,
 }
 
+/// Flat `module_values_mut` index → (tensor, output channel) for the synthesis
+/// module, in `module_tensors_mut` order (output transform, optional
+/// stabiliser, then the layers).
+fn syn_flat_map(p: &Params, bias: bool) -> Vec<(SynSel, usize)> {
+    let mut convs: Vec<(&ConvLayer, SynSel)> = Vec::with_capacity(p.syn.len() + 2);
+    convs.push((&p.out_transform, SynSel::OutTransform));
+    if let Some(st) = &p.syn_stab {
+        convs.push((st, SynSel::Stabiliser));
+    }
+    convs.extend(p.syn.iter().enumerate().map(|(l, c)| (c, SynSel::Layer(l))));
+    let mut map = Vec::new();
+    for (c, sel) in convs {
+        if bias {
+            map.extend((0..c.b.len()).map(|j| (sel, j)));
+        } else {
+            let ch = c.c_in * c.k * c.k;
+            map.extend((0..c.w.len()).map(|j| (sel, j / ch)));
+        }
+    }
+    map
+}
+
 /// Runs RDOQ in place. `log` gets one line per (module, weight|bias).
 pub(crate) fn rdoq(
     pb: &Problem<'_>,
@@ -100,12 +123,19 @@ pub(crate) fn rdoq(
             syn_in: eval::upsample(shape, p, &qlat),
             q: qlat.clone(),
         };
+        // Synthesis candidates score through the incremental forward: a
+        // parameter move touches one output channel of one tensor, so the
+        // accepted prefix outputs and stabiliser are reused. Bit-identical to
+        // the full `synthesize` (channel accumulation is independent).
+        let mut inc =
+            (m == Module::Synthesis).then(|| eval::SynInc::new(shape, p, &fixed.syn_in));
         for is_bias in [false, true] {
             let step = step_of(q, m, is_bias);
             let n = module_values_mut(p, m, is_bias).len();
             if n == 0 {
                 continue;
             }
+            let syn_map = inc.is_some().then(|| syn_flat_map(p, is_bias));
             let mut best = super::pool(n_pix).install(|| score(pb, p, q, m, &fixed));
             let start = best;
             // Random visiting order (upstream torch.randperm).
@@ -124,7 +154,18 @@ pub(crate) fn rdoq(
                         *module_values_mut(p, m, is_bias)[idx] =
                             initial + sign * shift as f32 * step;
                         evals += 1;
-                        let s = super::pool(n_pix).install(|| score(pb, p, q, m, &fixed));
+                        let s = super::pool(n_pix).install(|| {
+                            match (&syn_map, inc.as_mut()) {
+                                (Some(map), Some(inc)) => {
+                                    let (sel, chan) = map[idx];
+                                    let raw = inc.candidate(pb.shape, p, sel, chan);
+                                    dist_quant(pb, &raw)
+                                        + pb.lambda as f64 * nn_rate_of(p, q, m) as f64
+                                            / n_pix as f64
+                                }
+                                _ => score(pb, p, q, m, &fixed),
+                            }
+                        });
                         if s < best {
                             best = s;
                             best_value = *module_values_mut(p, m, is_bias)[idx];
@@ -134,6 +175,11 @@ pub(crate) fn rdoq(
                     }
                 }
                 *module_values_mut(p, m, is_bias)[idx] = best_value;
+                if best_value != initial {
+                    if let (Some(map), Some(inc)) = (&syn_map, inc.as_mut()) {
+                        inc.invalidate(map[idx].0);
+                    }
+                }
             }
             log(alloc::format!(
                 "rdoq {:?} {}: score {start:.6} -> {best:.6} ({n} values, {evals} evaluations)",

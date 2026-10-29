@@ -344,6 +344,45 @@ pub(super) fn conv_forward(l: &ConvLayer, x: &[f32], h: usize, w: usize) -> Vec<
     out
 }
 
+/// Output channel `o` of [`conv_forward`], written into `dst`: the same
+/// accumulation order as the full forward, so the channel is bit-identical.
+/// Used by RDOQ's incremental synthesis scoring.
+pub(super) fn conv_channel(
+    l: &ConvLayer,
+    x: &[f32],
+    h: usize,
+    w: usize,
+    o: usize,
+    dst: &mut [f32],
+) {
+    let (k, p) = (l.k, l.k / 2);
+    let pw = w + 2 * p;
+    let n = h * w;
+    dst.fill(l.b[o]);
+    for i in 0..l.c_in {
+        let wk = &l.w[(o * l.c_in + i) * k * k..(o * l.c_in + i + 1) * k * k];
+        if k == 1 {
+            axpy(dst, wk[0], &x[i * n..(i + 1) * n]);
+            continue;
+        }
+        let xp = pad(&x[i * n..(i + 1) * n], h, w, p, true);
+        for y in 0..h {
+            let drow = &mut dst[y * w..(y + 1) * w];
+            for ky in 0..k {
+                let row = &xp[(y + ky) * pw..(y + ky + 1) * pw];
+                for kx in 0..k {
+                    axpy(drow, wk[ky * k + kx], &row[kx..kx + w]);
+                }
+            }
+        }
+    }
+    if l.residual {
+        for (d, s) in dst.iter_mut().zip(&x[o * n..(o + 1) * n]) {
+            *d += *s;
+        }
+    }
+}
+
 /// Backward of [`conv_forward`]; parallel over input channels (each owns its input
 /// gradient and its column of weight gradients).
 fn conv_backward(
