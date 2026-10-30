@@ -69,6 +69,21 @@ after the latents — same policy, same bit-identity argument. End to end on a
 256² two-frame I/P stream (wavefront idle at that size): **75.8 ms** vs
 100.4 ms serial.
 
+Declined after measurement: a four-accumulator `dot` unroll lost to the
+simple fold on the ARM's short vectors (6–72 elements); i64 SIMD is out
+because no `i64×i64` vector multiply exists below AVX-512DQ and magetypes
+has no i64 multiply backend; a Laplace-CDF tail early-out that skips `exp`
+only fires for |arg| ≳ 16 (too rare); CDF precomputation is pointless
+because the decoder search is already logarithmic; upsampling-module RDOQ
+incrementalization covers 48 of 1869 candidate parameters (2.6%, ~1%
+ceiling); the remaining memory-bound decode loops (`translate`, B-frame
+beta blend, latent→f32, `stack_nearest`) are ~1 ms each at 512² against
+~0.3 ms of spawn cost; and the 17% of encode time in `expm1f`/`expf`
+cannot take an approximate SIMD exp because the Laplace rate feeds the
+loss → training trajectory → serialized bytes. The range decoder itself
+stays serial by construction: its arithmetic state is the serialized
+stream.
+
 ### Bit-exactness risks
 
 - The leaky Laplace CDF calls `exp` in f64. Upstream gets it from the platform libm through
