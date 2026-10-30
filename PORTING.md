@@ -65,7 +65,9 @@ policy covers both directions — encode installs it alongside the single-thread
 rayon pool so a one-thread encode stays one thread through latent coding.
 The inference warper fans out over row bands above 32k pixels (512² ×3ch,
 8-tap filter: **27 ms** vs 154 ms serial) — the dominant inter-frame cost
-after the latents — same policy, same bit-identity argument.
+after the latents — same policy, same bit-identity argument. End to end on a
+256² two-frame I/P stream (wavefront idle at that size): **75.8 ms** vs
+100.4 ms serial.
 
 ### Bit-exactness risks
 
