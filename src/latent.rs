@@ -400,7 +400,7 @@ use decode_seq::is_sequential;
 /// Threads for the wavefront diagonal evaluation: available parallelism
 /// capped at 8 (diagonals are short), 1 under the sequential policy.
 #[cfg(feature = "std")]
-fn wave_threads() -> usize {
+pub(crate) fn wave_threads() -> usize {
     let n = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(8);

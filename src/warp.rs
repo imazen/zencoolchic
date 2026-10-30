@@ -142,45 +142,70 @@ fn warp_plane(
     let x = &x.data[c * w * h..(c + 1) * w * h];
     let (flow_x, flow_y) = flow;
     let mut out = vec![0.0f32; w * h];
-    let mut line = [0.0f32; MAX_TAPS];
     let first = -(filter_size as i64 / 2) + 1;
-    for y in 0..h {
-        for x_ in 0..w {
-            let i = y * w + x_;
-            // round(flow * 64) / 64 — inference-time flow quantization;
-            // training mode (upstream `Warper.training`) uses the flow as-is.
-            let (qx, qy) = if quantize {
-                (
-                    libm::rintf(flow_x[i] * FRAC_ACCURACY) / FRAC_ACCURACY,
-                    libm::rintf(flow_y[i] * FRAC_ACCURACY) / FRAC_ACCURACY,
-                )
-            } else {
-                (flow_x[i], flow_y[i])
-            };
-            let bx = libm::floorf(qx);
-            let by = libm::floorf(qy);
-            let cx = coeffs(qx - bx, filter_size, kernel);
-            let cy = coeffs(qy - by, filter_size, kernel);
-            let (bx, by) = (bx as i64, by as i64);
-            // Integer part of the flow re-indexes the source with border
-            // clamping; coefficients interpolate the fractional part along
-            // columns first, then rows (upstream `interpolate_1d` twice).
-            for (r, slot) in line[..filter_size].iter_mut().enumerate() {
-                let yy = clamp_idx(y as i64 + by + first + r as i64, h);
-                let row = &x[yy * w..yy * w + w];
-                let mut acc = 0.0f32;
-                for (s, &cx_s) in cx[..filter_size].iter().enumerate() {
-                    acc += cx_s * row[clamp_idx(x_ as i64 + bx + first + s as i64, w)];
+    // Every output pixel is an independent filter_size² gather — row bands
+    // fan out to scoped helpers under the same policy as the latent
+    // wavefront. Output is identical either way.
+    let eval = |y0: usize, y1: usize, out: &mut [f32]| {
+        let mut line = [0.0f32; MAX_TAPS];
+        for y in y0..y1 {
+            for x_ in 0..w {
+                let i = (y - y0) * w + x_;
+                let fi = y * w + x_;
+                // round(flow * 64) / 64 — inference-time flow quantization;
+                // training mode (upstream `Warper.training`) uses the flow as-is.
+                let (qx, qy) = if quantize {
+                    (
+                        libm::rintf(flow_x[fi] * FRAC_ACCURACY) / FRAC_ACCURACY,
+                        libm::rintf(flow_y[fi] * FRAC_ACCURACY) / FRAC_ACCURACY,
+                    )
+                } else {
+                    (flow_x[fi], flow_y[fi])
+                };
+                let bx = libm::floorf(qx);
+                let by = libm::floorf(qy);
+                let cx = coeffs(qx - bx, filter_size, kernel);
+                let cy = coeffs(qy - by, filter_size, kernel);
+                let (bx, by) = (bx as i64, by as i64);
+                // Integer part of the flow re-indexes the source with border
+                // clamping; coefficients interpolate the fractional part along
+                // columns first, then rows (upstream `interpolate_1d` twice).
+                for (r, slot) in line[..filter_size].iter_mut().enumerate() {
+                    let yy = clamp_idx(y as i64 + by + first + r as i64, h);
+                    let row = &x[yy * w..yy * w + w];
+                    let mut acc = 0.0f32;
+                    for (s, &cx_s) in cx[..filter_size].iter().enumerate() {
+                        acc += cx_s * row[clamp_idx(x_ as i64 + bx + first + s as i64, w)];
+                    }
+                    *slot = acc;
                 }
-                *slot = acc;
+                out[i] = cy[..filter_size]
+                    .iter()
+                    .zip(&line)
+                    .map(|(c, l)| c * l)
+                    .sum();
             }
-            out[i] = cy[..filter_size]
-                .iter()
-                .zip(&line)
-                .map(|(c, l)| c * l)
-                .sum();
         }
+    };
+    #[cfg(feature = "std")]
+    if w * h >= 32768 && crate::latent::wave_threads() > 1 {
+        let workers = crate::latent::wave_threads().min(h.div_ceil(8));
+        let band = h.div_ceil(workers);
+        let eval = &eval;
+        std::thread::scope(|s| {
+            let mut chunks = out.chunks_mut(band * w);
+            let first_chunk = chunks.next().unwrap();
+            for (b, chunk) in chunks.enumerate() {
+                let y0 = (b + 1) * band;
+                s.spawn(move || eval(y0, (y0 + band).min(h), chunk));
+            }
+            eval(0, band.min(h), first_chunk);
+        });
+    } else {
+        eval(0, h, &mut out);
     }
+    #[cfg(not(feature = "std"))]
+    eval(0, h, &mut out);
     out
 }
 
@@ -419,6 +444,31 @@ mod unit_tests {
         for fs in [0, 1, 3, 5, 15] {
             assert!(warp(&x, &[0.0; 2], &[0.0; 2], fs).is_err(), "fs={fs}");
         }
+    }
+
+    /// The row-band fan-out (>= 32768 px under `std`) must produce the same
+    /// output as the serial pass. 256×128 hits the gate.
+    #[cfg(feature = "std")]
+    #[test]
+    fn parallel_bands_match_serial() {
+        let (h, w) = (256usize, 128usize);
+        let n = h * w;
+        let x = planes(
+            1,
+            h,
+            w,
+            (0..n)
+                .map(|i| ((i * 37 + 11) % 251) as f32 * 0.01 - 1.0)
+                .collect(),
+        );
+        let flow_x: Vec<f32> = (0..n).map(|i| ((i * 13 + 5) % 61) as f32 * 0.05).collect();
+        let flow_y: Vec<f32> = (0..n).map(|i| ((i * 7 + 3) % 47) as f32 * -0.05).collect();
+        let serial = {
+            let _seq = crate::latent::SequentialThreads::install();
+            warp(&x, &flow_x, &flow_y, 8).unwrap()
+        };
+        let par = warp(&x, &flow_x, &flow_y, 8).unwrap();
+        assert_eq!(serial.data, par.data);
     }
 }
 
