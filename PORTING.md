@@ -58,7 +58,9 @@ scoped worker threads while the range coder stays serial on the calling thread
 The gate needs ~32 px per diagonal, so it activates around 320²+ image sizes:
 measured best-of-5 on this host, `examples/decode`, lop encodes — 512² **124 ms**
 vs 192 ms serial; 384² **63 ms** vs 99 ms; 256² stays serial (26 px/diagonal loses
-~1 ms to barrier overhead). The zencodec `Sequential`/`SingleThread` policy and
+~1 ms to barrier overhead). A 16007×41 fuzz slow-unit (41 px × ~16k diagonals)
+went 713 → 555 ms, so the gate holds at extreme aspect ratios too. The zencodec
+`Sequential`/`SingleThread` policy and
 no-`std` builds keep the serial traversal. The IFCE context pass is likewise
 fanned out above 16k stacked pixels (~3 ms of a 512² decode); the sequential
 policy covers both directions — encode installs it alongside the single-thread
