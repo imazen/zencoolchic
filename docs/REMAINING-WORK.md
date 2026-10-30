@@ -121,8 +121,12 @@ headers.
   across content is ±2–3 dB. 512² and other archs/latent sizes are
   unmeasured; historical one-image benchmarks still do not rank speed.
 - Deeper fuzz runs happened (i265, 80 min): 312,958 `decode_still` and
-  161,983 `decode_video` executions, zero crashes; the grown corpus (1178
-  entries) is synced to `/mnt/v/fuzzes/zencoolchic/corpus/`.
+  161,983 `decode_video` executions, zero crashes; a second 150-min window
+  added 132,900 `decode_still` and 214,229 `decode_video` executions, again
+  zero crashes (only a benign 16007×41 slow-unit, measured at 713 ms
+  serial / 555 ms under the wavefront). The grown corpus (875
+  entries across both targets) is synced to
+  `/mnt/v/fuzzes/zencoolchic/corpus/`.
 - Two libFuzzer targets cover the public decode entry points
   ([fuzz/fuzz_targets](../fuzz/fuzz_targets/)), with real-stream seeds under
   [fuzz/seeds](../fuzz/seeds/), a minimized crash corpus under
