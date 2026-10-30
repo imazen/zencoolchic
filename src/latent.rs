@@ -269,7 +269,7 @@ fn wave_diagonals(
     max_t: usize,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<bool> {
-    use core::sync::atomic::{AtomicU32, AtomicUsize};
+    use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
     use std::thread;
 
     // Barriers cost ~1µs per diagonal, so parallelize only when diagonals
@@ -286,8 +286,11 @@ fn wave_diagonals(
     }
     let n_ctx = g.n_spatial + g.inter.map_or(0, |c| c.c);
 
-    // Per-diagonal job slots: `h` is the largest possible diagonal.
-    let diag_px: Vec<AtomicU32> = (0..g.h).map(|_| AtomicU32::new(0)).collect();
+    // Per-diagonal job slots: `h` is the largest possible diagonal. Pixel
+    // coords pack into a u64 (grids up to 2^28 px pass the decode limits —
+    // u16 halves would silently truncate at 65536).
+    let diag_px: Vec<AtomicU64> = (0..g.h).map(|_| AtomicU64::new(0)).collect();
+    // Model indices are bounded by the mu/scale tables (a few thousand).
     let out_idx: Vec<AtomicU32> = (0..g.h).map(|_| AtomicU32::new(0)).collect();
     let diag_len = AtomicUsize::new(0);
     // Diagonal currently offered for evaluation (t + 1); `usize::MAX` quits.
@@ -298,7 +301,7 @@ fn wave_diagonals(
         let mut i = id;
         while i < n {
             let p = diag_px[i].load(Ordering::Relaxed);
-            let (im, is) = eval_px(g, ctx, scratch, (p >> 16) as usize, (p & 0xffff) as usize);
+            let (im, is) = eval_px(g, ctx, scratch, (p >> 32) as usize, p as u32 as usize);
             out_idx[i].store((im as u32) << 16 | is as u32, Ordering::Relaxed);
             i += threads;
         }
@@ -336,7 +339,7 @@ fn wave_diagonals(
                 let y0 = if t >= g.w { (t - g.w) / step + 1 } else { 0 };
                 let mut y = y0;
                 while y < g.h && step * y <= t {
-                    diag_px[n].store((y as u32) << 16 | (t - step * y) as u32, Ordering::Relaxed);
+                    diag_px[n].store((y as u64) << 32 | (t - step * y) as u64, Ordering::Relaxed);
                     n += 1;
                     y += 1;
                 }
@@ -350,7 +353,7 @@ fn wave_diagonals(
                 for i in 0..n {
                     let p = diag_px[i].load(Ordering::Relaxed);
                     let o = out_idx[i].load(Ordering::Relaxed);
-                    let (y, x) = ((p >> 16) as usize, (p & 0xffff) as usize);
+                    let (y, x) = ((p >> 32) as usize, p as u32 as usize);
                     let sym = rc.code(y, x, (o >> 16) as usize, (o & 0xffff) as usize)?;
                     g.padded[(y + PAD) * g.pw + x + PAD].store(sym as i8, Ordering::Relaxed);
                 }
@@ -552,6 +555,30 @@ mod tests {
             let g = code_grid(&mut dec, &arm, &window, None, h, w, &mut check).unwrap();
             assert_eq!(g.data, values);
         }
+    }
+
+    /// Grids wider than 65535 px are legal under the decode limits — the
+    /// packed `diag_px` coords must not truncate.
+    #[test]
+    fn wavefront_wide_grid_round_trips() {
+        let (h, w) = (33usize, 66000usize);
+        let arm = test_arm();
+        let window = context_window_indices(6).unwrap();
+        let values: Vec<i64> = (0..h * w)
+            .map(|i| ((i * 31 + 7) % 127) as i64 - 63)
+            .collect();
+        let mut check = || -> Result<()> { Ok(()) };
+        let mut enc = RangeEncoder::new();
+        let mut ge = GridEncoder {
+            rc: &mut enc,
+            values: &values,
+            w,
+        };
+        code_grid(&mut ge, &arm, &window, None, h, w, &mut check).unwrap();
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let g = code_grid(&mut dec, &arm, &window, None, h, w, &mut check).unwrap();
+        assert_eq!(g.data, values);
     }
 
     /// The parallel IFCE pass (>= 16384 stacked pixels under `std`) must
