@@ -157,9 +157,10 @@ let output = CoolChicEncoderConfig::default()
 Jobs accept `with_stop(StopToken)` and `with_limits(ResourceLimits)`. Cancellation is
 cooperative per iteration, quantization/RDOQ candidate, and decode grid/stage. The final
 stream is checked against `max_output_bytes` before returning it; encoding is not streaming.
-Finite working-memory caps are refused rather than silently ignored. Encoding uses the
-ambient rayon pool; a sequential job policy is refused, so install a single-thread caller
-pool when needed. No calibrated memory/time estimates exist.
+Finite working-memory caps are refused rather than silently ignored. Encoding honors the
+job threading policy: a sequential policy runs the whole encode — training pool, latent
+and warp helper fan-out — single-threaded and produces identical bytes; parallel policies
+use the ambient rayon pool. No calibrated memory/time estimates exist.
 
 Generic quality is explicitly **uncalibrated**: for q clamped to 0–100,
 `lambda = 10^(-1 - 4*q/100)`. Higher q lowers lambda monotonically; it does not promise any
