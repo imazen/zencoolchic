@@ -164,8 +164,10 @@ decode via `decode::VideoDecoder`, display-order RGB frames, references retained
 serves pull streaming as one-shot decode plus ≤64-row batches, and honors sequential
 threading policies on both sides (scoped single-thread pool for encode; scoped serial
 traversal for decode — identical stream bytes in both directions). Decode otherwise
-evaluates the latent ARM contexts wavefront-parallel on up to 8 threads: the range
-coder stays serial, so output is bit-identical (measured −35% at 384²/512² grids).
+evaluates the latent ARM contexts wavefront-parallel on up to 8 threads, fans out
+the IFCE context pass above 16k stacked pixels, and fans out the inference warper
+over row bands above 32k pixels: the range coder stays serial, so output is
+bit-identical (measured −35% at 384²/512² grids, 154→27 ms on a 512² ×3ch warp).
 Decode-side `max_memory_bytes` is honored via a pre-flight working-set estimate
 (`decode::estimate_decode_bytes`: network parameters, latent grids and ARM/IFCE
 contexts, upsample/synthesis conv buffers, stored reference frames, output canvas —
