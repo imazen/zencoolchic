@@ -258,6 +258,14 @@ impl Encoder for CoolChicEncoder {
         } else {
             Some(crate::train::SequentialPool::install())
         };
+        // The latent wavefront and IFCE passes spawn scoped threads outside
+        // the rayon pools — the same policy covers them.
+        #[cfg(feature = "std")]
+        let _seq_latent = if self.job.limits.threading.is_parallel() {
+            None
+        } else {
+            Some(crate::latent::SequentialThreads::install())
+        };
         let report = crate::unstable::encode_rgb8_with_stop(
             &rgb,
             width,
@@ -413,6 +421,12 @@ impl AnimationFrameEncoder for CoolChicAnimationEncoder {
             None
         } else {
             Some(crate::train::SequentialPool::install())
+        };
+        #[cfg(feature = "std")]
+        let _seq_latent = if self.job.limits.threading.is_parallel() {
+            None
+        } else {
+            Some(crate::latent::SequentialThreads::install())
         };
         let (w, h) = self.dims.unwrap_or((0, 0));
         check_encode_budget(&self.job.limits, self.job.config.options.arch, w, h, n)?;

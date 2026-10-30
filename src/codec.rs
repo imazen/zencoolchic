@@ -407,7 +407,7 @@ impl Decode for CoolChicDecoder<'_> {
         let _seq = if self.job.limits.threading.is_parallel() {
             None
         } else {
-            Some(crate::latent::SequentialDecode::install())
+            Some(crate::latent::SequentialThreads::install())
         };
         let picture = crate::decode::decode_checked(
             &self.data,
@@ -541,7 +541,7 @@ impl zencodec::decode::AnimationFrameDecoder for CoolChicAnimationDecoder {
         let _seq = if self.job.limits.threading.is_parallel() {
             None
         } else {
-            Some(crate::latent::SequentialDecode::install())
+            Some(crate::latent::SequentialThreads::install())
         };
         self.dec.pull_display(i, &mut check)?;
         let frame = self

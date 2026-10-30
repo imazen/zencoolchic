@@ -104,19 +104,38 @@ pub(crate) fn inter_context(
         stack_nearest(coded)
     };
 
-    // IFCE output at the stacked resolution.
+    // IFCE output at the stacked resolution. The per-pixel forwards are
+    // independent (immutable `stacked`, disjoint `small` slices), so the
+    // largest passes fan out to scoped helpers under the same policy as the
+    // wavefront — output is identical either way.
     let mut small = vec![0i64; uh * uw * n_out];
     if let Some(arm) = ifce {
         let shift = 2 * WEIGHT_SHIFT - N_FRAC_BIT_INTER_FT_CTX;
-        let mut scratch = [[0i64; MAX_WIDTH]; 2];
-        for p in 0..uh * uw {
-            arm.forward(
-                &stacked[p * uc..(p + 1) * uc],
-                shift,
-                &mut small[p * n_out..(p + 1) * n_out],
-                &mut scratch,
-            );
+        let eval = |base: usize, chunk: &mut [i64]| {
+            let mut scratch = [[0i64; MAX_WIDTH]; 2];
+            for (i, out) in chunk.chunks_mut(n_out).enumerate() {
+                let p = base + i;
+                arm.forward(&stacked[p * uc..(p + 1) * uc], shift, out, &mut scratch);
+            }
+        };
+        #[cfg(feature = "std")]
+        if uh * uw >= 16384 && wave_threads() > 1 {
+            let np = uh * uw;
+            let per = np.div_ceil(wave_threads().min(np.div_ceil(4096)));
+            let eval = &eval;
+            std::thread::scope(|s| {
+                let mut chunks = small.chunks_mut(per * n_out);
+                let first = chunks.next().unwrap();
+                for (c, chunk) in chunks.enumerate() {
+                    s.spawn(move || eval((c + 1) * per, chunk));
+                }
+                eval(0, first);
+            });
+        } else {
+            eval(0, &mut small);
         }
+        #[cfg(not(feature = "std"))]
+        eval(0, &mut small);
     }
 
     // Nearest ×2 then crop. Upstream round-trips through f32 here.
@@ -344,10 +363,11 @@ fn wave_diagonals(
     Ok(true)
 }
 
-/// Scoped install of a sequential-threading policy for decode (the zencodec
-/// `Sequential`/`SingleThread` limit): [`wave_threads`] yields 1 while the
-/// guard lives, so the wavefront diagonal evaluation runs on the calling
-/// thread only (identical output).
+/// Scoped install of a sequential-threading policy (the zencodec
+/// `Sequential`/`SingleThread` limit, on either side of the codec):
+/// [`wave_threads`] yields 1 while the guard lives, so the wavefront diagonal
+/// evaluation and the IFCE pass run on the calling thread only (identical
+/// output).
 #[cfg(feature = "std")]
 mod decode_seq {
     std::thread_local! {
@@ -356,8 +376,8 @@ mod decode_seq {
     pub(crate) fn is_sequential() -> bool {
         SEQ.with(|c| c.get())
     }
-    pub(crate) struct SequentialDecode(());
-    impl SequentialDecode {
+    pub(crate) struct SequentialThreads(());
+    impl SequentialThreads {
         /// Dead in builds that decode but never install a threading policy.
         #[allow(dead_code)]
         pub(crate) fn install() -> Self {
@@ -365,7 +385,7 @@ mod decode_seq {
             Self(())
         }
     }
-    impl Drop for SequentialDecode {
+    impl Drop for SequentialThreads {
         fn drop(&mut self) {
             SEQ.with(|c| c.set(false));
         }
@@ -373,7 +393,7 @@ mod decode_seq {
 }
 #[cfg(feature = "std")]
 #[allow(unused_imports)]
-pub(crate) use decode_seq::SequentialDecode;
+pub(crate) use decode_seq::SequentialThreads;
 #[cfg(feature = "std")]
 use decode_seq::is_sequential;
 
@@ -496,7 +516,7 @@ mod tests {
         // Sequential policy → serial traversal for both directions.
         let (bytes_seq, grid_seq);
         {
-            let _seq = SequentialDecode::install();
+            let _seq = SequentialThreads::install();
             let mut enc = RangeEncoder::new();
             {
                 let mut ge = GridEncoder {
@@ -527,10 +547,43 @@ mod tests {
 
         // Decode either stream under either policy: identical grid.
         for (bytes, seq) in [(&bytes_seq, true), (&bytes_par, false), (&bytes_par, true)] {
-            let _seq = seq.then(SequentialDecode::install);
+            let _seq = seq.then(SequentialThreads::install);
             let mut dec = RangeDecoder::new(bytes).unwrap();
             let g = code_grid(&mut dec, &arm, &window, None, h, w, &mut check).unwrap();
             assert_eq!(g.data, values);
         }
+    }
+
+    /// The parallel IFCE pass (>= 16384 stacked pixels under `std`) must
+    /// produce the same context as the serial pass. One 128² coded grid hits
+    /// the gate exactly.
+    #[test]
+    fn ifce_parallel_matches_serial() {
+        let layer = |n_in, n_out, seed| FixedLinear {
+            n_in,
+            n_out,
+            w: (0..n_in * n_out)
+                .map(|i| (((i + seed) % 11) as i64 - 5) << 10)
+                .collect(),
+            b: (0..n_out).map(|i| ((i + seed) % 7) as i64 - 3).collect(),
+        };
+        // 1-input IFCE arm: `stack_nearest` over a single coded grid has c=1.
+        let arm = FixedArm {
+            layers: vec![layer(1, 4, 0), layer(4, 3, 1)],
+            stabiliser: layer(1, 3, 2),
+        };
+        let coded = Grid {
+            h: 128,
+            w: 128,
+            data: (0..128 * 128)
+                .map(|i| ((i * 17 + 3) % 127) as i64 - 63)
+                .collect(),
+        };
+        let serial = {
+            let _seq = SequentialThreads::install();
+            inter_context(&[&coded], (256, 256), Some(&arm), 3)
+        };
+        let par = inter_context(&[&coded], (256, 256), Some(&arm), 3);
+        assert_eq!(serial.data, par.data);
     }
 }
