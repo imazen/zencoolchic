@@ -63,6 +63,9 @@ no-`std` builds keep the serial traversal. The IFCE context pass is likewise
 fanned out above 16k stacked pixels (~3 ms of a 512² decode); the sequential
 policy covers both directions — encode installs it alongside the single-thread
 rayon pool so a one-thread encode stays one thread through latent coding.
+The inference warper fans out over row bands above 32k pixels (512² ×3ch,
+8-tap filter: **27 ms** vs 154 ms serial) — the dominant inter-frame cost
+after the latents — same policy, same bit-identity argument.
 
 ### Bit-exactness risks
 
